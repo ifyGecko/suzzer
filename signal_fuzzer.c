@@ -41,7 +41,7 @@ int main(int argc, char** argv) {
   for(int i = 0; i < MAP_SIZE; ++i) {
     if(coverage_map[i] != 0) {
 	  printf("index: %d\n", i);
-	}
+    }
   }
 
   return 0;
