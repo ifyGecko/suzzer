@@ -2,6 +2,12 @@
 """
 gen_patchlist.py -- produce an LCV2 binary patch list for a target binary.
 
+Drives rizin via the rzpipe Python module: one long-lived rizin process,
+`aaa` runs exactly once at startup, and every subsequent query reuses the
+cached analysis. The previous shell-subprocess implementation re-ran
+`aaa` for every command and was wall-clock dominated by it on
+medium-sized binaries.
+
 Per-arch behavior:
   x86_64, aarch64, arm (ARM mode), powerpc, riscv64: patch block terminators
   arm (Thumb mode):                                  patch first 2 bytes only
@@ -43,7 +49,8 @@ Selective instrumentation (--root / --cutoff / --max-depth):
       function's entry, with a note printed to stderr.
     - Bare names try (in order): exact rizin name, then 'dbg.<name>',
       'sym.<name>', 'fcn.<name>', 'sym.imp.<name>', then suffix match on
-      the last dotted segment. Ambiguous suffix matches are an error.
+      the last dotted segment of every function name.  Ambiguous suffix
+      matches are an error.
 
   The call graph is built from rizin's `afij` callrefs: outgoing CALL
   edges to functions inside the analyzed binary. PLT/import targets are
@@ -88,8 +95,9 @@ import argparse
 import json
 import re
 import struct
-import subprocess
 import sys
+
+import rzpipe
 
 
 # Threading-hint values written into the LCV2 header.
@@ -98,23 +106,33 @@ TH_ST  = 1
 TH_MT  = 2
 
 
-def rizin(binary, cmds):
-    out = subprocess.check_output(
-        ["rizin", "-q", "-c", "; ".join(cmds), binary],
-        stderr=subprocess.DEVNULL,
-    )
-    return out.decode("utf-8", errors="replace")
+# rizin still emits a few ANSI CSI sequences (clear-line etc.) even from
+# rzpipe with default settings; strip them before raw-JSON decoding of
+# `afij @@F` output. cmdj()-returned values are already JSON-parsed so
+# this only matters for the raw `cmd()` path.
+_ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
-def rizin_json(binary, cmds):
-    raw = rizin(binary, cmds).strip()
-    if not raw:
-        return None
-    return json.loads(raw)
+def open_rizin(binary):
+    """Open a persistent rizin session and run analysis exactly once.
+
+    All subsequent queries reuse the cached analysis, which is the whole
+    point of the rzpipe rewrite -- the previous shell-subprocess version
+    re-ran `aaa` on every command and that dominated wall-clock cost on
+    anything larger than the toy test target.
+    """
+    try:
+        rz = rzpipe.open(binary)
+    except Exception as e:
+        sys.exit(f"error: failed to open {binary} with rizin: {e}")
+    # Silence ANSI/colour from cmd() output; cmdj() is unaffected.
+    rz.cmd("e scr.color=0")
+    rz.cmd("aaa")
+    return rz
 
 
-def get_bin_info(binary):
-    info = rizin_json(binary, ["ij"]) or {}
+def get_bin_info(rz):
+    info = rz.cmdj("ij") or {}
     b = info.get("bin", {})
     return {
         "arch":   b.get("arch", ""),
@@ -124,10 +142,14 @@ def get_bin_info(binary):
     }
 
 
-def get_functions(binary, include_re, exclude_re):
-    fns = rizin_json(binary, ["aaa", "aflj"]) or []
+def get_all_functions(rz):
+    """Unfiltered function list from `aflj`. Caller filters via regex."""
+    return rz.cmdj("aflj") or []
+
+
+def filter_functions(all_fns, include_re, exclude_re):
     out = []
-    for f in fns:
+    for f in all_fns:
         name = f.get("name", "")
         if include_re and not include_re.search(name):
             continue
@@ -141,8 +163,8 @@ def get_functions(binary, include_re, exclude_re):
     return out
 
 
-def get_block_insns(binary, addr, ninstr):
-    return rizin_json(binary, ["aaa", f"pdj {ninstr} @ {addr}"]) or []
+def get_block_insns(rz, addr, ninstr):
+    return rz.cmdj(f"pdj {ninstr} @ {addr}") or []
 
 
 BRANCH_TYPES = {
@@ -152,30 +174,30 @@ BRANCH_TYPES = {
 }
 
 
-def _is_branch_at(binary, addr):
-    insns = get_block_insns(binary, addr, 1)
+def _is_branch_at(rz, addr):
+    insns = get_block_insns(rz, addr, 1)
     if not insns:
         return False
     t = insns[0].get("type", "")
     return t in BRANCH_TYPES
 
 
-def pick_sites(binary, fn, strategy, arch):
+def pick_sites(rz, fn, strategy, arch):
     is_mips = arch in ("mips", )
-    blocks = rizin_json(binary, ["aaa", f"afbj @ {fn['offset']}"]) or []
+    blocks = rz.cmdj(f"afbj @ {fn['offset']}") or []
     sites = []
     for b in blocks:
         n = int(b.get("ninstr", 0))
         if n == 0:
             continue
         addr = int(b["addr"])
-        insns = get_block_insns(binary, addr, n)
+        insns = get_block_insns(rz, addr, n)
         if not insns:
             continue
 
         if strategy == "entry":
             idx = 0
-            if is_mips and _is_branch_at(binary, addr - 4):
+            if is_mips and _is_branch_at(rz, addr - 4):
                 idx = 1
                 if idx >= len(insns):
                     continue
@@ -314,18 +336,12 @@ def resolve_to_offset(token, all_fns):
     raise ValueError(f"could not resolve '{token}' to any function")
 
 
-# ANSI CSI strip: rizin prints terminal control sequences (e.g. clear-
-# line "\x1b[2K") even with -q, which break a literal-string startswith
-# check on JSON output. We strip them before JSON-parsing.
-_ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
-
-
-def build_call_graph(binary, all_fns):
+def build_call_graph(rz, all_fns):
     """Build outgoing-call adjacency: offset -> set(offset).
 
-    Runs a single rizin session: `aaa; afij @@F`. The `@@F` iterator
-    runs `afij` at every function rizin discovered, emitting each as
-    its own JSON array. We parse the concatenated arrays with
+    Runs `afij @@F` in the persistent session. The `@@F` iterator runs
+    `afij` at every function rizin discovered, emitting each as its own
+    JSON array. We parse the concatenated arrays with
     `json.JSONDecoder.raw_decode` and key results by each entry's
     `offset` field (NOT positionally -- the iteration order isn't a
     documented contract).
@@ -341,7 +357,7 @@ def build_call_graph(binary, all_fns):
     `@@F` is both cleaner and the documented all-functions iterator.
     """
     fn_set = {int(f["offset"]) for f in all_fns}
-    raw = rizin(binary, ["aaa", "afij @@F"])
+    raw = rz.cmd("afij @@F")
     raw = _ANSI_CSI_RE.sub("", raw).strip()
 
     # Walk the concatenated JSON arrays.
@@ -418,53 +434,11 @@ def bfs_reachable(roots, adj, cutoffs, max_depth=None):
     return out
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("binary")
-    ap.add_argument("output")
-    ap.add_argument("--include-pat", default=None,
-                    help="only include functions whose name matches this regex")
-    ap.add_argument("--exclude-pat",
-                    default=r"^(sym\.imp\.|sym\._init|sym\._fini|sym\.deregister|sym\.register|sym\.frame_dummy|sym\.__libc_csu)",
-                    help="exclude functions whose name matches this regex")
-    ap.add_argument("--strategy", choices=["auto", "entry", "terminator"],
-                    default="auto",
-                    help="per-block patch site selection (auto = arch default)")
-    ap.add_argument("--threading", choices=["st", "mt"], default="st",
-                    help="target libcov threading variant (st default, mt for "
-                         "thread-safe runtime)")
-    ap.add_argument("--root", action="append", default=[],
-                    metavar="SYM_OR_ADDR",
-                    help="instrument only the call-graph slice reachable from "
-                         "this function/address. Repeatable. Accepts function "
-                         "names (main, dbg.main, sym.parse_request) or "
-                         "addresses (0x401234). Combine with --cutoff to "
-                         "scope further. If omitted, all functions matching "
-                         "--include-pat/--exclude-pat are instrumented "
-                         "(legacy behavior).")
-    ap.add_argument("--cutoff", action="append", default=[],
-                    metavar="SYM_OR_ADDR",
-                    help="stop call-graph traversal at this function. The "
-                         "cutoff itself is excluded from the slice. "
-                         "Repeatable. Resolution rules match --root.")
-    ap.add_argument("--max-depth", type=int, default=None, metavar="N",
-                    help="bound the call-graph BFS to N edges below each root "
-                         "(default: unbounded). A root is depth 0.")
-    ap.add_argument("--print-reachable", action="store_true",
-                    help="resolve --root/--cutoff, print the reachable "
-                         "function set to stderr, and exit without writing "
-                         "the patchlist. Useful for iterating on a slice.")
-    ap.add_argument("--verbose", "-v", action="store_true")
-    args = ap.parse_args()
-
-    if (args.cutoff or args.max_depth is not None or args.print_reachable) \
-            and not args.root:
-        ap.error("--cutoff / --max-depth / --print-reachable require --root")
-
+def run(args, rz):
     inc = re.compile(args.include_pat) if args.include_pat else None
     exc = re.compile(args.exclude_pat) if args.exclude_pat else None
 
-    info = get_bin_info(args.binary)
+    info = get_bin_info(rz)
     baddr = info["baddr"]
     arch  = info["arch"]
     bits  = info["bits"]
@@ -476,16 +450,18 @@ def main():
               f"baddr=0x{baddr:x} strategy={strategy} threading={args.threading}",
               file=sys.stderr)
 
-    fns = get_functions(args.binary, inc, exc)
+    # One canonical `aflj` snapshot, reused for filtering, slice
+    # resolution, and PPC64 dual-entry lookup.
+    all_fns_raw = get_all_functions(rz)
+    fns = filter_functions(all_fns_raw, inc, exc)
 
     # Selective instrumentation: resolve --root / --cutoff and intersect the
     # regex-filtered fns with the call-graph slice reachable from the roots.
     # Resolution and BFS run over the UNFILTERED function list, because the
     # user's regex may exclude intermediate functions that sit between a
     # --root and a downstream callee that the user does want to instrument.
-    reachable_offsets = None
     if args.root:
-        all_fns = get_functions(args.binary, None, None)
+        all_fns = filter_functions(all_fns_raw, None, None)
         try:
             roots = set()
             for r in args.root:
@@ -513,7 +489,7 @@ def main():
 
         print(f"building call graph over {len(all_fns)} functions...",
               file=sys.stderr)
-        adj = build_call_graph(args.binary, all_fns)
+        adj = build_call_graph(rz, all_fns)
         reachable_offsets = bfs_reachable(roots, adj, cutoffs, args.max_depth)
         depth_note = (f", max-depth={args.max_depth}"
                       if args.max_depth is not None else "")
@@ -537,10 +513,10 @@ def main():
             print(f"regex \u2229 reachable: {before} -> {len(fns)} functions",
                   file=sys.stderr)
 
-    # PowerPC64 dual entry: also pull in fcn.<offset+8> for each matched fn.
+    # PowerPC64 dual entry: also pull in fcn.<offset+8> for each matched
+    # fn. Reuses the same cached aflj snapshot -- no fresh query.
     if arch == "ppc" and bits == 64:
-        all_fns = rizin_json(args.binary, ["aaa", "aflj"]) or []
-        by_offset = {int(f["offset"]): f for f in all_fns}
+        by_offset = {int(f["offset"]): f for f in all_fns_raw}
         extra = []
         seen_offsets = {f["offset"] for f in fns}
         for f in fns:
@@ -565,7 +541,7 @@ def main():
     records = []
     mt_skipped_alignment = 0
     for fn in fns:
-        sites = pick_sites(args.binary, fn, strategy, arch)
+        sites = pick_sites(rz, fn, strategy, arch)
         for addr, size, bhex in sites:
             if addr in seen:
                 continue
@@ -621,6 +597,59 @@ def main():
           f"(threading={args.threading}"
           + (f", skipped {mt_skipped_alignment} mt-unsafe sites" if mt_skipped_alignment else "")
           + ")", file=sys.stderr)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("binary")
+    ap.add_argument("output")
+    ap.add_argument("--include-pat", default=None,
+                    help="only include functions whose name matches this regex")
+    ap.add_argument("--exclude-pat",
+                    default=r"^(sym\.imp\.|sym\._init|sym\._fini|sym\.deregister|sym\.register|sym\.frame_dummy|sym\.__libc_csu)",
+                    help="exclude functions whose name matches this regex")
+    ap.add_argument("--strategy", choices=["auto", "entry", "terminator"],
+                    default="auto",
+                    help="per-block patch site selection (auto = arch default)")
+    ap.add_argument("--threading", choices=["st", "mt"], default="st",
+                    help="target libcov threading variant (st default, mt for "
+                         "thread-safe runtime)")
+    ap.add_argument("--root", action="append", default=[],
+                    metavar="SYM_OR_ADDR",
+                    help="instrument only the call-graph slice reachable from "
+                         "this function/address. Repeatable. Accepts function "
+                         "names (main, dbg.main, sym.parse_request) or "
+                         "addresses (0x401234). Combine with --cutoff to "
+                         "scope further. If omitted, all functions matching "
+                         "--include-pat/--exclude-pat are instrumented "
+                         "(legacy behavior).")
+    ap.add_argument("--cutoff", action="append", default=[],
+                    metavar="SYM_OR_ADDR",
+                    help="stop call-graph traversal at this function. The "
+                         "cutoff itself is excluded from the slice. "
+                         "Repeatable. Resolution rules match --root.")
+    ap.add_argument("--max-depth", type=int, default=None, metavar="N",
+                    help="bound the call-graph BFS to N edges below each root "
+                         "(default: unbounded). A root is depth 0.")
+    ap.add_argument("--print-reachable", action="store_true",
+                    help="resolve --root/--cutoff, print the reachable "
+                         "function set to stderr, and exit without writing "
+                         "the patchlist. Useful for iterating on a slice.")
+    ap.add_argument("--verbose", "-v", action="store_true")
+    args = ap.parse_args()
+
+    if (args.cutoff or args.max_depth is not None or args.print_reachable) \
+            and not args.root:
+        ap.error("--cutoff / --max-depth / --print-reachable require --root")
+
+    rz = open_rizin(args.binary)
+    try:
+        run(args, rz)
+    finally:
+        try:
+            rz.quit()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
