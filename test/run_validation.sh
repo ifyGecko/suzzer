@@ -20,12 +20,25 @@ echo ">> regenerate patch list"
 "$ROOT/tools/gen_patchlist.py" "$TARGET" "$LCV" \
     --include-pat '^dbg\.(main|classify|loop_sum|cmdline)$'
 
+# The shm file starts with a 72-byte libcov_shm_header followed by the
+# 64 KB live bitmap and the snapshot ring. The legacy single-bitmap
+# checks below only care about the bitmap region. Use python to avoid
+# the SIGPIPE-vs-pipefail interaction of a tail|head pipeline.
+extract_bitmap() {
+    python3 -c "
+import sys
+with open(sys.argv[1],'rb') as f:
+    f.seek(72); d = f.read(65536)
+with open(sys.argv[2],'wb') as f:
+    f.write(d)" "$1" "$2"
+}
+
 run_one() {
     local mode="$1" input="$2" out="$3"
     rm -f "$SHM"
     LIBCOV_PATCHLIST="$LCV" LIBCOV_SHM_PATH="$SHM" LIBCOV_MODE="$mode" \
         LIBCOV_LOG=/dev/null LD_PRELOAD="$LIB" "$TARGET" "$input" > "$out"
-    cp "$SHM" "$out.bitmap"
+    extract_bitmap "$SHM" "$out.bitmap"
 }
 
 echo ">> oneshot: same input twice should produce identical bitmap"

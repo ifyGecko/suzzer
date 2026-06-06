@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "sink.h"
+#include "boundary.h"
 #include "util.h"
 
 #include <stdio.h>
@@ -11,7 +12,9 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
-uint8_t *libcov_bitmap = NULL;
+void   *libcov_shm_base = NULL;
+size_t  libcov_shm_size = 0;
+uint8_t *libcov_bitmap  = NULL;
 
 /* prev_loc: shared global for ST builds; TLS for MT builds so concurrent
  * threads don't fight over edge attribution. The declaration in sink.h
@@ -42,12 +45,32 @@ static int try_file_open(const char *path, int *fd_out) {
     return 0;
 }
 
-int sink_init(const char *path) {
+/* Total shm size = header + live bitmap + ring*slot_stride. */
+static size_t compute_shm_size(unsigned ring_size, size_t *bitmap_off_out,
+                               size_t *ring_off_out, size_t *slot_stride_out) {
+    size_t hdr      = sizeof(struct libcov_shm_header);
+    size_t bmap_off = hdr;
+    size_t ring_off = bmap_off + LIBCOV_MAP_SIZE;
+    size_t stride   = sizeof(struct libcov_ring_slot_hdr) + LIBCOV_MAP_SIZE;
+    size_t total    = ring_off + (size_t)ring_size * stride;
+    if (bitmap_off_out)  *bitmap_off_out = bmap_off;
+    if (ring_off_out)    *ring_off_out   = ring_off;
+    if (slot_stride_out) *slot_stride_out = stride;
+    return total;
+}
+
+int sink_init(const char *path, unsigned ring_size) {
     char default_path[128];
     if (!path || !*path) {
         snprintf(default_path, sizeof default_path, "/libcov_%d", (int)getpid());
         path = default_path;
     }
+
+    if (ring_size < 2)  ring_size = 2;
+    if (ring_size > 16) ring_size = 16;
+
+    size_t bitmap_off, ring_off, slot_stride;
+    size_t total = compute_shm_size(ring_size, &bitmap_off, &ring_off, &slot_stride);
 
     int fd = -1;
     /* Heuristic: if path looks like a filesystem path (contains a non-leading
@@ -78,20 +101,42 @@ int sink_init(const char *path) {
         }
     }
 
-    if (ftruncate(fd, LIBCOV_MAP_SIZE) < 0) {
-        libcov_logf("sink: ftruncate: %s", strerror(errno));
+    if (ftruncate(fd, (off_t)total) < 0) {
+        libcov_logf("sink: ftruncate(%zu): %s", total, strerror(errno));
         close(fd);
         return -1;
     }
-    void *m = mmap(NULL, LIBCOV_MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    void *m = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (m == MAP_FAILED) {
         libcov_logf("sink: mmap: %s", strerror(errno));
         return -1;
     }
-    /* Don't zero the map; an external driver may want hit-counts to accumulate
-     * across runs, or clear them between iterations on its side. */
-    libcov_bitmap = (uint8_t *)m;
-    libcov_logf("sink: bitmap @ %p size=%u", m, (unsigned)LIBCOV_MAP_SIZE);
+
+    /* Zero the entire region so the driver sees clean state at attach
+     * and the ring slots start with slot_gen=0 ("empty"). The previous
+     * "don't zero" comment predated the boundary mechanism: iteration
+     * framing now lives in the header + ring, and per-iter clearing of
+     * the live bitmap is libcov's job (not the driver's). */
+    memset(m, 0, total);
+    struct libcov_shm_header *hdr = (struct libcov_shm_header *)m;
+    memcpy(hdr->magic, LIBCOV_SHM_MAGIC, 4);
+    hdr->version       = (uint16_t)LIBCOV_SHM_VERSION;
+    hdr->ring_size     = (uint16_t)ring_size;
+    hdr->map_size      = LIBCOV_MAP_SIZE;
+    hdr->slot_stride   = (uint32_t)slot_stride;
+    hdr->flags         = 0;        /* SHM_FLAG_ACTIVE set later by boundary_init */
+    hdr->gen_current   = 0;
+    hdr->gen_init      = 0;
+    hdr->bitmap_offset = bitmap_off;
+    hdr->ring_offset   = ring_off;
+
+    libcov_shm_base = m;
+    libcov_shm_size = total;
+    libcov_bitmap   = (uint8_t *)m + bitmap_off;
+    libcov_prev_loc = 0;
+
+    libcov_logf("sink: shm @ %p total=%zu bitmap@+%zu ring@+%zu slots=%u stride=%zu",
+                m, total, bitmap_off, ring_off, ring_size, slot_stride);
     return 0;
 }

@@ -121,7 +121,8 @@ run_target_clean() {
 bitmap_stats() {
     python3 -c "
 with open('$1','rb') as f: d=f.read()
-n=sum(1 for b in d if b); t=sum(d); m=max(d)
+if d[:4] == b'LCVS': d = d[72:72+65536]
+n=sum(1 for b in d if b); t=sum(d); m=max(d) if d else 0
 print(n, t, m)"
 }
 

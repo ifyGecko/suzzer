@@ -122,7 +122,7 @@ endif
 
 BUILD := build/$(ARCH)
 
-COMMON_SRC := src/libcov.c src/util.c src/config.c src/sink_shm.c
+COMMON_SRC := src/libcov.c src/util.c src/config.c src/sink_shm.c src/boundary.c
 SRC := $(COMMON_SRC) $(PATCH_SRC) $(HANDLER_SRC) $(EXTRA_SRC) $(ARCH_SRC)
 
 # Object files go into a threading-suffixed subdir to keep ST and MT builds
@@ -145,7 +145,12 @@ $(OBJDIR)/%.o: src/%.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -fPIC -c $< -o $@
 
 $(LIB): $(OBJ) | $(BUILD)
-	$(CC) $(CFLAGS) -shared -fPIC -Wl,-z,now -o $@ $^ -ldl -lrt $(LDLIBS_EXTRA)
+	$(CC) $(CFLAGS) -shared -fPIC -Wl,-z,now -o $@ $^ \
+	    -ldl -lrt $(LDLIBS_EXTRA) -Wl,--as-needed -latomic
+# -Wl,--as-needed -latomic pulls libatomic in only when the toolchain
+# can't inline 64-bit atomics (32-bit arches: mips, mipsel, powerpc).
+# boundary.c's gen_current/gen_init use 64-bit atomics; on 64-bit
+# arches __atomic_*_8 is inline and libatomic stays unlinked.
 
 test: $(LIB)
 	$(MAKE) -C test ARCH=$(ARCH) CROSS=$(CROSS) BUILD=$(abspath $(BUILD))

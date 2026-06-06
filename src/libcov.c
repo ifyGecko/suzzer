@@ -5,6 +5,7 @@
 #include "handler.h"
 #include "sink.h"
 #include "arch.h"
+#include "boundary.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +15,15 @@
 #include <errno.h>
 
 static int g_initialized = 0;
+
+static unsigned parse_ring_size(void) {
+    const char *s = getenv("LIBCOV_BOUNDARY_RING");
+    if (!s || !*s) return 4;
+    int v = atoi(s);
+    if (v < 2)  v = 2;
+    if (v > 16) v = 16;
+    return (unsigned)v;
+}
 
 __attribute__((constructor(101)))
 static void libcov_init(void) {
@@ -30,7 +40,7 @@ static void libcov_init(void) {
     const char *mode_str = getenv("LIBCOV_MODE");
     if (mode_str && !strcmp(mode_str, "oneshot")) mode = LIBCOV_MODE_ONESHOT;
 
-    if (sink_init(getenv("LIBCOV_SHM_PATH")) != 0) {
+    if (sink_init(getenv("LIBCOV_SHM_PATH"), parse_ring_size()) != 0) {
         libcov_logf("init: sink_init failed");
         return;
     }
@@ -45,6 +55,20 @@ static void libcov_init(void) {
     if (handler_install(mode) != 0) {
         libcov_logf("init: handler_install failed");
         return;
+    }
+
+    int boundary_state = boundary_init();
+    if (boundary_state < 0) {
+        libcov_logf("init: boundary_init failed; continuing without iteration scoping");
+    } else if (boundary_state == 1) {
+        /* Sanity check: oneshot + REARM=none + active boundaries makes per-
+         * iteration snapshots go empty after warmup. Warn loudly; not fatal. */
+        const char *rearm = getenv("LIBCOV_BOUNDARY_REARM");
+        if (mode == LIBCOV_MODE_ONESHOT && (!rearm || !*rearm || !strcmp(rearm, "none"))) {
+            libcov_logf("init: WARNING -- MODE=oneshot with BOUNDARY_REARM=none means "
+                        "per-iter bitmaps empty after warmup; use REARM=all or "
+                        "REARM=touched, or switch to MODE=leapfrog");
+        }
     }
 
     g_initialized = 1;

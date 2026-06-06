@@ -4,6 +4,7 @@
 #include "arch.h"
 #include "sink.h"
 #include "util.h"
+#include "boundary.h"
 
 #include <stddef.h>
 #include <signal.h>
@@ -64,6 +65,13 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
         }
         g_last_restored = e;
     }
+
+    /* Iteration boundary: no-op when LIBCOV_BOUNDARY_LIST is unset. When
+     * boundaries are active, this tracks the disarm of e, checks whether
+     * pc is a marker, and if so publishes a snapshot + clears the live
+     * bitmap + applies the configured boundary re-arm policy. */
+    boundary_on_trap(pc, e);
+
     /* Returning resumes execution at pc; kernel re-fetches the now-valid insn. */
 }
 

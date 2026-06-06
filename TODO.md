@@ -5,6 +5,15 @@ become blocking. Captured here so design context isn't lost.
 
 ## Done since last revision
 
+- **Iteration boundary**: per-target sidecar (LCVB1) names marker
+  addresses; on each hit libcov publishes the live bitmap to a snapshot
+  ring in shm, clears the live bitmap, and applies a configurable re-arm
+  policy (`none` / `all` / `touched`). Drivers read snapshots via a
+  seqlock pattern with per-slot generation stamps -- desync detection
+  is structural. Per-thread depth tracking, touched-set, and deferred
+  marker re-arm are `__thread` under `libcov_mt.so`. `tools/gen_boundary.py`
+  generates the sidecar; `test/target_loop.c` is the canonical long-running
+  target; `test/fuzz_driver.c` is the boundary-aware reader.
 - **Multi-thread support**: `libcov_mt.so` is a separate brick. TLS
   `prev_loc`, atomic saturating bitmap, atomic per-site spinlock,
   `/proc/self/mem` mprotect-free writes, `membarrier(SYNC_CORE)` for
@@ -26,9 +35,10 @@ The PoC validates the trampoline mechanism end-to-end across 11 backends
 powerpc64 BE+LE, riscv64) and both threading variants. The next phase
 makes it useful against network daemons.
 
-- **Iteration boundary**: driver-side quiescence heuristic and/or an
-  optional control socket so a remote driver can scope coverage to a
-  single request/response cycle.
+- **Paired begin/end boundary markers** for nested request handlers
+  (HTTP/2 streams, SOAP envelopes, recursive dispatchers). The current
+  boundary mechanism handles begin-only markers; paired-mode depth
+  scoping is the natural next iteration on `boundary.c`.
 - **Multi-module patch list (LCV3)**: header carries a module name
   table; each record has a module_idx. Loader resolves each module's
   base via `/proc/self/maps`. Lets us instrument linked libraries

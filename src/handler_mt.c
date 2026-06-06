@@ -22,6 +22,7 @@
 #include "arch.h"
 #include "sink.h"
 #include "util.h"
+#include "boundary.h"
 
 #include <stddef.h>
 #include <signal.h>
@@ -78,6 +79,14 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
         }
         g_last_restored = e;
     }
+
+    /* Iteration boundary: no-op when LIBCOV_BOUNDARY_LIST is unset. When
+     * boundaries are active, per-thread state tracks the disarm of e,
+     * checks whether pc is a marker on this thread, and if so publishes
+     * a snapshot + clears the live bitmap + applies the configured
+     * boundary re-arm policy. Per-thread depth + touched-set state means
+     * concurrent worker threads scope their own iterations cleanly. */
+    boundary_on_trap(pc, e);
 }
 
 int handler_install(enum libcov_mode mode) {

@@ -1,5 +1,5 @@
 /*
- * sink.h -- AFL-style 64KB shared-memory bitmap. Threading-mode aware.
+ * sink.h -- shared-memory bitmap + iteration ring. Threading-mode aware.
  *
  * The .so build defines exactly one of LIBCOV_THREADING_ST or
  * LIBCOV_THREADING_MT. This header switches the inline emit body and the
@@ -11,6 +11,16 @@
  *
  * Both implementations of sink_emit are async-signal-safe and inline at
  * the trap-handler call site.
+ *
+ * Shm layout (created by sink_init):
+ *
+ *   offset 0                   struct libcov_shm_header (see boundary.h)
+ *   offset bitmap_offset       live bitmap, LIBCOV_MAP_SIZE bytes
+ *   offset ring_offset         RING slots, each slot_stride bytes
+ *
+ * The header is always present; the ring stays unused (zeroed, SHM_FLAG_ACTIVE
+ * clear) when LIBCOV_BOUNDARY_LIST is unset, so drivers wanting a single
+ * cumulative bitmap (legacy use) only read `bitmap_offset`-relative data.
  */
 #ifndef LIBCOV_SINK_H
 #define LIBCOV_SINK_H
@@ -22,7 +32,14 @@
 #define LIBCOV_MAP_SIZE      (1u << LIBCOV_MAP_SIZE_POW2)
 #define LIBCOV_MAP_MASK      (LIBCOV_MAP_SIZE - 1u)
 
-int sink_init(const char *path);
+/* Allocate header + live bitmap + ring; map them as one contiguous shm
+ * region. ring_size is clamped to [2, 16]. */
+int sink_init(const char *path, unsigned ring_size);
+
+/* The mmap base (== &header). Used by boundary.c to compute ring/bitmap
+ * pointers from the header's *_offset fields. */
+extern void  *libcov_shm_base;
+extern size_t libcov_shm_size;
 
 extern uint8_t *libcov_bitmap;
 

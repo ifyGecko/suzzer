@@ -94,3 +94,25 @@ struct patch_entry *patch_lookup(uintptr_t addr) {
     }
     return NULL;
 }
+
+size_t patch_rearm_set(struct patch_entry **set, size_t n) {
+    size_t armed = 0;
+    for (size_t i = 0; i < n; i++) {
+        struct patch_entry *e = set[i];
+        if (!e || e->patched) continue;
+        if (patch_arm(e) == 0) armed++;
+    }
+    return armed;
+}
+
+size_t patch_rearm_all_disarmed(void) {
+    size_t n;
+    struct patch_entry *t = config_table_mut(&n);
+    if (!t) return 0;
+    size_t armed = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (t[i].patched) continue;
+        if (patch_arm(&t[i]) == 0) armed++;
+    }
+    return armed;
+}

@@ -48,20 +48,37 @@ echo ">> baseline run without libcov"
 bare_total=$(grep '^TOTAL=' /tmp/v_mt.bare)
 echo "   $bare_total"
 
+# The shm file starts with a 72-byte libcov_shm_header followed by the
+# 64 KB live bitmap and the snapshot ring. Tests below operate on the
+# live bitmap only. python avoids the SIGPIPE-vs-pipefail interaction
+# of a tail|head pipeline.
+extract_bitmap() {
+    python3 -c "
+import sys
+with open(sys.argv[1],'rb') as f:
+    f.seek(72); d = f.read(65536)
+with open(sys.argv[2],'wb') as f:
+    f.write(d)" "$1" "$2"
+}
+
 run_under_libcov() {
     local mode=$1 out=$2
     rm -f "$SHM"
     LIBCOV_PATCHLIST="$LCV" LIBCOV_SHM_PATH="$SHM" LIBCOV_MODE="$mode" \
         LIBCOV_LOG=/tmp/v_mt.${mode}.log LD_PRELOAD="$LIB" \
         "$TARGET" "$THREADS" "$ITERS" "${INPUTS[@]}" > "$out" 2>&1
-    cp "$SHM" "$out.bitmap"
+    extract_bitmap "$SHM" "$out.bitmap"
 }
 
+# Accepts either a pre-extracted bitmap file or a raw shm. It auto-detects
+# by checking the first 4 bytes for the "LCVS" magic; if present, skips
+# the 72-byte header.
 bitmap_stats() {
     python3 -c "
 import sys
 with open(sys.argv[1],'rb') as f: d=f.read()
-n=sum(1 for b in d if b); t=sum(d); m=max(d)
+if d[:4] == b'LCVS': d = d[72:72+65536]
+n=sum(1 for b in d if b); t=sum(d); m=max(d) if d else 0
 print(n, t, m)" "$1"
 }
 

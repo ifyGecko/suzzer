@@ -63,10 +63,14 @@ run_target_clean() {
     fi
 }
 
+# The shm file is laid out as a 72-byte libcov_shm_header followed by the
+# 64 KB live bitmap (and the snapshot ring, unused when boundaries are
+# off). Bitmap statistics must skip the header.
 count_edges() {
     python3 -c "
 import sys
 with open(sys.argv[1],'rb') as f: d=f.read()
+if d[:4] == b'LCVS': d = d[72:72+65536]
 n=sum(1 for b in d if b); t=sum(d)
 print(n,t)" "$1"
 }
@@ -157,7 +161,10 @@ with open('$LCV','rb') as f:
     LIBCOV_PATCHLIST="$LCV" LIBCOV_SHM_PATH="$SHM" LIBCOV_LOG=/dev/null \
         LIBCOV_MODE=leapfrog \
         run_target "$build_arch" "$libcov_so" "$target_bin" 99 > "$OUT.lf" 2>&1
-    maxhits=$(python3 -c "print(max(open('$SHM','rb').read()))")
+    maxhits=$(python3 -c "
+d=open('$SHM','rb').read()
+if d[:4] == b'LCVS': d = d[72:72+65536]
+print(max(d) if d else 0)")
     if (( maxhits < 2 )); then
         echo "FAIL leapfrog never recorded multi-hit (max=$maxhits)"
         FAIL=$((FAIL+1)); FAILED+=("$arch:leapfrog"); continue
