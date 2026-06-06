@@ -16,13 +16,15 @@ void   *libcov_shm_base = NULL;
 size_t  libcov_shm_size = 0;
 uint8_t *libcov_bitmap  = NULL;
 
-/* prev_loc: shared global for ST builds; TLS for MT builds so concurrent
- * threads don't fight over edge attribution. The declaration in sink.h
+/* prev_loc window: shared global for ST builds; TLS for MT builds so
+ * concurrent threads don't fight over edge attribution. Length is
+ * LIBCOV_NGRAM_WIN = max(N-1, 1) -- N=1 still allocates one (unused)
+ * slot so the array never has zero length. The declaration in sink.h
  * picks the same qualifier; keep them in sync. */
 #if defined(LIBCOV_THREADING_MT)
-__thread uint16_t libcov_prev_loc = 0;
+__thread uint16_t libcov_prev_loc[LIBCOV_NGRAM_WIN] = {0};
 #else
-uint16_t libcov_prev_loc = 0;
+uint16_t libcov_prev_loc[LIBCOV_NGRAM_WIN] = {0};
 #endif
 
 static int try_shm_open(const char *name, int *fd_out) {
@@ -134,7 +136,7 @@ int sink_init(const char *path, unsigned ring_size) {
     libcov_shm_base = m;
     libcov_shm_size = total;
     libcov_bitmap   = (uint8_t *)m + bitmap_off;
-    libcov_prev_loc = 0;
+    memset(libcov_prev_loc, 0, sizeof libcov_prev_loc);
 
     libcov_logf("sink: shm @ %p total=%zu bitmap@+%zu ring@+%zu slots=%u stride=%zu",
                 m, total, bitmap_off, ring_off, ring_size, slot_stride);

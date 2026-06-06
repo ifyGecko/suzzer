@@ -65,6 +65,71 @@
 #endif
 
 /* ------------------------------------------------------------------ */
+/* Coverage collection scheme (N-gram window)                         */
+/* ------------------------------------------------------------------ */
+
+/* LIBCOV_NGRAM_N
+ *   Length of the PC window combined into each bitmap bucket on every
+ *   sink_emit(). Sets the "shape" of coverage collection without
+ *   touching the bitmap layout (size, hash, saturation, atomics).
+ *
+ *     N=1   block coverage  -- idx = hash(pc); prev-PC window unused.
+ *                              Cheapest. Bucket means "block was hit".
+ *     N=2   AFL-style edges -- idx = (hash(pc) ^ prev[0]) & MASK.
+ *                              Default. Bit-for-bit identical to the
+ *                              historical libcov emit path. Bucket
+ *                              means "edge prev->cur was taken".
+ *     N>=3  N-gram coverage -- idx = hash(pc) ^ prev[0] ^ ... ^ prev[N-2].
+ *                              Bucket means "the last N control
+ *                              transfers in this thread were this exact
+ *                              tuple". More context, more sensitive to
+ *                              path differences, slightly more collision
+ *                              pressure for the same bitmap size.
+ *
+ *   Cost per emit: approximately (N-1) XORs and (N-1) TLS stores in the
+ *   window-shift step. Bitmap layout (LIBCOV_MAP_SIZE_POW2) is unchanged
+ *   regardless of N -- consumers of the bitmap do not need to know N.
+ *   The first (N-1) emits per thread XOR with zero-initialised window
+ *   slots, biasing toward low buckets; this is the same warmup bias AFL
+ *   already exhibits at iter-1 and is harmless in practice.
+ *
+ *   Override at build: -DLIBCOV_NGRAM_N=4
+ *   Override in source: edit the value next to the #define below.
+ *
+ *   Constraints: integer in [1, 8]. Higher N inflates TLS pressure and
+ *   collision rate without proportional sensitivity gain; if you really
+ *   need >8, raise this cap together with the static_assert in sink.h.
+ */
+#ifndef LIBCOV_NGRAM_N
+#define LIBCOV_NGRAM_N 2
+#endif
+
+/* LIBCOV_NGRAM_ROTATE
+ *   When 1, each prev[j] slot is rotated by a position-dependent amount
+ *   before being XORed into the index. With plain XOR (default), windows
+ *   {A,B,C} and {C,B,A} hash to the same bucket because XOR commutes.
+ *   Rotation breaks that symmetry so reordered sequences index to
+ *   distinct buckets, reducing collisions at higher N.
+ *
+ *     0     plain XOR (default; N=2 stays bit-identical to AFL).
+ *     1     per-position rotation enabled.
+ *
+ *   Cost per emit: one additional shift + OR per prev slot. Still cheap
+ *   relative to the trap-and-signal entry cost.
+ *
+ *   Note: setting this to 1 with N=2 changes the AFL-compatible math
+ *   (the single prev slot is rotated before the XOR), so bitmaps will
+ *   not be byte-identical to a stock libcov ST run -- they still encode
+ *   edges, just under a different permutation of bucket indices.
+ *
+ *   Override at build: -DLIBCOV_NGRAM_ROTATE=1
+ *   Override in source: edit the value next to the #define below.
+ */
+#ifndef LIBCOV_NGRAM_ROTATE
+#define LIBCOV_NGRAM_ROTATE 0
+#endif
+
+/* ------------------------------------------------------------------ */
 /* Init-time logging (util.c)                                         */
 /* ------------------------------------------------------------------ */
 

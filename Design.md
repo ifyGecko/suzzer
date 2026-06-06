@@ -138,13 +138,15 @@ looks the address up in our sorted patch table.
 
 ### 3.3 Coverage emission
 
-If the PC is in our table, we emit an AFL-style edge:
+If the PC is in our table, we emit into the bitmap. The exact index
+formula is selected at build time by `LIBCOV_NGRAM_N` (default 2 =
+AFL edges; see §9.2 for block / AFL / N-gram schemes):
 
 ```c
 cur_loc  = hash16(pc)
-idx      = (prev_loc ^ cur_loc) & MAP_MASK    // 0..0xFFFF
+idx      = (prev_loc[0] ^ ... ^ prev_loc[N-2] ^ cur_loc) & MAP_MASK
 bitmap[idx]++                                  // saturating at 255
-prev_loc = cur_loc >> 1
+// shift window; freshest slot becomes cur_loc >> 1
 ```
 
 ### 3.4 Restore and continue
@@ -266,10 +268,12 @@ src/
   handler.h             trap-handler interface
   handler_st.c          ST trap handler (global g_last_restored)
   handler_mt.c          MT trap handler (TLS g_last_restored)
-  sink.h                inline edge hashing + sink_emit;
-                        macro-gated TLS vs global prev_loc + atomic vs plain inc
+  sink.h                inline N-gram emit + edge hashing + sink_emit;
+                        macro-gated TLS vs global prev_loc window + atomic vs
+                        plain inc; LIBCOV_NGRAM_N selects block / AFL edge /
+                        N-gram scheme
   sink_shm.c            64KB bitmap (shm_open + filesystem fallback);
-                        prev_loc definition (TLS for MT)
+                        prev_loc window definition (TLS for MT)
   membarrier.h, membarrier.c
                         MT-only; PRIVATE_EXPEDITED_SYNC_CORE wrapper
                         with init-time detection + graceful fallback
@@ -439,6 +443,11 @@ the value in the header or by passing `-D` flags at build time; the
 **`src/tunables.h`** — cross-cutting knobs:
 - `LIBCOV_TRAP_SIGNO` (default `SIGILL`).
 - `LIBCOV_MAP_SIZE_POW2` (default 16; coverage bitmap = 1 << POW2 bytes).
+- `LIBCOV_NGRAM_N` (default 2; window length for coverage scheme.
+  1 = block, 2 = AFL edges, 3..8 = N-gram. See §9.2.)
+- `LIBCOV_NGRAM_ROTATE` (default 0; when 1, per-position rotation
+  before XOR so reordered windows index to distinct buckets. Useful
+  at higher N to reduce XOR-commutativity collisions.)
 - `LIBCOV_LOG_BUFFER_SIZE` (default 512; per-message buffer in libcov_logf).
 
 **`src/tunables_<arch>.h`** — per-backend knobs. One file per arch:
@@ -605,21 +614,62 @@ from the handler at all — only from constructor code.
 - Compatible with AFL's classic bitmap layout — an external driver
   written for AFL bitmaps can read it directly.
 
-### 9.2 Edge hashing
+### 9.2 Coverage scheme (block / AFL / N-gram)
+
+`sink_emit` folds a window of the last `N-1` PCs into the bitmap
+bucket. `N` is the compile-time tunable `LIBCOV_NGRAM_N` in
+`src/tunables.h`; the bitmap layout, hash, saturating counter, and
+atomic emit path are all independent of `N`.
 
 ```c
 sink_emit(pc):
-    cur_loc  = hash16(pc)            // 64-bit mix → 16-bit
-    idx      = (prev_loc ^ cur_loc) & 0xFFFF
-    if bitmap[idx] != 255: bitmap[idx]++
-    prev_loc = cur_loc >> 1
+    cur          = hash16(pc)
+    idx          = cur
+    for j in 0..N-2:                          // unrolled / elided at N<=1
+        idx     ^= prev[j]                    // or rotated prev[j] (ROTATE=1)
+    idx         &= MAP_MASK
+    bitmap[idx] += 1                          // saturating; CAS loop under MT
+    for j in N-2 .. 1:                        // shift window: oldest drops off
+        prev[j]  = prev[j-1]
+    prev[0]      = cur >> 1                   // freshest entry
 ```
+
+| `N` | Index formula                              | Meaning of a bucket                                  |
+|-----|--------------------------------------------|------------------------------------------------------|
+| 1   | `idx = hash(pc)`                           | "block was hit"                                      |
+| 2   | `idx = hash(pc) ^ prev[0]`                 | "edge prev->cur was taken" (AFL math; default)       |
+| k>=3| `idx = hash(pc) ^ prev[0] ^ ... ^ prev[k-2]`| "last k control transfers in this thread were this tuple" |
 
 `hash16` is the standard splitmix-style 64-bit mixer truncated to 16
 bits. It's defined as a `static inline` in `sink.h` so the handler
 inlines the whole thing.
 
-`prev_loc` is a single uint16_t global. Single-threaded scope; no atomics.
+The `cur >> 1` shift when inserting into `prev[0]` is what makes AFL's
+A->B and B->A index to different buckets at N=2; the same shift keeps
+short reorderings distinguishable at higher N. With `LIBCOV_NGRAM_ROTATE=1`
+each `prev[j]` is rotated by a position-dependent amount before being
+XOR'd in, so windows `{A,B,C}` and `{C,B,A}` index to distinct buckets
+(plain XOR commutes); this reduces collisions when running at higher N
+in dense code.
+
+Per-thread storage is a fixed array `libcov_prev_loc[LIBCOV_NGRAM_WIN]`
+where `LIBCOV_NGRAM_WIN = max(N-1, 1)` — N=1 still allocates one
+(unused) slot so the array never has zero length. Under MT the array
+is `__thread`; under ST it is a process-wide global. boundary.c clears
+the whole window at every iteration boundary so cross-iteration
+context doesn't leak.
+
+The first `N-1` emits per thread XOR with zero-initialised window
+slots, biasing toward low buckets; this is the same warmup bias AFL
+already exhibits at iter-1 and is harmless in practice.
+
+The shipped consumers (`test/fuzz_driver.c`, the AFL-bitmap reader
+pattern) don't need to know `N` — the bitmap is still 64 KiB of
+saturating-count buckets and any "novelty" comparison works
+unchanged. If a future consumer wants to interpret the bitmap with
+knowledge of `N`, the spare bytes in `flags` or `reserved[16]` in
+`struct libcov_shm_header` are the natural place to record it
+(deferred until a consumer actually needs it).
 
 ### 9.3 Backing storage
 

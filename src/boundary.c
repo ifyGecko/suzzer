@@ -315,14 +315,15 @@ static void publish_snapshot(uint64_t gen) {
         (void)write(g_eventfd, &one, sizeof one);
     }
 
-    /* Clear live bitmap so iter N+1 starts at zero. Also reset prev_loc so
-     * AFL-style edge hashing doesn't carry across iterations. Under MT,
-     * racing emits from peer threads may land in the wrong iteration's
-     * snapshot by a few edges; that jitter is bounded (each peer thread
-     * does one emit at most before noticing the boundary's clear) and
-     * acceptable for AFL-style fuzzing. */
+    /* Clear live bitmap so iter N+1 starts at zero. Also clear the whole
+     * prev-PC window (N-gram coverage uses the last N-1 PCs as context;
+     * AFL-style at N=2 reduces to a single uint16_t) so cross-iteration
+     * context doesn't leak. Under MT, racing emits from peer threads may
+     * land in the wrong iteration's snapshot by a few edges; that jitter
+     * is bounded (each peer thread does one emit at most before noticing
+     * the boundary's clear) and acceptable for AFL-style fuzzing. */
     memset(libcov_bitmap, 0, LIBCOV_MAP_SIZE);
-    libcov_prev_loc = 0;
+    memset(libcov_prev_loc, 0, sizeof libcov_prev_loc);
 }
 
 static void apply_rearm_policy(struct patch_entry *exclude) {

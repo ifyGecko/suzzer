@@ -75,15 +75,15 @@ either is fine — `-D` wins because the preprocessor sees it first:
 2. **Pass `-D` on the build line**, e.g.
    `make EXTRA_CFLAGS='-DLIBCOV_ARCH_MIPS_ILLEGAL=0xDEADBEEFu'`.
 
-| Concern                                  | Header                  |
-|------------------------------------------|-------------------------|
-| Trap signal, bitmap size, log buffer     | `src/tunables.h`        |
-| x86_64 illegal encoding / widths         | `src/tunables_x86_64.h` |
-| aarch64 illegal encoding / widths        | `src/tunables_aarch64.h`|
-| arm + Thumb illegal encodings / widths   | `src/tunables_arm.h`    |
-| MIPS / MIPS64 illegal encodings / widths | `src/tunables_mips.h`, `src/tunables_mips64.h` |
-| PowerPC / PowerPC64 illegal encodings    | `src/tunables_powerpc.h`, `src/tunables_powerpc64.h` |
-| RISC-V illegal encodings / widths        | `src/tunables_riscv64.h`|
+| Concern                                                     | Header                  |
+|-------------------------------------------------------------|-------------------------|
+| Trap signal, bitmap size, **N-gram width**, log buffer      | `src/tunables.h`        |
+| x86_64 illegal encoding / widths                            | `src/tunables_x86_64.h` |
+| aarch64 illegal encoding / widths                           | `src/tunables_aarch64.h`|
+| arm + Thumb illegal encodings / widths                      | `src/tunables_arm.h`    |
+| MIPS / MIPS64 illegal encodings / widths                    | `src/tunables_mips.h`, `src/tunables_mips64.h` |
+| PowerPC / PowerPC64 illegal encodings                       | `src/tunables_powerpc.h`, `src/tunables_powerpc64.h` |
+| RISC-V illegal encodings / widths                           | `src/tunables_riscv64.h`|
 
 Each tunables file opens with a banner explaining both override paths;
 each individual knob carries its own doc block (purpose, default,
@@ -208,6 +208,40 @@ to be instrumented.
 | `LIBCOV_BOUNDARY_RING` | `4` | Number of snapshot slots (2..16). Driver lag tolerance = `RING - 1` iterations. |
 | `LIBCOV_BOUNDARY_INIT_GRACE` | `0` | Drop the first N marker hits before publishing (skip init noise). |
 | `LIBCOV_BOUNDARY_NOTIFY_FD` | unset | Inherited fd; libcov writes 8 bytes after each snapshot (eventfd-style wakeup). Counter polling works without it. |
+
+## Coverage scheme (N-gram)
+
+How a trap turns into a bitmap bucket is configurable at build time
+through `LIBCOV_NGRAM_N` (and `LIBCOV_NGRAM_ROTATE`) in `src/tunables.h`.
+The bitmap layout (size, hash, saturating uint8 counters, atomic emit
+under MT) is identical across all settings — readers, AFL-style
+drivers, and the snapshot ring need no changes.
+
+| `LIBCOV_NGRAM_N` | Scheme            | Index formula                                  | When to use                                 |
+|------------------|-------------------|------------------------------------------------|---------------------------------------------|
+| `1`              | Block coverage    | `idx = hash(pc)`                               | Lowest overhead; "did this block run" only. |
+| `2` (**default**)| AFL-style edges   | `idx = hash(pc) ^ prev[0]`                     | Bit-for-bit identical to historical libcov. |
+| `3..8`           | N-gram coverage   | `idx = hash(pc) ^ prev[0] ^ ... ^ prev[N-2]`   | Path-sensitive; distinguishes loop trips, dispatch sequences, and call-chain variants the same edge map collapses. |
+
+```sh
+# Block coverage (cheapest):
+make EXTRA_CFLAGS='-DLIBCOV_NGRAM_N=1'
+
+# 4-gram coverage:
+make EXTRA_CFLAGS='-DLIBCOV_NGRAM_N=4'
+
+# 8-gram with per-position rotation (defeats {A,B,C} == {C,B,A} XOR collisions):
+make EXTRA_CFLAGS='-DLIBCOV_NGRAM_N=8 -DLIBCOV_NGRAM_ROTATE=1'
+```
+
+Cost is roughly `N-1` extra XORs and `N-1` TLS stores per emit — well
+below the SIGILL trap entry cost on every architecture. Constraints:
+`N` in `[1, 8]` (enforced via a compile-time `_Static_assert`); higher
+caps inflate TLS pressure and collision rate without proportional
+sensitivity gain. The window is cleared at each iteration boundary
+under boundary mode and at process init under either threading
+variant. The two knobs are documented in detail next to their
+`#define`s in `src/tunables.h`.
 
 ## Modes
 

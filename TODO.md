@@ -5,6 +5,17 @@ become blocking. Captured here so design context isn't lost.
 
 ## Done since last revision
 
+- **N-gram coverage scheme**: `LIBCOV_NGRAM_N` (1..8) selects block
+  coverage (N=1), AFL-style edges (N=2, default, bit-for-bit identical
+  to the historical emit), or N-gram coverage (N>=3) at build time.
+  `LIBCOV_NGRAM_ROTATE` adds per-position rotation to defeat XOR-
+  commutativity collisions at higher N. Bitmap layout, hash,
+  saturation, and atomic emit path are independent of N -- existing
+  consumers and the snapshot ring need no changes. Per-thread prev-PC
+  storage grew from a single `uint16_t` to a `uint16_t[N-1]` window;
+  the boundary publish path clears the whole window per-iter. Both ST
+  and MT validated end-to-end at N=1/2/4/8 plus rotate; cross-arch
+  smoke confirms every backend still builds and links clean.
 - **Iteration boundary**: per-target sidecar (LCVB1) names marker
   addresses; on each hit libcov publishes the live bitmap to a snapshot
   ring in shm, clears the live bitmap, and applies a configurable re-arm
@@ -58,6 +69,26 @@ makes it useful against network daemons.
   inner loops from collapsing throughput.
 - **dlopen hook**: instrument libraries loaded *after* libcov init
   (plugins, lazily-loaded modules). Probably an LCV3 extension.
+
+## N-gram follow-ups
+
+- **Runtime-selectable N**. Today `LIBCOV_NGRAM_N` is purely compile-
+  time so the hot path stays branch-free and fully unrollable. If a
+  user wants to A/B different N values without rebuilding, add a
+  `LIBCOV_NGRAM_RUNTIME` tunable: compile-time `N` becomes the
+  *maximum* and an env var picks the actual window length at init,
+  clamped to `[1, max]`. Costs one runtime-resolved loop bound per
+  emit, which is negligible relative to the trap-and-signal entry.
+- **Hybrid coverage publish**. Some research workflows want both
+  AFL-style edges and an N-gram view at the same time. Requires an
+  extra bitmap region in the shm layout (header field for
+  `aux_bitmap_offset` + `aux_scheme_n`) and consumer support. Hold
+  until a concrete consumer needs it.
+- **Tag N in the shm header**. Consumers today don't need to know
+  `N` (the bitmap is opaque buckets), but if a future
+  AFL-mode-vs-N-gram-mode comparison tool wants to dispatch on the
+  producer's scheme, pack `N` into the spare upper bytes of
+  `hdr->flags` (additive; old readers ignore them).
 
 ## MT follow-ups
 

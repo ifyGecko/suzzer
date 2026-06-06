@@ -3,14 +3,28 @@
  *
  * The .so build defines exactly one of LIBCOV_THREADING_ST or
  * LIBCOV_THREADING_MT. This header switches the inline emit body and the
- * type of prev_loc accordingly:
+ * type of the prev-PC window accordingly:
  *
- *   ST: single uint16_t prev_loc global; bitmap byte incremented directly.
- *   MT: per-thread (__thread) prev_loc; bitmap byte incremented via an
+ *   ST: a single uint16_t window global; bitmap byte incremented directly.
+ *   MT: a per-thread (__thread) window; bitmap byte incremented via an
  *       atomic CAS loop that saturates at 255 without ever decrementing.
  *
  * Both implementations of sink_emit are async-signal-safe and inline at
  * the trap-handler call site.
+ *
+ * Coverage scheme (LIBCOV_NGRAM_N in tunables.h):
+ *
+ *   N=1   block coverage: idx = hash(pc). Window unused.
+ *   N=2   AFL-style edges: idx = hash(pc) ^ prev[0]. Default; bit-for-bit
+ *         identical to the historical libcov emit.
+ *   N>=3  N-gram coverage: idx XORs in prev[0..N-2], encoding the last
+ *         N control transfers in this thread. Bitmap layout (size, hash,
+ *         saturation, atomics) is unchanged regardless of N.
+ *
+ * The window is stored as `libcov_prev_loc[LIBCOV_NGRAM_WIN]` -- one slot
+ * per remembered PC. N=1 still allocates one (unused) slot so the array
+ * never has zero length. boundary.c clears the whole window at each
+ * iteration boundary so cross-iteration context doesn't leak.
  *
  * Shm layout (created by sink_init):
  *
@@ -28,10 +42,24 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#include "tunables.h"   /* LIBCOV_MAP_SIZE_POW2 */
+#include "tunables.h"   /* LIBCOV_MAP_SIZE_POW2, LIBCOV_NGRAM_N, LIBCOV_NGRAM_ROTATE */
 
 #define LIBCOV_MAP_SIZE      (1u << LIBCOV_MAP_SIZE_POW2)
 #define LIBCOV_MAP_MASK      (LIBCOV_MAP_SIZE - 1u)
+
+/* Compile-time clamp on N. Bumping this cap requires accepting a few
+ * more TLS bytes per thread and (slightly) more collision pressure;
+ * adjust here together with the doc in tunables.h. */
+_Static_assert(LIBCOV_NGRAM_N >= 1 && LIBCOV_NGRAM_N <= 8,
+               "LIBCOV_NGRAM_N must be in [1, 8]");
+
+/* Number of remembered prev-PC slots. At least 1 so the storage array
+ * never has zero length (N=1 leaves the slot unused). */
+#if LIBCOV_NGRAM_N >= 2
+#  define LIBCOV_NGRAM_WIN (LIBCOV_NGRAM_N - 1)
+#else
+#  define LIBCOV_NGRAM_WIN 1
+#endif
 
 /* Allocate header + live bitmap + ring; map them as one contiguous shm
  * region. ring_size is clamped to [2, 16]. */
@@ -45,9 +73,9 @@ extern size_t libcov_shm_size;
 extern uint8_t *libcov_bitmap;
 
 #if defined(LIBCOV_THREADING_MT)
-extern __thread uint16_t libcov_prev_loc;
+extern __thread uint16_t libcov_prev_loc[LIBCOV_NGRAM_WIN];
 #else
-extern uint16_t libcov_prev_loc;
+extern uint16_t libcov_prev_loc[LIBCOV_NGRAM_WIN];
 #endif
 
 static inline uint16_t sink_hash_pc(uintptr_t pc) {
@@ -59,9 +87,35 @@ static inline uint16_t sink_hash_pc(uintptr_t pc) {
     return (uint16_t)(v & LIBCOV_MAP_MASK);
 }
 
+#if LIBCOV_NGRAM_ROTATE
+/* Position-dependent rotate so {A,B,C} and {C,B,A} index differently.
+ * The rotation amounts are chosen non-zero and coprime-ish vs. 16 so
+ * adjacent slots don't share rotation amounts. */
+static inline uint16_t sink_ngram_rot(uint16_t v, unsigned j) {
+    unsigned r = ((j + 1u) * 3u) & 15u;   /* 3, 6, 9, 12, 15, 2, 5 */
+    if (!r) return v;
+    return (uint16_t)((v << r) | (v >> (16u - r)));
+}
+#endif
+
 static inline void sink_emit(uintptr_t pc) {
     uint16_t cur = sink_hash_pc(pc);
-    uint16_t idx = (uint16_t)(libcov_prev_loc ^ cur) & LIBCOV_MAP_MASK;
+
+    /* Fold the last N-1 PCs into the bucket index. N=1 collapses to
+     * idx = hash(pc) (the for-loop body is preprocessed away). N=2
+     * collapses to idx = cur ^ prev[0] -- AFL's exact math. */
+    uint16_t idx = cur;
+#if LIBCOV_NGRAM_N >= 2
+    for (int j = 0; j < LIBCOV_NGRAM_WIN; j++) {
+#  if LIBCOV_NGRAM_ROTATE
+        idx ^= sink_ngram_rot(libcov_prev_loc[j], (unsigned)j);
+#  else
+        idx ^= libcov_prev_loc[j];
+#  endif
+    }
+#endif
+    idx &= LIBCOV_MAP_MASK;
+
 #if defined(LIBCOV_THREADING_MT)
     /* Saturating atomic increment: load + CAS loop, never decrement past 255. */
     uint8_t old = __atomic_load_n(&libcov_bitmap[idx], __ATOMIC_RELAXED);
@@ -75,7 +129,16 @@ static inline void sink_emit(uintptr_t pc) {
 #else
     if (libcov_bitmap[idx] != 255) libcov_bitmap[idx]++;
 #endif
-    libcov_prev_loc = (uint16_t)(cur >> 1);
+
+    /* Shift the window: oldest slot (prev[WIN-1]) drops off; freshest
+     * slot (prev[0]) holds (cur >> 1). The shift is what makes AFL's
+     * A->B and B->A index to different buckets at N=2; the same shift
+     * keeps short reorderings distinguishable at higher N. */
+#if LIBCOV_NGRAM_N >= 2
+    for (int j = LIBCOV_NGRAM_WIN - 1; j > 0; j--)
+        libcov_prev_loc[j] = libcov_prev_loc[j - 1];
+    libcov_prev_loc[0] = (uint16_t)(cur >> 1);
+#endif
 }
 
 #endif
