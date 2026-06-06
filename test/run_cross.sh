@@ -122,7 +122,7 @@ with open('$LCV','rb') as f:
     print(c)")
     echo "  patch records: $record_count"
 
-    libcov_so="$ROOT/build/$build_arch/libcov.so"
+    libcov_so="$ROOT/build/$build_arch/libcov_st.so"
 
     # Determinism check: same input twice = identical bitmaps.
     rm -f "$SHM" "$LOG"

@@ -11,8 +11,16 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
-uint8_t  *libcov_bitmap   = NULL;
-uint16_t  libcov_prev_loc = 0;
+uint8_t *libcov_bitmap = NULL;
+
+/* prev_loc: shared global for ST builds; TLS for MT builds so concurrent
+ * threads don't fight over edge attribution. The declaration in sink.h
+ * picks the same qualifier; keep them in sync. */
+#if defined(LIBCOV_THREADING_MT)
+__thread uint16_t libcov_prev_loc = 0;
+#else
+uint16_t libcov_prev_loc = 0;
+#endif
 
 static int try_shm_open(const char *name, int *fd_out) {
     /* shm_open requires a leading slash. */

@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ARCH="${ARCH:-$(uname -m)}"
-LIB="$ROOT/build/$ARCH/libcov.so"
+LIB="$ROOT/build/$ARCH/libcov_st.so"
 TARGET="$ROOT/build/$ARCH/target_simple"
 LCV="/tmp/target_simple.lcv"
 SHM="/tmp/libcov_validate"

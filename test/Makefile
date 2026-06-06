@@ -8,9 +8,12 @@ BUILD ?= ../build/$(ARCH)
 CC      := $(CROSS)gcc
 CFLAGS  ?= -O0 -g -Wall -Wextra
 
-.PHONY: all clean
+.PHONY: all clean mt
 
 all: $(BUILD)/target_simple $(BUILD)/fuzz_driver
+
+# pthread MT stress target. Built on demand by the MT validation scripts.
+mt: $(BUILD)/target_simple_mt
 
 # -no-pie keeps test addresses static for easy patch-list generation.
 # -fno-stack-protector trims function prologue noise.
@@ -34,5 +37,9 @@ thumb: $(BUILD)/target_simple_thumb
 $(BUILD)/fuzz_driver: fuzz_driver.c
 	$(CC) -O2 -g -Wall -Wextra -o $@ $<
 
+$(BUILD)/target_simple_mt: target_simple_mt.c
+	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -pthread -o $@ $<
+
 clean:
-	rm -rf $(BUILD)/target_simple $(BUILD)/target_simple_thumb $(BUILD)/fuzz_driver
+	rm -rf $(BUILD)/target_simple $(BUILD)/target_simple_thumb \
+	       $(BUILD)/target_simple_mt $(BUILD)/fuzz_driver

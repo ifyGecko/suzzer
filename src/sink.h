@@ -1,9 +1,16 @@
 /*
- * sink.h -- AFL-style 64KB shared-memory bitmap.
+ * sink.h -- AFL-style 64KB shared-memory bitmap. Threading-mode aware.
  *
- * Single-threaded PoC: no atomics needed. The handler computes a 16-bit
- * cur_loc from PC, indexes bitmap[prev_loc ^ cur_loc] with saturating
- * increment, then updates prev_loc = cur_loc >> 1.
+ * The .so build defines exactly one of LIBCOV_THREADING_ST or
+ * LIBCOV_THREADING_MT. This header switches the inline emit body and the
+ * type of prev_loc accordingly:
+ *
+ *   ST: single uint16_t prev_loc global; bitmap byte incremented directly.
+ *   MT: per-thread (__thread) prev_loc; bitmap byte incremented via an
+ *       atomic CAS loop that saturates at 255 without ever decrementing.
+ *
+ * Both implementations of sink_emit are async-signal-safe and inline at
+ * the trap-handler call site.
  */
 #ifndef LIBCOV_SINK_H
 #define LIBCOV_SINK_H
@@ -17,9 +24,13 @@
 
 int sink_init(const char *path);
 
-/* Pointer to the mmap'd region. Single allocation, never moves. */
-extern uint8_t  *libcov_bitmap;
-extern uint16_t  libcov_prev_loc;
+extern uint8_t *libcov_bitmap;
+
+#if defined(LIBCOV_THREADING_MT)
+extern __thread uint16_t libcov_prev_loc;
+#else
+extern uint16_t libcov_prev_loc;
+#endif
 
 static inline uint16_t sink_hash_pc(uintptr_t pc) {
     /* Cheap mixer chosen so adjacent PCs don't collide. */
@@ -33,7 +44,19 @@ static inline uint16_t sink_hash_pc(uintptr_t pc) {
 static inline void sink_emit(uintptr_t pc) {
     uint16_t cur = sink_hash_pc(pc);
     uint16_t idx = (uint16_t)(libcov_prev_loc ^ cur) & LIBCOV_MAP_MASK;
+#if defined(LIBCOV_THREADING_MT)
+    /* Saturating atomic increment: load + CAS loop, never decrement past 255. */
+    uint8_t old = __atomic_load_n(&libcov_bitmap[idx], __ATOMIC_RELAXED);
+    while (old < 255) {
+        uint8_t want = (uint8_t)(old + 1);
+        if (__atomic_compare_exchange_n(&libcov_bitmap[idx], &old, want,
+                                        0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            break;
+        /* old now holds the value we observed; loop and retry. */
+    }
+#else
     if (libcov_bitmap[idx] != 255) libcov_bitmap[idx]++;
+#endif
     libcov_prev_loc = (uint16_t)(cur >> 1);
 }
 
