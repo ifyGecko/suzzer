@@ -78,6 +78,108 @@ makes it useful against network daemons.
   consume serious CPU in trap+spinlock overhead. Auto-disarm above
   threshold N (per-site, atomic counter) keeps throughput stable.
 
+## Patch-list generator improvements
+
+The generator now supports hand-picked instrumentation slices via
+`--root` / `--cutoff` / `--max-depth` (see `tools/gen_patchlist.py` and
+the README section "Selective instrumentation"). Items below are
+follow-ups worth doing as the tool sees real-world use.
+
+### Slice resolution / quality
+
+- **Indirect-call resolution**. Static slicing via rizin's `callrefs`
+  misses function pointers, vtables, switch-via-table dispatch, and
+  callback-driven flows (libevent, glib, JS-engine bytecode dispatch).
+  Options, roughly in order of effort:
+    1. Heuristic: collect any function whose address is taken (rizin
+       `axt @ <fn-entry>` returns xrefs *to* the function -- including
+       DATA refs that suggest the address is being stored). Optionally
+       union them into the reachable set under a `--include-addr-taken`
+       flag.
+    2. Value-set analysis via Ghidra (headless) -- much heavier dep, but
+       resolves table-driven dispatch on simple parsers.
+    3. Runtime augmentation: run the binary once under a tracer
+       (uftrace, eBPF uprobes, even our own `LIBCOV_MODE=oneshot` with a
+       broad initial slice) to record which addresses actually get
+       called from where, then re-generate a slice anchored on the
+       runtime call graph. Hybrid static+dynamic is usually the right
+       answer for production fuzzing.
+
+- **Tail-call detection**. Rizin classifies some `jmp` instructions as
+  `CALL` and others as `JMP`/`CODE`. Today we only follow `CALL`. Add a
+  pass that inspects the jump target: if it's the entry of another
+  function in the analyzed set AND the source block is the function's
+  terminator, count it as a tail-call edge. Gate behind `--follow-tail`
+  to keep default behavior conservative.
+
+- **Address-taken roots**. Often the user knows "this callback gets
+  registered with foo_set_handler" but doesn't know who calls the
+  handler. Allow `--root @0x401234` to read a function-pointer value
+  from a constant address (rizin `pv8 @ <addr>`) and treat the
+  dereferenced address as the root. Useful for vtable / dispatch-table
+  fuzzing.
+
+- **Per-basic-block cutoff**. Today cutoffs are function-granular;
+  excising "everything below this basic block inside function X" is
+  more surgical. Implement as an extension of `--cutoff` accepting
+  `FUNC+0x40` syntax: BFS over basic blocks inside that function instead
+  of functions, excluding the named block and its successors.
+
+- **Negative slicing (`--exclude-reachable`)**. Subtract the slice
+  reachable from a "noisy" root (e.g. the logging subsystem) from the
+  main slice. Useful for keeping hot-loop logging code out of coverage.
+
+- **Backward slicing (`--callers-of`)**. Given a leaf function X,
+  instrument every function that can reach X. Inverse of `--root`. Good
+  for fault localization after a crash: "what could have led to this
+  trap?"
+
+### Symbol & address ergonomics
+
+- **Globbing in --root/--cutoff**. Accept `--root 'parse_*'` and expand
+  via fnmatch against the function list. Easier than chaining ten
+  `--root` flags by hand.
+
+- **Slice file format**. Accept `--root-file PATH` containing one
+  symbol/address per line, optionally with comments. Lets users keep
+  the slice spec under version control instead of in shell history.
+
+- **Improved stripped-binary resolution**. With no symbols, the
+  function list is all `fcn.<hex>`. The generator should accept a
+  user-supplied symbol map (`name=0xADDR` lines) as `--symbols PATH` so
+  the user can name the entry points they care about.
+
+### Visualization / dry-run
+
+- **Dot/Graphviz dump**. `--dump-graph slice.dot` after BFS to render
+  the slice as a call graph. Easier to spot missing branches than
+  reading the linear `--print-reachable` output.
+
+- **Slice diff**. `--diff baseline.lcv` to print which functions are in
+  the new patchlist but not the baseline (and vice versa). Useful when
+  iterating on cutoff lists.
+
+### Performance / correctness
+
+- **Cache the rizin session**. Today `pick_sites` does one `rizin -q -c
+  "aaa; afbj @ X"` per function, re-running `aaa` each time. For a
+  500-function binary that's the single biggest wall-clock cost. Move
+  to a persistent rizin process via FIFO/socket (poor-man's rzpipe
+  without the Python dep), or batch all `afbj`/`pdj` queries into one
+  session like `build_call_graph` already does.
+
+- **Verify slice against runtime hits**. After a fuzz run, diff the
+  bitmap's hit set against the static slice. Bitmap edges not in the
+  slice are bugs in our slicing (or indirect-call gaps); slice entries
+  with zero hits are dead code the user can prune from the patchlist
+  next round.
+
+- **Selectivity-aware MT generation**. When `--threading mt`
+  drops sites for cache-line straddling, the user currently only sees
+  a count. Print the dropped offsets under `--verbose` so the user can
+  decide whether to nudge the source to re-emit those instructions on
+  aligned boundaries.
+
 ## Tooling / transport
 
 - **`suzzer-relay`**: tiny standalone tool to be deployed on the target

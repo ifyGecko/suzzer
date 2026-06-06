@@ -87,6 +87,67 @@ The 64 KB AFL-style bitmap is written to `/tmp/cov` (or whatever path
 `LIBCOV_SHM_PATH` points at). An external fuzzer mmaps the same file/SHM
 and reads hit-counts.
 
+## Selective instrumentation (call-graph slicing)
+
+Real-world fuzz targets rarely need every function in the binary
+instrumented; the interesting coverage lives in the input-parsing and
+state-machine code reached from the request handler. The generator
+supports hand-picking that region with three flags:
+
+```
+--root SYM_OR_ADDR     # BFS seed: function name or address (repeatable)
+--cutoff SYM_OR_ADDR   # boundary: excluded and not traversed (repeatable)
+--max-depth N          # bound BFS to N call-edges below each root
+--print-reachable      # dump the slice to stderr and exit (dry-run)
+```
+
+The slice is built from rizin's static call graph (`afij` callrefs). PLT
+stubs and library imports are automatically out-of-graph and so act as
+implicit cutoffs at the library boundary. When `--root` is combined with
+`--include-pat` / `--exclude-pat` the result is their **intersection**:
+a function must be both reachable from a root AND pass the regex filter
+to be instrumented.
+
+### Resolution rules for SYM_OR_ADDR
+
+- `0x401234` / `401234` / `4198964` → address. If the address is inside a
+  function but not at its entry, the enclosing function's entry is used
+  (with a note printed to stderr).
+- `main` → tries exact match, then `dbg.main`, `sym.main`, `fcn.main`,
+  `sym.imp.main`, then matches the last dotted segment of any function
+  name. Ambiguous suffix matches are an error.
+- `dbg.parse_request` → exact rizin name.
+
+### Example
+
+```
+# Iterate on the slice first (no patchlist written):
+./tools/gen_patchlist.py build/x86_64/target_simple /dev/null \
+    --root main \
+    --cutoff cmdline \
+    --print-reachable -v
+
+# Then write the patchlist:
+./tools/gen_patchlist.py build/x86_64/target_simple /tmp/t.lcv \
+    --root main \
+    --cutoff cmdline \
+    --max-depth 4
+```
+
+### Known limits
+
+- **Indirect calls** (function pointers, vtables, dispatch tables) are
+  invisible to rizin's static analysis. Slices through them require
+  another `--root` at the callee.
+- **Tail calls** lowered to `jmp` may or may not appear as `CALL`
+  callrefs depending on rizin's classification. Verify a suspect slice
+  with `--print-reachable`.
+- **Cutoffs are function-granular**. Excising a single basic block
+  inside a function is a future feature (see `TODO.md`).
+- **Recursion bounds matter** for huge binaries. `--max-depth` is the
+  primary throttle; without it a `--root main` on a 5000-function
+  binary will likely BFS the entire executable.
+
 ## Environment variables
 
 | Var | Default | Meaning |
