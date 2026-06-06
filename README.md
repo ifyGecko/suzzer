@@ -29,17 +29,21 @@ where Frida or DynamoRIO are too heavy.
 
 ## Supported backends
 
-| Backend           | Trap insn       | Signal  | Patch len | Notes                              |
-|-------------------|-----------------|---------|-----------|------------------------------------|
-| x86_64            | UD2             | SIGILL  | 2..15     | Variable insn length               |
-| aarch64           | UDF #0 (zeros)  | SIGILL  | 4         |                                    |
-| arm (ARM mode)    | UDF 0xE7F000F0  | SIGILL  | 4         |                                    |
-| arm (Thumb mode)  | UDF.N 0xDE00    | SIGILL  | 2         | Per-function bits=16 detection     |
-| mips, mipsel      | BREAK 0         | SIGTRAP | 4         | Generator skips branch delay slots |
-| mips64, mips64el  | BREAK 0         | SIGTRAP | 4         | Same as mips32                     |
-| powerpc           | tw 31,0,0       | SIGTRAP | 4         |                                    |
-| powerpc64 BE+LE   | tw 31,0,0       | SIGTRAP | 4         | Local-entry-aware patch generation |
-| riscv64           | c.unimp (zero)  | SIGILL  | 2 or 4    | Mixed 2-byte (C) / 4-byte insns    |
+Every backend raises `LIBCOV_TRAP_SIGNO` (= `SIGILL` by default). Every
+encoding below is the *shipped default* and is overridable via the
+per-backend tunables header (see [Tunables](#tunables)).
+
+| Backend           | Default trap insn        | Patch len | Notes                                   |
+|-------------------|--------------------------|-----------|-----------------------------------------|
+| x86_64            | UD2 (`0F 0B`)            | 2..15 / 2 | ST: UD2 + NOP pad; MT: UD2 only         |
+| aarch64           | UDF #0 (`0x00000000`)    | 4         |                                         |
+| arm (ARM mode)    | UDF `0xE7F000F0`         | 4         |                                         |
+| arm (Thumb mode)  | UDF.N `0xDE00`           | 2         | Per-function bits=16 detection          |
+| mips, mipsel      | user-mode `MFC0 $0,$0`   | 4         | Was BREAK 0 / SIGTRAP; skips delay slots|
+| mips64, mips64el  | user-mode `MFC0 $0,$0`   | 4         | Same rationale as mips32                |
+| powerpc           | all-zero (`0x00000000`)  | 4         | Was `tw 31,0,0` / SIGTRAP               |
+| powerpc64 BE+LE   | all-zero (`0x00000000`)  | 4         | Was `tw 31,0,0` / SIGTRAP               |
+| riscv64           | c.unimp (`0x0000`)       | 2 or 4    | Mixed 2-byte (C) / 4-byte insns         |
 
 All backends validated end-to-end under `qemu-<arch>-static`:
 `test/run_cross.sh`.
@@ -60,6 +64,48 @@ Outputs land in `build/<arch>/libcov_<threading>.so` (and
 `build/<arch>/target_simple` for the ST test target;
 `build/<arch>/target_simple_mt` for the pthread stress target via
 `make -C test ... mt`).
+
+## Tunables
+
+Build-time configuration lives in two layers of headers, each using the
+same `#ifndef`-guard pattern. There are two ways to change a default and
+either is fine — `-D` wins because the preprocessor sees it first:
+
+1. **Edit the value in the header**, next to the `#define`.
+2. **Pass `-D` on the build line**, e.g.
+   `make EXTRA_CFLAGS='-DLIBCOV_ARCH_MIPS_ILLEGAL=0xDEADBEEFu'`.
+
+| Concern                                  | Header                  |
+|------------------------------------------|-------------------------|
+| Trap signal, bitmap size, log buffer     | `src/tunables.h`        |
+| x86_64 illegal encoding / widths         | `src/tunables_x86_64.h` |
+| aarch64 illegal encoding / widths        | `src/tunables_aarch64.h`|
+| arm + Thumb illegal encodings / widths   | `src/tunables_arm.h`    |
+| MIPS / MIPS64 illegal encodings / widths | `src/tunables_mips.h`, `src/tunables_mips64.h` |
+| PowerPC / PowerPC64 illegal encodings    | `src/tunables_powerpc.h`, `src/tunables_powerpc64.h` |
+| RISC-V illegal encodings / widths        | `src/tunables_riscv64.h`|
+
+Each tunables file opens with a banner explaining both override paths;
+each individual knob carries its own doc block (purpose, default,
+override syntax, constraints). The headers are the source of truth for
+the configurable surface area — there is no separate options table.
+
+**Worked example: retarget the MIPS illegal encoding for a chip rev
+that traps the default differently.** Either:
+
+```sh
+# (a) edit the default in the header
+$EDITOR src/tunables_mips.h    # change LIBCOV_ARCH_MIPS_ILLEGAL
+make ARCH=mips
+
+# (b) or override at build time without touching the file
+make ARCH=mips \
+    EXTRA_CFLAGS='-DLIBCOV_ARCH_MIPS_ILLEGAL=0xDEADBEEFu'
+```
+
+Note: `src/patchlist_format.h` (renamed from `src/config.h`) is the
+on-disk patch-list wire format and the runtime `patch_entry` struct —
+**not** a tunables header.
 
 ## Quick start
 
@@ -423,8 +469,14 @@ across runs are easier with ASLR off.
 src/
   libcov.c            constructor; env parsing; sigaction/signal interception
   util.c/.h           /proc/self/maps parsing; init-time logger
-  config.c/.h         LCV1+LCV2 mmap loader; sorted patch_entry table (endian-safe);
+  config.c            LCV1+LCV2 mmap loader; sorted patch_entry table (endian-safe);
                       threading-hint enforcement
+  patchlist_format.h  on-disk LCV1/LCV2 wire format + runtime patch_entry struct
+                      (renamed from config.h; not a tunables file)
+  tunables.h          project-wide knobs (trap signo default SIGILL, bitmap size,
+                      log buf); every knob -D-overridable
+  tunables_<arch>.h   per-backend knobs (illegal encoding(s), instruction-width
+                      bounds); one per backend, every knob -D-overridable
   patch.h             arm/disarm/lookup + batch rearm interface (same ABI both variants)
   patch_st.c          ST: mprotect + memcpy + cache flush; batch rearm
   patch_mt.c          MT: /proc/self/mem + per-entry spinlock + membarrier(SYNC_CORE);
@@ -438,15 +490,15 @@ src/
                       per-thread depth + touched-set under MT
   membarrier.h/.c     MT-only; PRIVATE_EXPEDITED_SYNC_CORE wrapper with fallback
   arch.h              backend interface (extern symbols, no #ifdefs)
-  arch_x86_64.c       ST x86: UD2 + NOP padding / SIGILL / 2..15 bytes
-  arch_x86_64_mt.c    MT x86: UD2 head-only (single atomic 2-byte write)
-  arch_aarch64.c      UDF #0 / SIGILL / 4-byte fixed (ST+MT)
-  arch_arm.c          ARM UDF + Thumb UDF.N / SIGILL / 2 or 4 bytes (ST+MT)
-  arch_mips.c         BREAK 0 / SIGTRAP / 4-byte fixed MIPS32 BE+LE (ST+MT)
+  arch_x86_64.c       x86 UD2 (ST: + NOP pad / 2..15 bytes;
+                      MT: head-only via #ifdef LIBCOV_THREADING_MT / 2 bytes)
+  arch_aarch64.c      UDF #0 / 4-byte fixed (ST+MT)
+  arch_arm.c          ARM UDF + Thumb UDF.N / 2 or 4 bytes (ST+MT)
+  arch_mips.c         user-mode MFC0 / 4-byte fixed MIPS32 BE+LE (ST+MT)
   arch_mips64.c       same / 4-byte fixed (ST+MT)
-  arch_powerpc.c      tw 31,0,0 / SIGTRAP / PPC32 BE (ST+MT)
-  arch_powerpc64.c    tw 31,0,0 / SIGTRAP / PPC64 BE+LE (ST+MT)
-  arch_riscv64.c      c.unimp / SIGILL / 2-or-4-byte (ST+MT)
+  arch_powerpc.c      all-zero illegal / PPC32 BE (ST+MT)
+  arch_powerpc64.c    all-zero illegal / PPC64 BE+LE (ST+MT)
+  arch_riscv64.c      c.unimp / 2-or-4-byte (ST+MT)
 test/
   target_simple.c             single-shot ground-truth target (10+ branches)
   target_simple_mt.c          pthread stress target for MT validation

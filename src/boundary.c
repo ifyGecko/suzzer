@@ -17,7 +17,7 @@
  */
 #define _GNU_SOURCE
 #include "boundary.h"
-#include "config.h"
+#include "patchlist_format.h"
 #include "patch.h"
 #include "sink.h"
 #include "util.h"

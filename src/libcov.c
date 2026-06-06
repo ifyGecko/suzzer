@@ -1,11 +1,12 @@
 #define _GNU_SOURCE
 #include "util.h"
-#include "config.h"
+#include "patchlist_format.h"
 #include "patch.h"
 #include "handler.h"
 #include "sink.h"
 #include "arch.h"
 #include "boundary.h"
+#include "tunables.h"   /* LIBCOV_TRAP_SIGNO */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -77,7 +78,7 @@ static void libcov_init(void) {
 
 /* ---- sigaction / signal interception (hardening) ---------------- *
  * If the target tries to install its own handler for our trap signal
- * (SIGILL or SIGTRAP depending on arch) after we've armed, silently keep
+ * (LIBCOV_TRAP_SIGNO -- SIGILL by default) after we've armed, silently keep
  * ours and report success so the target's flow isn't broken, but stash
  * the requested handler so a *real* trap still chains through. */
 
@@ -104,7 +105,7 @@ static int              g_target_trap_sa_valid = 0;
 int sigaction(int signo, const struct sigaction *act, struct sigaction *oldact) {
     sigaction_fn real = real_sigaction_fn();
     if (!real) { errno = ENOSYS; return -1; }
-    if (g_initialized && signo == libcov_trap_signo) {
+    if (g_initialized && signo == LIBCOV_TRAP_SIGNO) {
         if (oldact) {
             if (g_target_trap_sa_valid) *oldact = g_target_trap_sa;
             else { memset(oldact, 0, sizeof *oldact); oldact->sa_handler = SIG_DFL; }
@@ -119,7 +120,7 @@ int sigaction(int signo, const struct sigaction *act, struct sigaction *oldact) 
 sighandler_fn signal(int signo, sighandler_fn h) {
     signal_fn real = real_signal_fn();
     if (!real) { errno = ENOSYS; return SIG_ERR; }
-    if (g_initialized && signo == libcov_trap_signo) {
+    if (g_initialized && signo == LIBCOV_TRAP_SIGNO) {
         sighandler_fn prev = g_target_trap_sa_valid ? g_target_trap_sa.sa_handler : SIG_DFL;
         memset(&g_target_trap_sa, 0, sizeof g_target_trap_sa);
         g_target_trap_sa.sa_handler = h;

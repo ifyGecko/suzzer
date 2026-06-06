@@ -1,32 +1,31 @@
 /*
  * arch_riscv64.c -- RISC-V 64-bit backend.
  *
- * Illegal: c.unimp = 0x0000 (2-byte compressed all-zero instruction,
- *          permanently illegal per the RVC spec).
+ * All tunable values come from src/tunables_riscv64.h -- edit there or
+ * pass -D flags.
  *
- * RISC-V has mixed 2-byte (C extension) and 4-byte instructions. For a
- * 4-byte patch site we write 0x00000000 (two c.unimps); the first traps
- * immediately, the second is never decoded. Restore puts the original
- * 4 bytes back.
+ * RISC-V mixes 2-byte (C extension) and 4-byte instructions. For a
+ * 4-byte patch site we write two c.unimps back-to-back (32 bits of
+ * zero); the first traps immediately, the second is never decoded.
  *
  * PC: uc_mcontext.__gregs[REG_PC].
  */
 #define _GNU_SOURCE
 #include <string.h>
 #include "arch.h"
+#include "tunables_riscv64.h"
 
-const char    *libcov_arch_name     = "riscv64";
-const int      libcov_trap_signo    = SIGILL;
-const uint8_t  libcov_min_patch_len = 2;
-const uint8_t  libcov_max_patch_len = 4;
+const char    *libcov_arch_name     = LIBCOV_ARCH_RISCV64_NAME;
+const uint8_t  libcov_min_patch_len = LIBCOV_ARCH_RISCV64_MIN_PATCH_LEN;
+const uint8_t  libcov_max_patch_len = LIBCOV_ARCH_RISCV64_MAX_PATCH_LEN;
 
 void libcov_arch_write_illegal(void *dst, uint8_t len) {
     if (len == 2) {
-        static const uint16_t cunimp = 0x0000u;
+        const uint16_t cunimp = LIBCOV_ARCH_RISCV64_ILLEGAL_C;
         memcpy(dst, &cunimp, 2);
     } else {
-        static const uint32_t z = 0x00000000u;  /* two c.unimps back-to-back */
-        memcpy(dst, &z, 4);
+        const uint32_t illegal = LIBCOV_ARCH_RISCV64_ILLEGAL_W;
+        memcpy(dst, &illegal, 4);
     }
 }
 

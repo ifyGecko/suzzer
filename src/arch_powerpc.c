@@ -1,11 +1,12 @@
 /*
  * arch_powerpc.c -- PowerPC 32-bit BE backend.
  *
- * Trap: tw 31, 0, 0  (encoding 0x7FE00008). Unconditional trap. Raises
- *       SIGTRAP -- the same rationale as MIPS: SIGILL would require us to
- *       pick a reserved-opcode encoding that depends on the chip
- *       revision, while TW is universal across all 32/64-bit POWER
- *       variants and SIGTRAP is just as unused by application code.
+ * All tunable values come from src/tunables_powerpc.h -- edit there or
+ * pass -D flags.
+ *
+ * Historically SIGTRAP-based (`tw 31,0,0` = 0x7FE00008). Now SIGILL by
+ * default via the all-zero word, which PowerISA reserves as illegal
+ * across every variant; Linux delivers SIGILL.
  *
  * Fixed 4-byte instructions. PC via uc_mcontext.uc_regs->gregs[PT_NIP].
  */
@@ -13,16 +14,16 @@
 #include <string.h>
 #include <asm/ptrace.h>   /* PT_NIP */
 #include "arch.h"
+#include "tunables_powerpc.h"
 
-const char    *libcov_arch_name     = "powerpc";
-const int      libcov_trap_signo    = SIGTRAP;
-const uint8_t  libcov_min_patch_len = 4;
-const uint8_t  libcov_max_patch_len = 4;
+const char    *libcov_arch_name     = LIBCOV_ARCH_PPC_NAME;
+const uint8_t  libcov_min_patch_len = LIBCOV_ARCH_PPC_MIN_PATCH_LEN;
+const uint8_t  libcov_max_patch_len = LIBCOV_ARCH_PPC_MAX_PATCH_LEN;
 
 void libcov_arch_write_illegal(void *dst, uint8_t len) {
     (void)len;
-    static const uint32_t tw = 0x7FE00008u;  /* tw 31, 0, 0 */
-    memcpy(dst, &tw, 4);
+    const uint32_t illegal = LIBCOV_ARCH_PPC_ILLEGAL;
+    memcpy(dst, &illegal, 4);
 }
 
 uintptr_t libcov_arch_pc_from_uctx(const ucontext_t *uc) {

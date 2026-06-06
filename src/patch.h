@@ -6,7 +6,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include "config.h"
+#include "patchlist_format.h"
 
 /* Validate that the byte sequence at e->addr matches e->orig[0..len).
  * Returns 0 on match, -1 on mismatch. Safe to call before patching. */

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "util.h"
+#include "tunables.h"   /* LIBCOV_LOG_BUFFER_SIZE */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,7 +20,7 @@ void libcov_log_init(void) {
 }
 
 void libcov_logf(const char *fmt, ...) {
-    char buf[512];
+    char buf[LIBCOV_LOG_BUFFER_SIZE];
     int n = snprintf(buf, sizeof buf, "libcov: ");
     va_list ap;
     va_start(ap, fmt);

@@ -1,33 +1,34 @@
 /*
- * arch_mips.c -- MIPS32 backend (BE and LE; the cross compiler picks).
+ * arch_mips.c -- MIPS32 backend (BE and LE; cross compiler picks).
  *
- * Trap: BREAK 0 instruction, 0x0000000D. Universal across MIPS r1..r6.
- *       Raises SIGTRAP (TRAP_BRKPT). We use SIGTRAP -- the original libcov
- *       design called for SIGILL, but on MIPS the only universally
- *       reliable user-mode-triggerable trap encoding is BREAK; SIGTRAP is
- *       just as unused by normal application code.
+ * All tunable values (illegal encoding, instruction-width bounds) come
+ * from src/tunables_mips.h -- edit there or pass -D flags.
  *
- * Branch delay slots: NEVER patch the instruction after a branch (the
- * delay slot). When a trap fires in a delay slot the kernel reports the
- * branch PC and sets the BD cause bit, which would break our lookup. The
- * generator avoids delay slots by patching block-entry instructions, which
- * are never delay slots.
+ * This backend was historically SIGTRAP-based (BREAK 0). It is now SIGILL
+ * by default; the default illegal encoding is `MFC0 $0, $0` which the
+ * Linux MIPS kernel rejects as a user-mode coprocessor-0 access via
+ * SIGILL (ILL_PRVOPC). Works on every MIPS revision (r1..r6).
+ *
+ * Branch delay slots: NEVER patch the instruction after a branch. When a
+ * trap fires in a delay slot the kernel reports the branch PC and sets
+ * the BD cause bit, which would break our lookup. The generator avoids
+ * delay slots by patching block-entry instructions.
  *
  * Fixed 4-byte instructions. PC in uc_mcontext.pc.
  */
 #define _GNU_SOURCE
 #include <string.h>
 #include "arch.h"
+#include "tunables_mips.h"
 
-const char    *libcov_arch_name     = "mips";
-const int      libcov_trap_signo    = SIGTRAP;
-const uint8_t  libcov_min_patch_len = 4;
-const uint8_t  libcov_max_patch_len = 4;
+const char    *libcov_arch_name     = LIBCOV_ARCH_MIPS_NAME;
+const uint8_t  libcov_min_patch_len = LIBCOV_ARCH_MIPS_MIN_PATCH_LEN;
+const uint8_t  libcov_max_patch_len = LIBCOV_ARCH_MIPS_MAX_PATCH_LEN;
 
 void libcov_arch_write_illegal(void *dst, uint8_t len) {
     (void)len;
-    static const uint32_t brk = 0x0000000Du;  /* BREAK 0 */
-    memcpy(dst, &brk, 4);
+    const uint32_t illegal = LIBCOV_ARCH_MIPS_ILLEGAL;
+    memcpy(dst, &illegal, 4);
 }
 
 uintptr_t libcov_arch_pc_from_uctx(const ucontext_t *uc) {

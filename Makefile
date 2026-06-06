@@ -1,4 +1,8 @@
-# libcov -- SIGILL-trampoline coverage library (multi-arch, multi-threading).
+# libcov -- trap-trampoline coverage library (multi-arch, multi-threading).
+#
+# Trap signal is SIGILL by default for every backend. Override via
+# -DLIBCOV_TRAP_SIGNO=<signo> (and a matching per-arch illegal encoding)
+# through EXTRA_CFLAGS; see src/tunables.h and src/tunables_<arch>.h.
 #
 # Two threading variants are built as separate LEGO bricks:
 #   THREADING=st (default) -- single-threaded, low overhead, the original PoC.
@@ -98,14 +102,12 @@ ifeq ($(THREADING),mt)
   PATCH_SRC   := src/patch_mt.c
   HANDLER_SRC := src/handler_mt.c
   EXTRA_SRC   := src/membarrier.c
-  # x86_64 has a dedicated MT backend (UD2 head-only); other arches reuse
-  # their ST backend since their natural 2- or 4-byte writes are already
-  # single-copy-atomic at the trap-encoding width.
-  ifeq ($(BACKEND),x86_64)
-    ARCH_SRC := src/arch_x86_64_mt.c
-  else
-    ARCH_SRC := src/arch_$(BACKEND).c
-  endif
+  ARCH_SRC    := src/arch_$(BACKEND).c
+  # The arch backend handles ST/MT differences internally via
+  # #ifdef LIBCOV_THREADING_MT (e.g. arch_x86_64.c writes UD2 head-only
+  # in MT, UD2+NOPs in ST). For fixed-width arches the natural 2- or
+  # 4-byte write is already single-copy-atomic, so no #ifdef is needed.
+  #
   # MT prev_loc uses __thread; pthreads linkage is required because libc
   # only allocates the static TLS area when the binary or any DSO it loads
   # is linked against pthreads. LD_PRELOAD'ing a TLS-using .so into a
@@ -119,6 +121,12 @@ else
   ARCH_SRC    := src/arch_$(BACKEND).c
   LDLIBS_EXTRA :=
 endif
+
+# User pass-through for tunables overrides. Example:
+#   make EXTRA_CFLAGS='-DLIBCOV_ARCH_MIPS_ILLEGAL=0xDEADBEEFu'
+# CFLAGS is the toolchain baseline (already overridable); EXTRA_CFLAGS is
+# appended so users can add -D flags without losing the defaults.
+CFLAGS += $(EXTRA_CFLAGS)
 
 BUILD := build/$(ARCH)
 

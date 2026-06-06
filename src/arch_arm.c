@@ -1,37 +1,30 @@
 /*
- * arch_arm.c -- ARMv7 backend (ARM and Thumb).
+ * arch_arm.c -- ARMv7 backend (ARM + Thumb).
  *
- * Two illegal encodings:
- *   ARM mode   (len=4): UDF (perm-undefined) = 0xE7F000F0
- *   Thumb mode (len=2): UDF.N                = 0xDE00
+ * All tunable values (illegal encodings for ARM and Thumb, width bounds)
+ * come from src/tunables_arm.h -- edit there or pass -D flags.
  *
- * The generator selects mode per patch site via the patch record's `len`
- * field (4 = ARM, 2 = Thumb). For 4-byte Thumb-2 instructions we still
- * only patch the first 2 bytes with UDF.N -- the kernel traps before the
- * back half of the original is decoded, and restore leaves the back half
- * intact.
- *
- * PC: uc_mcontext.arm_pc. CPSR T-bit tells us mode at the trap site but
- * isn't needed for our flow -- we look up the entry by PC and use its
- * stored `len` to drive restore.
+ * Per-site mode selection: the generator records len=4 for ARM-mode
+ * sites and len=2 for Thumb sites. The runtime picks the encoding from
+ * len at arm time. For 4-byte Thumb-2 instructions we patch only the
+ * first 2 bytes with the Thumb UDF -- the kernel traps before the back
+ * half is decoded, and restore leaves the back half intact.
  */
 #define _GNU_SOURCE
 #include <string.h>
 #include "arch.h"
+#include "tunables_arm.h"
 
-const char    *libcov_arch_name     = "arm";
-const int      libcov_trap_signo    = SIGILL;
-const uint8_t  libcov_min_patch_len = 2;
-const uint8_t  libcov_max_patch_len = 4;
+const char    *libcov_arch_name     = LIBCOV_ARCH_ARM_NAME;
+const uint8_t  libcov_min_patch_len = LIBCOV_ARCH_ARM_MIN_PATCH_LEN;
+const uint8_t  libcov_max_patch_len = LIBCOV_ARCH_ARM_MAX_PATCH_LEN;
 
 void libcov_arch_write_illegal(void *dst, uint8_t len) {
     if (len == 4) {
-        /* ARM mode UDF. Encoded little-endian on standard armhf. */
-        static const uint32_t arm_udf = 0xE7F000F0u;
+        const uint32_t arm_udf = LIBCOV_ARCH_ARM_ILLEGAL_ARM;
         memcpy(dst, &arm_udf, 4);
     } else {
-        /* Thumb UDF.N. */
-        static const uint16_t thumb_udf = 0xDE00u;
+        const uint16_t thumb_udf = LIBCOV_ARCH_ARM_ILLEGAL_THUMB;
         memcpy(dst, &thumb_udf, 2);
     }
 }

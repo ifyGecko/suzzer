@@ -3,11 +3,12 @@
  * into a given libcov.so build. Each backend provides the symbols and
  * functions declared below.
  *
- * Trap signal: most architectures use SIGILL via an undefined-instruction
- * encoding. MIPS and PowerPC use SIGTRAP via the BREAK / TW instructions
- * because those are the universally-portable "raise a trap" encodings on
- * those ISAs and SIGTRAP is just as unused by normal application code as
- * SIGILL is. The handler installs whichever signal the backend declares.
+ * Trap signal: every backend uses LIBCOV_TRAP_SIGNO (default SIGILL) -- see
+ * src/tunables.h. The illegal-instruction encoding each backend writes is
+ * specified in src/tunables_<arch>.h (also user-overridable). To switch
+ * the whole project to a different signal (e.g. SIGTRAP) you change
+ * LIBCOV_TRAP_SIGNO and the per-arch ILLEGAL encodings together so they
+ * agree.
  */
 #ifndef LIBCOV_ARCH_H
 #define LIBCOV_ARCH_H
@@ -18,7 +19,6 @@
 #include <ucontext.h>
 
 extern const char    *libcov_arch_name;
-extern const int      libcov_trap_signo;     /* SIGILL or SIGTRAP */
 extern const uint8_t  libcov_min_patch_len;  /* smallest patchable insn (bytes) */
 extern const uint8_t  libcov_max_patch_len;  /* largest patchable insn (bytes) */
 

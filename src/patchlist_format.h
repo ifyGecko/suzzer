@@ -1,5 +1,8 @@
 /*
- * config.h -- on-disk patch-list format.
+ * patchlist_format.h -- on-disk patch-list wire format + runtime patch_entry.
+ *
+ * (Renamed from config.h. This file is NOT a tunables header; user-facing
+ * knobs live in src/tunables.h and src/tunables_<arch>.h.)
  *
  * Two versions are accepted by the loader:
  *

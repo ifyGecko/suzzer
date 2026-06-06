@@ -28,7 +28,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define LIBCOV_MAP_SIZE_POW2 16
+#include "tunables.h"   /* LIBCOV_MAP_SIZE_POW2 */
+
 #define LIBCOV_MAP_SIZE      (1u << LIBCOV_MAP_SIZE_POW2)
 #define LIBCOV_MAP_MASK      (LIBCOV_MAP_SIZE - 1u)
 

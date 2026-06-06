@@ -30,7 +30,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#include "config.h"
+#include "patchlist_format.h"
 
 /* ---- on-disk sidecar format -------------------------------------------- */
 

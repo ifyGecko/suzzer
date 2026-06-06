@@ -30,11 +30,12 @@
  *  - arm-Thumb / riscv64-compressed: 2-byte half-word stores naturally
  *    aligned. Single-copy-atomic on ARMv7+ and RV32IC/RV64IC.
  *
- *  - x86_64: arch_x86_64_mt.c writes only 2 bytes (UD2 head) and the
- *    backend's libcov_arch_max_patch_len is 2, so the generator must
- *    emit MT records with len=2. Intel SDM guarantees aligned 16-bit
- *    stores are atomic; in practice 16-bit stores that fit within a
- *    cache line are atomic on all P6+ CPUs.
+ *  - x86_64: arch_x86_64.c's MT path (#ifdef LIBCOV_THREADING_MT)
+ *    writes only 2 bytes (UD2 head) and the backend's
+ *    libcov_max_patch_len is 2 (see tunables_x86_64.h), so the generator
+ *    must emit MT records with len=2. Intel SDM guarantees aligned
+ *    16-bit stores are atomic; in practice 16-bit stores that fit
+ *    within a cache line are atomic on all P6+ CPUs.
  *
  * What we still don't claim:
  *

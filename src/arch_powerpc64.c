@@ -1,23 +1,26 @@
 /*
  * arch_powerpc64.c -- PowerPC 64-bit backend (BE and LE; toolchain picks).
  *
- * Same trap encoding as ppc32 (tw 31,0,0 = 0x7FE00008, SIGTRAP).
- * Different ucontext layout: PC lives at uc_mcontext.gp_regs[PT_NIP].
+ * All tunable values come from src/tunables_powerpc64.h -- edit there or
+ * pass -D flags. Encoding-wise this mirrors PPC32; only the ucontext
+ * layout differs: PC lives at uc_mcontext.gp_regs[PT_NIP].
+ *
+ * Historically SIGTRAP (`tw 31,0,0`); now SIGILL by default via all-zero.
  */
 #define _GNU_SOURCE
 #include <string.h>
 #include <asm/ptrace.h>   /* PT_NIP */
 #include "arch.h"
+#include "tunables_powerpc64.h"
 
-const char    *libcov_arch_name     = "powerpc64";
-const int      libcov_trap_signo    = SIGTRAP;
-const uint8_t  libcov_min_patch_len = 4;
-const uint8_t  libcov_max_patch_len = 4;
+const char    *libcov_arch_name     = LIBCOV_ARCH_PPC64_NAME;
+const uint8_t  libcov_min_patch_len = LIBCOV_ARCH_PPC64_MIN_PATCH_LEN;
+const uint8_t  libcov_max_patch_len = LIBCOV_ARCH_PPC64_MAX_PATCH_LEN;
 
 void libcov_arch_write_illegal(void *dst, uint8_t len) {
     (void)len;
-    static const uint32_t tw = 0x7FE00008u;
-    memcpy(dst, &tw, 4);
+    const uint32_t illegal = LIBCOV_ARCH_PPC64_ILLEGAL;
+    memcpy(dst, &illegal, 4);
 }
 
 uintptr_t libcov_arch_pc_from_uctx(const ucontext_t *uc) {

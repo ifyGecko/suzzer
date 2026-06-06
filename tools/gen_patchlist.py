@@ -72,7 +72,7 @@ Selective instrumentation (--root / --cutoff / --max-depth):
     - Cutoffs are function-granular. Per-basic-block excision is a
       separate feature on the backlog.
 
-Output layout matches src/config.h:
+Output layout matches src/patchlist_format.h:
   LCV2 header: magic[4]='LCV2', version=2, count, threading, flags, reserved
   record:      u64 offset, u8 len, u8 orig[15]
 

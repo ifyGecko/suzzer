@@ -1,5 +1,5 @@
 #define _GNU_SOURCE
-#include "config.h"
+#include "patchlist_format.h"
 #include "util.h"
 
 #include <stdio.h>

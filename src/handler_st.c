@@ -5,6 +5,7 @@
 #include "sink.h"
 #include "util.h"
 #include "boundary.h"
+#include "tunables.h"   /* LIBCOV_TRAP_SIGNO */
 
 #include <stddef.h>
 #include <signal.h>
@@ -94,13 +95,13 @@ int handler_install(enum libcov_mode mode) {
     sa.sa_flags     = SA_SIGINFO | SA_NODEFER;
     sigemptyset(&sa.sa_mask);
 
-    if (real_sigaction(libcov_trap_signo, &sa, &g_prev_sa) < 0) {
+    if (real_sigaction(LIBCOV_TRAP_SIGNO, &sa, &g_prev_sa) < 0) {
         libcov_logf("handler: sigaction(signo=%d): %s",
-                    libcov_trap_signo, strerror(errno));
+                    LIBCOV_TRAP_SIGNO, strerror(errno));
         return -1;
     }
     libcov_logf("handler: arch=%s trap_signo=%d mode=%s",
-                libcov_arch_name, libcov_trap_signo,
+                libcov_arch_name, LIBCOV_TRAP_SIGNO,
                 mode == LIBCOV_MODE_LEAPFROG ? "leapfrog" : "oneshot");
     return 0;
 }

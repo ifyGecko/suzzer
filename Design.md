@@ -41,17 +41,24 @@ re-executes the instruction at the (possibly modified) PC. This gives us
 a callback-on-execute primitive at any address we choose — we just
 replace the instruction there with a guaranteed-trap encoding.
 
-The trap signal varies by ISA but is universally a signal that real
-application code never relies on:
+The trap signal is `LIBCOV_TRAP_SIGNO` (default `SIGILL`), shared by
+every backend. Each backend's default illegal-instruction encoding is
+chosen so the Linux kernel delivers SIGILL on the target arch:
 
-- SIGILL — x86, AArch64, ARM (ARM and Thumb modes), RISC-V.
-- SIGTRAP — MIPS (via the `BREAK` instruction), PowerPC (via the `tw`
-  unconditional-trap instruction).
+- x86_64: UD2.
+- AArch64: UDF #0 (all-zero word).
+- ARM / Thumb: UDF / UDF.N.
+- RISC-V: c.unimp.
+- MIPS / MIPS64: user-mode COP0 access (`MFC0 $0, $0`) — kernel-rejected
+  via Coprocessor Unusable handler on every revision.
+- PowerPC / PowerPC64: all-zero word (PowerISA-reserved illegal).
 
-Both signals are "synchronous fault" signals: blocking them at a
+The signal is a "synchronous fault" signal: blocking it at a
 `pthread_sigmask` level does not prevent delivery for the faulting
 thread; the kernel forces termination if the signal is blocked. We rely
-on this to ensure our handler always runs.
+on this to ensure our handler always runs. The signal choice and every
+per-arch encoding are overridable through `src/tunables.h` and
+`src/tunables_<arch>.h` (see section 6.4).
 
 ---
 
@@ -80,9 +87,9 @@ LD_PRELOAD libcov.so loaded into target process:
   │    3. mmap LCV1 patch list                                  │
   │    4. mmap 64KB shm bitmap                                  │
   │    5. allocate sorted patch_table[]                         │
-  │    6. for each entry: mprotect→memcpy(UD2/BREAK/...)→       │
+  │    6. for each entry: mprotect→memcpy(illegal insn)→        │
   │           mprotect→cache flush                              │
-  │    7. install SIGILL or SIGTRAP handler                     │
+  │    7. install LIBCOV_TRAP_SIGNO handler                     │
   │    8. install sigaction/signal interceptors                 │
   │  return to main()                                           │
   └─────────────────────────────────────────────────────────────┘
@@ -90,7 +97,7 @@ LD_PRELOAD libcov.so loaded into target process:
   Target executes normally until it hits a patched instruction:
 
   ┌─────────────────────────────────────────────────────────────┐
-  │  kernel delivers SIGILL/SIGTRAP                             │
+  │  kernel delivers LIBCOV_TRAP_SIGNO (default SIGILL)         │
   │  trap_handler:                                              │
   │    pc = arch_pc_from_uctx(uc)                               │
   │    e  = patch_lookup(pc)             [signal-safe bsearch]  │
@@ -125,7 +132,7 @@ in the patch table for later restoration.
 ### 3.2 Trap and handler
 
 When execution reaches the patched address, the CPU raises the trap.
-The kernel delivers SIGILL or SIGTRAP (per backend) synchronously to the
+The kernel delivers LIBCOV_TRAP_SIGNO (default SIGILL) synchronously to the
 faulting thread. Our handler examines `ucontext_t`, extracts the PC, and
 looks the address up in our sorted patch table.
 
@@ -267,15 +274,20 @@ src/
                         MT-only; PRIVATE_EXPEDITED_SYNC_CORE wrapper
                         with init-time detection + graceful fallback
   arch.h                backend interface (extern symbol contract)
-  arch_x86_64.c         ST x86: UD2 + NOP padding (2..15 bytes)
-  arch_x86_64_mt.c      MT x86: UD2 head-only (atomic 2-byte write)
-  arch_aarch64.c        UDF #0 / SIGILL / 4-byte fixed (ST+MT share)
+  arch_x86_64.c         x86 UD2 (ST+NOP padding, MT head-only via #ifdef)
+  arch_aarch64.c        UDF #0 / 4-byte fixed (ST+MT share)
   arch_arm.c            ARM UDF + Thumb UDF.N (ST+MT share)
-  arch_mips.c           MIPS32 BREAK 0 / SIGTRAP (ST+MT share)
-  arch_mips64.c         MIPS64 BREAK 0 / SIGTRAP (ST+MT share)
-  arch_powerpc.c        PPC32 tw 31,0,0 / SIGTRAP (ST+MT share)
-  arch_powerpc64.c      PPC64 BE+LE tw 31,0,0 / SIGTRAP (ST+MT share)
-  arch_riscv64.c        c.unimp / SIGILL (ST+MT share)
+  arch_mips.c           MIPS32 user-mode MFC0 / SIGILL (ST+MT share)
+  arch_mips64.c         MIPS64 user-mode MFC0 / SIGILL (ST+MT share)
+  arch_powerpc.c        PPC32 all-zero illegal / SIGILL (ST+MT share)
+  arch_powerpc64.c      PPC64 BE+LE all-zero illegal / SIGILL (ST+MT share)
+  arch_riscv64.c        c.unimp (ST+MT share)
+  tunables.h            project-wide knobs (trap signo, bitmap size, log buf)
+  tunables_<arch>.h     per-backend knobs (illegal encoding(s) + widths);
+                        one per backend, every knob -D-overridable
+  patchlist_format.h    on-disk LCV1/LCV2 wire format + runtime patch_entry
+                        (formerly config.h; renamed to avoid confusion with
+                        tunables headers)
 
 tools/
   gen_patchlist.py      rizin-based LCV2 generator; per-arch strategies;
@@ -308,7 +320,6 @@ backend provides:
 
 ```c
 extern const char    *libcov_arch_name;        // "x86_64", "aarch64", ...
-extern const int      libcov_trap_signo;       // SIGILL or SIGTRAP
 extern const uint8_t  libcov_min_patch_len;    // smallest patchable insn
 extern const uint8_t  libcov_max_patch_len;    // largest patchable insn
 
@@ -316,30 +327,53 @@ void      libcov_arch_write_illegal(void *dst, uint8_t len);
 uintptr_t libcov_arch_pc_from_uctx(const ucontext_t *uc);
 ```
 
+The trap signal is project-wide, not per-backend: every backend uses
+`LIBCOV_TRAP_SIGNO` (default `SIGILL`) from `src/tunables.h`. To switch
+the whole project to a different signal you change `LIBCOV_TRAP_SIGNO`
+and any per-arch ILLEGAL encoding(s) together so the encoding agrees
+with the signal it must raise.
+
 This is the entire ABI. No `#ifdef ARCH` exists in the core code. The
 core (`libcov.c`, `handler.c`, `patch.c`, `config.c`, `util.c`,
 `sink_shm.c`) is byte-for-byte identical across all backends.
 
+The per-backend constants the `extern`s above expose (name, widths, the
+bytes written by `libcov_arch_write_illegal`) are not hardcoded in the
+`.c` file — each backend pulls them from `src/tunables_<arch>.h`, which
+is `#ifndef`-guarded so every knob is overridable either by editing the
+default or by passing `-D` at build time. See section 6.4.
+
 ### 6.1 Backend matrix
 
-| Backend          | Trap insn                | Signal  | Min len | Max len | Special handling                       |
-|------------------|--------------------------|---------|---------|---------|----------------------------------------|
-| x86_64           | UD2 (`0F 0B`)            | SIGILL  | 2       | 15      | Variable insn length; pad with 0x90    |
-| aarch64          | UDF #0 (`0x00000000`)    | SIGILL  | 4       | 4       | Fixed                                  |
-| arm (ARM mode)   | UDF (`0xE7F000F0`)       | SIGILL  | 2       | 4       | Per-site dispatch on len               |
-| arm (Thumb mode) | UDF.N (`0xDE00`)         | SIGILL  | 2       | 4       | len=2 selects Thumb encoding           |
-| mips, mipsel     | BREAK 0 (`0x0000000D`)   | SIGTRAP | 4       | 4       | LE/BE via toolchain                    |
-| mips64, mips64el | BREAK 0                  | SIGTRAP | 4       | 4       | Same                                   |
-| powerpc          | tw 31,0,0 (`0x7FE00008`) | SIGTRAP | 4       | 4       | BE                                     |
-| powerpc64 BE+LE  | tw 31,0,0                | SIGTRAP | 4       | 4       | Endian via toolchain                   |
-| riscv64          | c.unimp (`0x0000`)       | SIGILL  | 2       | 4       | 2 or 4 selects len; 4 = two c.unimps   |
+Every backend raises `LIBCOV_TRAP_SIGNO` (= `SIGILL` by default).
+
+| Backend          | Default trap insn        | Min len | Max len | Special handling                          |
+|------------------|--------------------------|---------|---------|-------------------------------------------|
+| x86_64 (ST)      | UD2 (`0F 0B`)            | 2       | 15      | Variable insn length; pad with 0x90       |
+| x86_64 (MT)      | UD2 (`0F 0B`)            | 2       | 2       | Head-only write; single-copy-atomic       |
+| aarch64          | UDF #0 (`0x00000000`)    | 4       | 4       | Fixed                                     |
+| arm (ARM mode)   | UDF (`0xE7F000F0`)       | 2       | 4       | Per-site dispatch on len                  |
+| arm (Thumb mode) | UDF.N (`0xDE00`)         | 2       | 4       | len=2 selects Thumb encoding              |
+| mips, mipsel     | MFC0 $0,$0 (`0x40000000`)| 4       | 4       | Was BREAK 0 / SIGTRAP; see 6.2            |
+| mips64, mips64el | MFC0 $0,$0 (`0x40000000`)| 4       | 4       | Was BREAK 0 / SIGTRAP; see 6.2            |
+| powerpc          | all-zero (`0x00000000`)  | 4       | 4       | Was `tw 31,0,0` / SIGTRAP; see 6.2        |
+| powerpc64 BE+LE  | all-zero (`0x00000000`)  | 4       | 4       | Was `tw 31,0,0` / SIGTRAP; see 6.2        |
+| riscv64          | c.unimp (`0x0000`)       | 2       | 4       | 2 or 4 selects len; 4 = two c.unimps      |
+
+x86_64 ST/MT live in one source file (`arch_x86_64.c`) that selects
+behaviour via `#ifdef LIBCOV_THREADING_MT` (set by the Makefile).
+Defaults for `MAX_PATCH_LEN` follow the same switch in
+`tunables_x86_64.h`.
 
 ### 6.2 Per-backend rationale
 
 **x86_64 / UD2**: canonical illegal opcode, 2 bytes, well-defined since
-the 286. Variable insn length forces us to record the original length
-and pad excess bytes with NOP after the UD2 — we only need the trap to
-fire on the *first* byte; the padding never executes.
+the 286. ST mode writes UD2 + (len-2) NOP padding because instructions
+are variable-length; the trap fires on the first 2 bytes, padding never
+executes. MT mode writes only the 2-byte UD2 because a naturally-aligned
+2-byte store is the largest single-copy-atomic write x86_64 guarantees
+(Intel SDM Vol 3 Sec 8.1.1); the tail bytes of the original instruction
+are never touched.
 
 **aarch64 / UDF #0**: ARMv8 ARM specifies the all-zero word as
 "permanently undefined". The encoding `D4 20 00 00` (`UDF #0` proper) is
@@ -355,23 +389,29 @@ trap fires before the back half is fetched, and the original 4-byte
 sequence is intact after restore because we never modified bytes [2,4).
 The generator forces `len=2` for any site in a Thumb function.
 
-**mips / BREAK 0**: MIPS has no universally-portable always-SIGILL
-encoding across r1..r6; reserved-opcode behavior depends on chip
-revision. BREAK is the canonical "raise a software trap" instruction
-defined since MIPS-I. Linux delivers SIGTRAP for BREAK. SIGTRAP is just
-as unused by normal application code as SIGILL. Backend uses SIGTRAP;
-the rest of the library is signal-agnostic via `libcov_trap_signo`.
+**mips / `MFC0 $0, $0` (was: BREAK 0 / SIGTRAP)**: MIPS has no
+universally-portable always-RI (Reserved Instruction) encoding across
+r1..r6; chip-revision-specific reserved opcodes get repurposed. The
+default `0x40000000` sidesteps this by encoding a user-mode access to
+coprocessor 0, which the Linux MIPS kernel rejects unconditionally on
+every revision by delivering `SIGILL` (`ILL_PRVOPC`) via the Coprocessor
+Unusable handler. The historical backend used `BREAK 0` (raises
+SIGTRAP); the switch to a SIGILL-raising encoding lets the whole project
+share one signal handler. If your target restricts COP0 access through a
+custom emulator path, override `LIBCOV_ARCH_MIPS_ILLEGAL` in
+`tunables_mips.h`.
 
-**mips64**: identical encoding and signal as mips32. The glibc
+**mips64**: identical encoding rationale as mips32. The glibc
 `ucontext_t.uc_mcontext.pc` field name is the same across both.
 
-**powerpc / `tw 31, 0, 0`**: PowerPC's "trap word" instruction with TO
-field = 31 (all conditions) and rA = rB = 0 always traps (any condition
-holds when comparing r0 to itself). Encoding `0x7FE00008`. Same SIGTRAP
-rationale as MIPS. PC accessor on glibc ppc32 is
-`uc->uc_mcontext.uc_regs->gregs[PT_NIP]`.
+**powerpc / all-zero (was: `tw 31, 0, 0` / SIGTRAP)**: the PowerISA spec
+reserves the all-zero 32-bit word as illegal across every variant (32/64,
+BE/LE). Linux delivers `SIGILL` (`ILL_ILLOPC`) via a Program Check
+interrupt. The historical backend used `tw 31, 0, 0` (raises SIGTRAP);
+the switch matches the project-wide SIGILL default. PC accessor on glibc
+ppc32 is `uc->uc_mcontext.uc_regs->gregs[PT_NIP]`.
 
-**powerpc64**: same trap encoding. Glibc ppc64 puts PC at
+**powerpc64**: same encoding rationale. Glibc ppc64 puts PC at
 `uc->uc_mcontext.gp_regs[PT_NIP]` (no `uc_regs` indirection). The
 backend file uses that path.
 
@@ -388,6 +428,42 @@ Each `libcov_arch_write_illegal` writes its trap encoding as a native
 target's endianness, native stores produce the byte order the CPU
 expects when it later fetches the instruction. No explicit byte-swapping
 is needed in the backends.
+
+### 6.4 Tunables and configuration
+
+The project ships two layers of tunables headers, both using the same
+`#ifndef`-guard pattern. Every knob can be changed either by editing
+the value in the header or by passing `-D` flags at build time; the
+`-D` wins because the preprocessor sees it first.
+
+**`src/tunables.h`** — cross-cutting knobs:
+- `LIBCOV_TRAP_SIGNO` (default `SIGILL`).
+- `LIBCOV_MAP_SIZE_POW2` (default 16; coverage bitmap = 1 << POW2 bytes).
+- `LIBCOV_LOG_BUFFER_SIZE` (default 512; per-message buffer in libcov_logf).
+
+**`src/tunables_<arch>.h`** — per-backend knobs. One file per arch:
+`tunables_x86_64.h`, `tunables_aarch64.h`, `tunables_arm.h`,
+`tunables_mips.h`, `tunables_mips64.h`, `tunables_powerpc.h`,
+`tunables_powerpc64.h`, `tunables_riscv64.h`. Each defines:
+- `LIBCOV_ARCH_<NAME>_NAME` — backend identifier string.
+- `LIBCOV_ARCH_<NAME>_ILLEGAL[_*]` — illegal-instruction byte(s).
+- `LIBCOV_ARCH_<NAME>_MIN_PATCH_LEN` / `_MAX_PATCH_LEN` — width bounds.
+
+The Makefile honors `EXTRA_CFLAGS` for the `-D` path. Example:
+
+```sh
+make ARCH=mips THREADING=st \
+    EXTRA_CFLAGS='-DLIBCOV_ARCH_MIPS_ILLEGAL=0xDEADBEEFu'
+```
+
+Each tunable header opens with a banner explaining both override paths;
+each knob carries its own doc block explaining purpose, default, range,
+and override syntax. These files are the source of truth for the
+configurable surface area.
+
+Note: `src/patchlist_format.h` (formerly `src/config.h`) is the on-disk
+patch-list wire format + runtime `patch_entry` struct, **not** a
+tunables header. Different concern.
 
 ---
 
@@ -459,7 +535,7 @@ resized, so handler-time reads are race-free against init-time writes
 The handler is installed via `sigaction` (resolved through
 `dlsym(RTLD_NEXT, "sigaction")` so our own `sigaction` interceptor —
 defined in `libcov.c` — does not recurse). The signal number is
-`libcov_trap_signo` (SIGILL or SIGTRAP per backend). Flags:
+`LIBCOV_TRAP_SIGNO` (default SIGILL; project-wide, see section 6.4). Flags:
 
 - `SA_SIGINFO`: we want `siginfo_t` + `ucontext_t`.
 - `SA_NODEFER`: we never want the trap signal blocked during our
@@ -491,7 +567,7 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
 
 ### 8.3 Real-fault chaining
 
-`chain_or_default` handles SIGILL/SIGTRAP at addresses not in our patch
+`chain_or_default` handles LIBCOV_TRAP_SIGNO at addresses not in our patch
 table — i.e., genuine illegal-instruction or trap conditions in the
 target. If a previous handler was registered before us, we forward to
 it. If `SIG_DFL`, we restore default disposition (via our cached real
@@ -625,7 +701,7 @@ can run user code that uses libc.
 3. sink_init(env)          // mmap bitmap
 4. config_load(patchlist)  // mmap LCV1, build patch_table
 5. patch_arm_all()         // mprotect+write+mprotect+flush every entry
-6. handler_install(mode)   // sigaction(trap_signo, &sa, &g_prev_sa)
+6. handler_install(mode)   // sigaction(LIBCOV_TRAP_SIGNO, &sa, &g_prev_sa)
 7. set g_initialized = 1
 ```
 
@@ -661,7 +737,7 @@ sighandler_fn signal(int signo, sighandler_fn h);
 ```
 
 Both are exported by libcov.so. The dynamic linker resolves them in the
-target before libc's. Inside, we check `signo == libcov_trap_signo`:
+target before libc's. Inside, we check `signo == LIBCOV_TRAP_SIGNO`:
 
 - If yes: silently report success, stash the requested handler in
   `g_target_trap_sa`, but **don't actually install it**. Our handler
@@ -671,7 +747,7 @@ target before libc's. Inside, we check `signo == libcov_trap_signo`:
 
 The stashed target handler is chained for *real* traps in
 `chain_or_default` — at addresses not in our patch table. The target's
-behavior for genuine SIGILL/SIGTRAP is preserved.
+behavior for genuine LIBCOV_TRAP_SIGNO (default SIGILL) is preserved.
 
 `g_initialized` gates the interception: before constructor finishes, we
 forward everything to the real handlers, so an init-time `sigaction`
