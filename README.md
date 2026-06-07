@@ -550,6 +550,11 @@ tools/
                       ppc64 local-entry-aware); --threading st|mt
   gen_boundary.py     rizin-based LCVB1 sidecar generator; resolves symbol
                       names to their first-BB terminator
+  mutate.py           generic AFL++-style mutation engine (library + CLI):
+                      stdlib-only, weighted havoc + splice, AFL-format
+                      dictionaries, user-defined StructuredInsert
+                      factories, pre/post hooks, opt-in trace hash;
+                      `python3 tools/mutate.py --selftest` to verify
 TODO.md               deferred design work (daemons, transport, etc.)
 ```
 

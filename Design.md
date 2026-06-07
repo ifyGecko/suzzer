@@ -296,6 +296,14 @@ src/
 tools/
   gen_patchlist.py      rizin-based LCV2 generator; per-arch strategies;
                         --threading st|mt selects record-length encoding
+  gen_boundary.py       rizin-based LCVB1 sidecar generator; resolves
+                        symbol names to their first-BB terminator
+  mutate.py             generic AFL++-style mutation engine; stdlib-only;
+                        importable Engine/Dictionary/StructuredInsert +
+                        CLI for ad-hoc mutant dumping and selftest. See
+                        the file's module docstring for the full API
+                        surface and the fuzz_telnetd/DESIGN.md
+                        section-6 retrospective for the design rationale
 
 test/
   target_simple.c       ground-truth ST target with known branch graph
