@@ -8,7 +8,7 @@ BUILD ?= ../build/$(ARCH)
 CC      := $(CROSS)gcc
 CFLAGS  ?= -O0 -g -Wall -Wextra
 
-.PHONY: all clean mt loop
+.PHONY: all clean mt loop demalloc
 
 all: $(BUILD)/target_simple $(BUILD)/target_loop $(BUILD)/fuzz_driver
 
@@ -19,6 +19,11 @@ mt: $(BUILD)/target_simple_mt
 # against a long-running target; an explicit `loop` alias is offered for
 # clarity in scripts.
 loop: $(BUILD)/target_loop
+
+# Heap-bug exerciser for libdemalloc validation. Built on demand by
+# run_validation_demalloc.sh; not pulled by `all` because libdemalloc
+# itself is opt-in.
+demalloc: $(BUILD)/target_demalloc
 
 # -no-pie keeps test addresses static for easy patch-list generation.
 # -fno-stack-protector trims function prologue noise.
@@ -56,7 +61,12 @@ $(BUILD)/fuzz_driver: fuzz_driver.c ../src/boundary.h ../src/sink.h
 $(BUILD)/target_simple_mt: target_simple_mt.c
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -pthread -o $@ $<
 
+# target_demalloc deliberately keeps the libc allocator behavior under
+# LD_PRELOAD interception, so it is a normal -no-pie -O0 build.
+$(BUILD)/target_demalloc: target_demalloc.c
+	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -o $@ $<
+
 clean:
 	rm -rf $(BUILD)/target_simple $(BUILD)/target_simple_thumb \
 	       $(BUILD)/target_simple_mt $(BUILD)/target_loop \
-	       $(BUILD)/fuzz_driver
+	       $(BUILD)/target_demalloc $(BUILD)/fuzz_driver
