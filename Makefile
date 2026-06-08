@@ -140,7 +140,7 @@ OBJ    := $(patsubst src/%.c,$(OBJDIR)/%.o,$(SRC))
 
 LIB := $(BUILD)/libcov_$(THREADING).so
 
-.PHONY: all clean test all-arch all-variants native print-vars
+.PHONY: all clean test all-arch all-variants native print-vars tools tools-clean
 
 all: $(LIB) test
 
@@ -162,6 +162,16 @@ $(LIB): $(OBJ) | $(BUILD)
 
 test: $(LIB)
 	$(MAKE) -C test ARCH=$(ARCH) CROSS=$(CROSS) BUILD=$(abspath $(BUILD))
+
+# Opt-in build of the auxiliary tooling LD_PRELOADs (currently
+# libdemalloc.so). Independent of THREADING and intentionally NOT
+# pulled by `all` or `all-arch` -- libdemalloc is opt-in.
+tools: | $(BUILD)
+	$(MAKE) -C tools ARCH=$(ARCH) CROSS=$(CROSS) BUILD=$(abspath $(BUILD)) \
+	    EXTRA_CFLAGS='$(EXTRA_CFLAGS)'
+
+tools-clean:
+	$(MAKE) -C tools ARCH=$(ARCH) CROSS=$(CROSS) BUILD=$(abspath $(BUILD)) clean
 
 clean:
 	rm -rf build
