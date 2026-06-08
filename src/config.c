@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "patchlist_format.h"
 #include "util.h"
+#include "sink.h"   /* libcov_module_base */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -112,6 +113,9 @@ int config_load(const char *path) {
     const char *modname = getenv("LIBCOV_MODULE");
     uintptr_t base = util_module_base(modname);
     if (!base) { libcov_logf("config: cannot resolve module base"); munmap(map, st.st_size); return -1; }
+    /* Publish base so sink_hash_pc can subtract it (ASLR invariance).
+     * Set BEFORE patch_arm fires any traps. */
+    libcov_module_base = base;
     libcov_logf("config: module base = 0x%lx threading_hint=%u",
                 (unsigned long)base, (unsigned)threading);
 

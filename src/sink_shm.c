@@ -16,6 +16,10 @@ void   *libcov_shm_base = NULL;
 size_t  libcov_shm_size = 0;
 uint8_t *libcov_bitmap  = NULL;
 
+/* Set in config.c::config_load() from util_module_base(). Used by
+ * sink_hash_pc to make the bitmap layout ASLR-invariant. */
+uintptr_t libcov_module_base = 0;
+
 /* prev_loc window: shared global for ST builds; TLS for MT builds so
  * concurrent threads don't fight over edge attribution. Length is
  * LIBCOV_NGRAM_WIN = max(N-1, 1) -- N=1 still allocates one (unused)

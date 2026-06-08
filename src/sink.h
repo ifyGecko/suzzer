@@ -72,6 +72,26 @@ extern size_t libcov_shm_size;
 
 extern uint8_t *libcov_bitmap;
 
+/* Runtime base address of the instrumented module (== util_module_base
+ * result, set in config_load). sink_hash_pc subtracts this before
+ * hashing so the bitmap layout is ASLR-invariant: the same patch site
+ * indexes into the same bucket on every fresh execve of a PIE target.
+ *
+ * Without this subtraction, hashing the absolute PC produces a fresh
+ * pseudo-random bucket set per process under ASLR; the cumulative
+ * bitmap then fills monotonically with random noise regardless of
+ * actual coverage, the queue grows 1:1 with iters, and discovery
+ * signal is completely lost. The bug was silent on systems with
+ * randomize_va_space=0 (which used to be common in fuzz farms) and
+ * surfaces immediately on the default Linux setting (= 2).
+ *
+ * Value 0 means "not initialised"; sink_hash_pc then falls back to
+ * hashing absolute PC (preserves the legacy behaviour and avoids
+ * accidentally producing identical indices for distinct addresses
+ * pre-init -- which only matters for log lines emitted before
+ * config_load runs). */
+extern uintptr_t libcov_module_base;
+
 #if defined(LIBCOV_THREADING_MT)
 extern __thread uint16_t libcov_prev_loc[LIBCOV_NGRAM_WIN];
 #else
@@ -79,8 +99,10 @@ extern uint16_t libcov_prev_loc[LIBCOV_NGRAM_WIN];
 #endif
 
 static inline uint16_t sink_hash_pc(uintptr_t pc) {
-    /* Cheap mixer chosen so adjacent PCs don't collide. */
-    uint64_t v = (uint64_t)pc;
+    /* Hash module-offset (pc - base), not absolute pc, so PIE/ASLR
+     * doesn't randomise the bitmap layout per execve. See the comment
+     * on libcov_module_base above. */
+    uint64_t v = (uint64_t)(pc - libcov_module_base);
     v ^= v >> 33;
     v *= 0xff51afd7ed558ccdULL;
     v ^= v >> 33;
