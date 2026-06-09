@@ -1147,6 +1147,16 @@ executing on the unchanged `R|X` mapping with no perm-change window.
 If `/proc/self/mem` open fails (e.g. Yama LSM with `ptrace_scope=2`),
 `patch_mt.c` falls back to the mprotect dance with a logged warning.
 
+The fallback dance is serialized globally by `g_fallback_lock` (a
+signal-safe spinlock matching the per-entry pattern). The per-entry
+`e->lock` from 17.2.3 is keyed on a `patch_entry`, but mprotect's
+permission bits are keyed on the page: with a large patch set, multiple
+entries commonly share a code page, and two threads patching different
+entries on the same page would otherwise race on the page protection --
+one thread restores `R|X` while the other's `memcpy` is still pending,
+faulting the in-flight writer. The `/proc/self/mem` path does not need
+this serialization because `pwrite` bypasses VMA permission checks.
+
 #### 17.2.5 Cross-CPU instruction-cache visibility
 
 After each successful byte write, `patch_mt.c` issues

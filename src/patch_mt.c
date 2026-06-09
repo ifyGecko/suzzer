@@ -11,7 +11,10 @@
  *      bypasses mprotect entirely, so peer threads keep executing on the
  *      R|X mapping unperturbed -- no transient writable window on the code
  *      page. Falls back to mprotect+memcpy on hardened kernels where
- *      /proc/self/mem writes are blocked.
+ *      /proc/self/mem writes are blocked. The fallback dance is serialized
+ *      globally (g_fallback_lock): mprotect bits are per-page, so the
+ *      per-entry e->lock cannot prevent two threads patching different
+ *      entries on the same page from racing on the page protection.
  *
  *  (3) Cross-CPU instruction-cache coherence: after each successful write,
  *      we call membarrier(PRIVATE_EXPEDITED_SYNC_CORE). On x86 this is a
@@ -57,9 +60,19 @@
 #include <sys/mman.h>
 #include <sys/types.h>
 
-static long g_pagesize = 0;
-static int  g_mem_fd   = -1;
-static int  g_initialized = 0;
+static long    g_pagesize      = 0;
+static int     g_mem_fd        = -1;
+static int     g_initialized   = 0;
+
+/* Global spinlock that serializes the mprotect+write+mprotect dance in
+ * the fallback path of write_bytes(). The per-entry e->lock is keyed on
+ * a patch_entry, but mprotect's permission bits are keyed on the page.
+ * With a large enough patch set, multiple entries share a code page;
+ * concurrent fallback writes on those entries race on the page protection
+ * (thread A restores PROT_READ|PROT_EXEC while thread B's memcpy is still
+ * pending, faulting thread B's writer). The /proc/self/mem path does not
+ * need this lock because pwrite bypasses VMA permission checks. */
+static uint8_t g_fallback_lock = 0;
 
 static void mt_init_once(void) {
     if (g_initialized) return;
@@ -88,6 +101,24 @@ static int protect_range(uintptr_t addr, size_t len, int prot) {
     return mprotect((void *)page, span, prot);
 }
 
+/* Bounded-spin signal-safe lock for the fallback mprotect dance. See the
+ * g_fallback_lock declaration above for why this is global, and why
+ * recursive acquisition by the same thread cannot occur (the lock is held
+ * only while executing libcov code on a non-patched page, so no in-flight
+ * critical section can take its own trap). */
+static inline void fallback_lock(void) {
+    uint8_t expected = 0;
+    while (!__atomic_compare_exchange_n(&g_fallback_lock, &expected, 1,
+                                        0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+        expected = 0;
+        __asm__ volatile ("" ::: "memory");
+    }
+}
+
+static inline void fallback_unlock(void) {
+    __atomic_store_n(&g_fallback_lock, 0, __ATOMIC_RELEASE);
+}
+
 /* Single write of `len` bytes at `addr`. The byte sequence is staged in a
  * caller-provided buffer first so the arch backend's write_illegal can
  * still target a normal pointer. Returns 0 on success.
@@ -109,11 +140,23 @@ static int write_bytes(uintptr_t addr, const void *src, size_t len) {
      * the now-RW page preserves the atomicity argument above. The window
      * where the page is RW is brief but non-zero; peer threads executing
      * the same page see no permission change for execute (Linux's RW flag
-     * doesn't clear X on the PTE), so they keep executing. */
-    if (protect_range(addr, len, PROT_READ | PROT_WRITE) < 0) return -1;
-    memcpy((void *)addr, src, len);
-    if (protect_range(addr, len, PROT_READ | PROT_EXEC) < 0) return -1;
-    return 0;
+     * doesn't clear X on the PTE), so they keep executing.
+     *
+     * Serialized globally via g_fallback_lock: mprotect's permission bits
+     * are per-page, but the per-entry e->lock is keyed per-entry, so two
+     * threads patching different entries on the same page can race --
+     * one restoring PROT_READ|PROT_EXEC while the other's memcpy is
+     * still pending. The global lock closes that window. */
+    fallback_lock();
+    int rv = -1;
+    if (protect_range(addr, len, PROT_READ | PROT_WRITE) == 0) {
+        memcpy((void *)addr, src, len);
+        if (protect_range(addr, len, PROT_READ | PROT_EXEC) == 0) {
+            rv = 0;
+        }
+    }
+    fallback_unlock();
+    return rv;
 }
 
 int patch_validate(const struct patch_entry *e) {
