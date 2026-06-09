@@ -95,9 +95,18 @@ def first_bb_terminator(binary, fn_addr):
     blocks = rizin_json(binary, ["aaa", f"afbj @ {fn_addr}"]) or []
     if not blocks:
         return None
-    # Pick the block whose .addr is closest to (and not greater than) the
-    # function entry -- rizin sometimes returns blocks unsorted.
-    first = min(blocks, key=lambda b: int(b["addr"]))
+    # The function's *entry* basic block is the one starting at fn_addr.
+    # Cold-split blocks (e.g. the .cold half of a __builtin_trap branch)
+    # can appear at lower addresses than the entry, so we can't just take
+    # min(addr); we have to match the block whose addr == fn_addr. Fall
+    # back to the smallest addr >= fn_addr if there's no exact match, and
+    # only then to the absolute smallest (preserves prior behaviour for
+    # one-BB functions whose lone block addr might not equal fn_addr).
+    first = next((b for b in blocks if int(b["addr"]) == int(fn_addr)), None)
+    if first is None:
+        forward = [b for b in blocks if int(b["addr"]) >= int(fn_addr)]
+        first = (min(forward, key=lambda b: int(b["addr"])) if forward
+                 else min(blocks, key=lambda b: int(b["addr"])))
     n = int(first.get("ninstr", 0))
     if n == 0:
         return None
