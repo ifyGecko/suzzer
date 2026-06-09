@@ -52,8 +52,10 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
         return;
     }
 
-    /* Record coverage edge BEFORE restoring, so prev/cur ordering is stable. */
-    sink_emit(pc);
+    /* Record coverage edge BEFORE restoring, so prev/cur ordering is stable.
+     * module_idx tells the sink which module base to subtract for the
+     * ASLR-invariant hash. */
+    sink_emit(pc, e->module_idx);
 
     /* Restore the original instruction so execution can resume. */
     patch_disarm(e);

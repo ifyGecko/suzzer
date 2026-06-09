@@ -1,22 +1,20 @@
 /*
  * arch_x86_64.c -- x86_64 backend (ST and MT in one file).
  *
- * Threading models share one source. The MT-specific behaviour (head-only
- * UD2 write, no NOP padding) is selected by -DLIBCOV_THREADING_MT, which
- * the Makefile sets for `make THREADING=mt`.
+ * Head-only UD2 (2 bytes) for both threading models. Bytes 2..N of the
+ * original instruction are never touched: the trap fires at UD2 before
+ * the tail is decoded, and disarm restores the 2-byte head so the
+ * original instruction is intact when execution resumes.
  *
- * All tunable values (illegal bytes, NOP padding byte, instruction-width
- * bounds) come from src/tunables_x86_64.h -- edit there or pass -D flags.
+ * In MT this is also the only encoding that satisfies the single-copy-
+ * atomic store contract from Intel SDM Vol 3 Sec 8.1.1 -- a naturally
+ * aligned 2-byte store is atomic; longer stores are not. The generator's
+ * --threading mt mode also skips sites that would straddle a 64-byte
+ * cache line, where even 2-byte atomicity is not architecturally
+ * guaranteed.
  *
- * ST mode: UD2 (2 bytes) + (len-2) NOPs as padding. Original instruction
- *   length is 2..15. Trap fires on UD2; padding bytes are never executed.
- *
- * MT mode: UD2 only (2 bytes), no padding. A single naturally-aligned
- *   2-byte store is the largest write x86_64 guarantees is single-copy-
- *   atomic per Intel SDM Vol 3 Sec 8.1.1. Bytes 2..N of the original
- *   instruction are never touched: arm/disarm only rewrite the head, the
- *   trap fires before the tail is decoded, and disarm restores the head
- *   so the original instruction is intact.
+ * All tunable values come from src/tunables_x86_64.h -- edit there or
+ * pass -D flags.
  */
 #define _GNU_SOURCE
 #include "arch.h"
@@ -30,12 +28,7 @@ void libcov_arch_write_illegal(void *dst, uint8_t len) {
     unsigned char *p = (unsigned char *)dst;
     p[0] = (unsigned char)LIBCOV_ARCH_X86_64_ILLEGAL_BYTE0;
     p[1] = (unsigned char)LIBCOV_ARCH_X86_64_ILLEGAL_BYTE1;
-#if defined(LIBCOV_THREADING_MT)
-    /* Head-only write; tail bytes of the original instruction are untouched. */
-    (void)len;
-#else
-    for (uint8_t i = 2; i < len; i++) p[i] = (unsigned char)LIBCOV_ARCH_X86_64_NOP_BYTE;
-#endif
+    (void)len; /* always 2; len is in the patch_entry for symmetry with other arches */
 }
 
 uintptr_t libcov_arch_pc_from_uctx(const ucontext_t *uc) {

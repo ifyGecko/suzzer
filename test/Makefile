@@ -8,12 +8,16 @@ BUILD ?= ../build/$(ARCH)
 CC      := $(CROSS)gcc
 CFLAGS  ?= -O0 -g -Wall -Wextra
 
-.PHONY: all clean mt loop demalloc
+.PHONY: all clean mt loop demalloc multimod
 
 all: $(BUILD)/target_simple $(BUILD)/target_loop $(BUILD)/fuzz_driver
 
 # pthread MT stress target. Built on demand by the MT validation scripts.
 mt: $(BUILD)/target_simple_mt
+
+# Multi-module target + helper .so. Built on demand by
+# run_validation_multimod.sh which exercises LCV3's multi-module path.
+multimod: $(BUILD)/target_multimod $(BUILD)/libmultimod_helper.so
 
 # Boundary-aware loop target. Built by `all` since the driver only works
 # against a long-running target; an explicit `loop` alias is offered for
@@ -66,7 +70,20 @@ $(BUILD)/target_simple_mt: target_simple_mt.c
 $(BUILD)/target_demalloc: target_demalloc.c
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -o $@ $<
 
+# Multi-module pair: a shared library + a -no-pie executable that calls
+# into it. The executable links against the helper so the loader maps the
+# .so at run time; gen_patchlist.py is given both with --module so each
+# gets its own module_idx in the LCV3 output.
+$(BUILD)/libmultimod_helper.so: libmultimod_helper.c libmultimod_helper.h
+	$(CC) $(CFLAGS) -fPIC -shared -o $@ libmultimod_helper.c
+
+$(BUILD)/target_multimod: target_multimod.c libmultimod_helper.h \
+                          $(BUILD)/libmultimod_helper.so
+	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -I. -o $@ target_multimod.c \
+	    -L$(BUILD) -lmultimod_helper -Wl,-rpath,$(BUILD)
+
 clean:
 	rm -rf $(BUILD)/target_simple $(BUILD)/target_simple_thumb \
 	       $(BUILD)/target_simple_mt $(BUILD)/target_loop \
-	       $(BUILD)/target_demalloc $(BUILD)/fuzz_driver
+	       $(BUILD)/target_demalloc $(BUILD)/fuzz_driver \
+	       $(BUILD)/target_multimod $(BUILD)/libmultimod_helper.so

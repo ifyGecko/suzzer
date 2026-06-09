@@ -5,11 +5,13 @@
  * to the `#define` below, OR pass -DLIBCOV_ARCH_X86_64_FOO=bar at build
  * time. Either is fine; the -D wins.
  *
- * Threading note: the MT build (-DLIBCOV_THREADING_MT, set by the
- * Makefile) tightens MAX_PATCH_LEN to 2 because only a naturally-aligned
- * 2-byte UD2 write is single-copy-atomic per Intel SDM Vol 3 Sec 8.1.1
- * (also requires the site to not straddle a cache line; the generator's
- * --threading mt mode enforces that).
+ * Patch shape: head-only UD2 (2 bytes). The original instruction tail is
+ * never touched -- the trap fires at UD2 before the tail is decoded, and
+ * disarm restores the head, so the original instruction is intact. This
+ * matches the MT backend's single-store contract (Intel SDM Vol 3 Sec
+ * 8.1.1: naturally-aligned 2-byte stores are single-copy-atomic) and the
+ * generator's --threading mt mode further requires sites that don't
+ * straddle a 64-byte cache line.
  */
 #ifndef LIBCOV_TUNABLES_X86_64_H
 #define LIBCOV_TUNABLES_X86_64_H
@@ -39,45 +41,17 @@
 #define LIBCOV_ARCH_X86_64_ILLEGAL_BYTE1 0x0B
 #endif
 
-/* LIBCOV_ARCH_X86_64_NOP_BYTE
- *   Padding byte written after UD2 when patching a >2-byte instruction
- *   (ST build only; MT build never pads -- see threading note above).
- *
- *   Default 0x90 (NOP). The padding is never executed because UD2 fires
- *   first; this byte is unobservable at runtime but is fetched by the
- *   CPU's frontend, so it must decode to something benign.
- */
-#ifndef LIBCOV_ARCH_X86_64_NOP_BYTE
-#define LIBCOV_ARCH_X86_64_NOP_BYTE 0x90
-#endif
-
 /* LIBCOV_ARCH_X86_64_MIN_PATCH_LEN
- *   Minimum original-instruction length the runtime will accept. UD2 is
- *   2 bytes, so anything shorter cannot be safely patched.
+ * LIBCOV_ARCH_X86_64_MAX_PATCH_LEN
+ *   Patch length the runtime will accept. UD2 is 2 bytes; head-only
+ *   patching means we always write exactly 2 bytes. Both ST and MT
+ *   builds use the same value.
  */
 #ifndef LIBCOV_ARCH_X86_64_MIN_PATCH_LEN
 #define LIBCOV_ARCH_X86_64_MIN_PATCH_LEN 2
 #endif
-
-/* LIBCOV_ARCH_X86_64_MAX_PATCH_LEN
- *   Maximum original-instruction length the runtime will accept.
- *
- *   ST default 15 (the x86_64 hardware max). The ST patch path writes
- *   UD2 + (len-2) NOP padding.
- *
- *   MT default 2 (UD2 only; see threading note above).
- *
- *   The MT override below kicks in when LIBCOV_THREADING_MT is defined
- *   (set by the Makefile for `make THREADING=mt`). To force a custom
- *   max length, pass -DLIBCOV_ARCH_X86_64_MAX_PATCH_LEN=N which wins
- *   over both defaults.
- */
 #ifndef LIBCOV_ARCH_X86_64_MAX_PATCH_LEN
-# if defined(LIBCOV_THREADING_MT)
-#  define LIBCOV_ARCH_X86_64_MAX_PATCH_LEN 2
-# else
-#  define LIBCOV_ARCH_X86_64_MAX_PATCH_LEN 15
-# endif
+#define LIBCOV_ARCH_X86_64_MAX_PATCH_LEN 2
 #endif
 
 #endif /* LIBCOV_TUNABLES_X86_64_H */

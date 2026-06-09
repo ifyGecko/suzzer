@@ -1,36 +1,51 @@
 /*
  * patchlist_format.h -- on-disk patch-list wire format + runtime patch_entry.
  *
- * (Renamed from config.h. This file is NOT a tunables header; user-facing
- * knobs live in src/tunables.h and src/tunables_<arch>.h.)
+ * Format: LCV3. Single-version, no backward-compat readers retained.
  *
- * Two versions are accepted by the loader:
+ *   struct patchlist_header_v3 {
+ *       char     magic[4];        // "LCV3"
+ *       uint32_t version;         // 3
+ *       uint32_t count;           // number of records that follow the header
+ *       uint8_t  threading;       // 0=ANY, 1=ST, 2=MT
+ *       uint8_t  flags;           // reserved, must be 0
+ *       uint8_t  module_count;    // 1..255 entries in the name table
+ *       uint8_t  reserved;
+ *       uint32_t modules_offset;  // file offset of the module-name table
+ *       uint32_t modules_size;    // total bytes in the name table
+ *   };
  *
- *   LCV1 (legacy): 16-byte header, no threading hint. Treated as "any".
+ * Layout in file:
+ *   [header_v3]
+ *   [count * struct patchlist_record]
+ *   [module name table: module_count NUL-terminated basenames concatenated]
  *
- *     struct patchlist_header_v1 {
- *         char     magic[4];   // "LCV1"
- *         uint32_t version;    // 1
- *         uint32_t count;
- *         uint32_t reserved;
- *     };
+ * The module name table can sit immediately after the records (typical) or
+ * anywhere else in the file (modules_offset is authoritative). Each name is
+ * the basename of a loaded ELF (e.g. "target_simple", "libfoo.so") and is
+ * resolved at init through /proc/self/maps. Record.module_idx is an index
+ * into this table; the runtime resolves one load base per module name and
+ * uses base[module_idx] + offset for each entry's absolute address.
  *
- *   LCV2 (current): 16-byte header, carries a threading-mode hint so a
- *   library built for one threading model refuses a patch list built for
- *   another. Field layout matches LCV1's first 12 bytes; the last 4 bytes
- *   are a one-byte hint, one-byte flags, two-byte reserved.
+ * All multi-byte fields are little-endian on disk regardless of target endian.
  *
- *     struct patchlist_header_v2 {
- *         char     magic[4];   // "LCV2"
- *         uint32_t version;    // 2
- *         uint32_t count;
- *         uint8_t  threading;  // 0=ANY, 1=ST, 2=MT
- *         uint8_t  flags;      // reserved
- *         uint16_t reserved;
- *     };
+ * Record:
  *
- * Both versions are followed by `count` records of struct patchlist_record.
- * All multi-byte fields little-endian on disk regardless of target endian.
+ *   struct patchlist_record {
+ *       uint64_t offset;       // from g_module_bases[module_idx]
+ *       uint8_t  len;          // bytes to patch and restore (2 or 4)
+ *       uint8_t  module_idx;   // index into the name table
+ *       uint8_t  orig[4];      // first `len` bytes are meaningful
+ *   } __attribute__((packed)); // 14 bytes
+ *
+ * `len` is per-record so back-to-back 2-byte ISAs (arm-Thumb, riscv64-C)
+ * can coexist with 4-byte ISAs in the same list without one site's arm
+ * clobbering a neighboring armed site. The arch backend's write_illegal
+ * is given `len` and writes exactly that many bytes; patch_arm /
+ * patch_disarm validate and restore the same span.
+ *
+ * `orig[4]` is sized for the widest cross-arch case (4-byte fixed-width
+ * ISAs). x86's UD2 patches store 2 meaningful bytes and ignore the tail.
  */
 #ifndef LIBCOV_CONFIG_H
 #define LIBCOV_CONFIG_H
@@ -38,40 +53,43 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define LIBCOV_MAGIC_V1   "LCV1"
-#define LIBCOV_MAGIC_V2   "LCV2"
-#define LIBCOV_VERSION_V1 1u
-#define LIBCOV_VERSION_V2 2u
+#define LIBCOV_MAGIC   "LCV3"
+#define LIBCOV_VERSION 3u
 
-/* Back-compat aliases. New code should use the _V2 names. */
-#define LIBCOV_MAGIC   LIBCOV_MAGIC_V2
-#define LIBCOV_VERSION LIBCOV_VERSION_V2
-
-/* Threading hint stored in LCV2 header. */
+/* Threading hint stored in the header. */
 #define LIBCOV_TH_ANY 0u
 #define LIBCOV_TH_ST  1u
 #define LIBCOV_TH_MT  2u
 
-struct patchlist_header_v1 {
-    char     magic[4];
-    uint32_t version;
-    uint32_t count;
-    uint32_t reserved;
-} __attribute__((packed));
+/* Maximum bytes ever written by libcov_arch_write_illegal across all
+ * supported arches. Sized so a single naturally-aligned 4-byte write
+ * covers fixed-width 4-byte ISAs (aarch64/arm-ARM/mips/ppc/riscv64), and
+ * 2-byte writes (x86 UD2, arm-Thumb, riscv64-C) fit with room to spare. */
+#define LIBCOV_PATCH_ORIG_MAX 4u
 
-struct patchlist_header_v2 {
+/* Caps on the module name table. 255 modules is plenty for typical
+ * targets (executable + a handful of shared libs). 4 KiB total name
+ * bytes leaves room for fully-qualified long basenames if ever needed. */
+#define LIBCOV_MAX_MODULES         255u
+#define LIBCOV_MAX_MODULES_BYTES   4096u
+
+struct patchlist_header_v3 {
     char     magic[4];
     uint32_t version;
     uint32_t count;
     uint8_t  threading;
     uint8_t  flags;
-    uint16_t reserved;
+    uint8_t  module_count;
+    uint8_t  reserved;
+    uint32_t modules_offset;
+    uint32_t modules_size;
 } __attribute__((packed));
 
 struct patchlist_record {
-    uint64_t offset;    /* offset from module base */
-    uint8_t  len;       /* original instruction length (1..15) */
-    uint8_t  orig[15];  /* original bytes, only [0..len) meaningful */
+    uint64_t offset;
+    uint8_t  len;
+    uint8_t  module_idx;
+    uint8_t  orig[LIBCOV_PATCH_ORIG_MAX];
 } __attribute__((packed));
 
 /* Runtime entry built from a record + module base. Sorted by addr; built
@@ -82,13 +100,17 @@ struct patchlist_record {
  * `lock` is MT-only: a single-byte spinlock acquired around the byte-write
  * critical section in patch_mt.c, so an in-flight arm and an in-flight
  * disarm on the same entry can't interleave their syscalls and leave the
- * bytes inconsistent with `patched`. ST-mode ignores this field. */
+ * bytes inconsistent with `patched`. ST-mode ignores this field.
+ *
+ * `module_idx` is carried from the wire record so the trap handler can
+ * subtract the correct module base in sink_hash_pc (ASLR invariance). */
 struct patch_entry {
-    uintptr_t addr;          /* absolute address in target process */
-    uint8_t   len;           /* original instruction length */
-    uint8_t   orig[15];      /* original bytes */
-    uint8_t   patched;       /* 1 if currently illegal, 0 if restored */
-    uint8_t   lock;          /* MT-only: 1 if arm/disarm in progress */
+    uintptr_t addr;
+    uint8_t   len;
+    uint8_t   module_idx;
+    uint8_t   orig[LIBCOV_PATCH_ORIG_MAX];
+    uint8_t   patched;
+    uint8_t   lock;
 };
 
 int  config_load(const char *path);

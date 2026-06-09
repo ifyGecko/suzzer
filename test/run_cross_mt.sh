@@ -4,7 +4,7 @@
 # For every supported arch we:
 #   1. Build libcov_mt.so.
 #   2. Build target_simple_mt (pthread stress target).
-#   3. Generate an LCV2 patch list with --threading mt.
+#   3. Generate an LCV3 patch list with --threading mt.
 #
 # Then we attempt a runtime validation. Whether the runtime test is
 # possible depends on whether qemu-user-static can faithfully emulate our
@@ -187,7 +187,7 @@ print(c, th)")
 
     if ! is_full_run_arch "$arch"; then
         # Build-only: we already built libcov_mt.so + target_simple_mt and
-        # produced an LCV2 patch list. That's all we can validate under
+        # produced an LCV3 patch list. That's all we can validate under
         # qemu-user for these arches. Running target_simple_mt with
         # libcov_mt loaded would infinite-loop on the first trap because
         # qemu's TCG cache keeps replaying the cached trap translation
@@ -195,7 +195,7 @@ print(c, th)")
         # invalidate TCG is mprotect with a perm change, which strips X
         # and SIGSEGVs peer guest fetches. On real hardware the CPU
         # naturally re-fetches and there is no TCG layer.
-        echo "  BUILD_ONLY PASS (libcov_mt.so + target_simple_mt + LCV2 patch list ok;"
+        echo "  BUILD_ONLY PASS (libcov_mt.so + target_simple_mt + LCV3 patch list ok;"
         echo "                   runtime validation requires real hardware -- see"
         echo "                   src/patch_mt.c for the per-arch correctness argument)"
         BUILD_ONLY=$((BUILD_ONLY+1))

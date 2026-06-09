@@ -66,7 +66,7 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
      * The first one's patch_disarm wins the cmpxchg and does the byte write;
      * losers no-op. Both paths record an edge in TLS prev_loc + the shared
      * atomic bitmap. */
-    sink_emit(pc);
+    sink_emit(pc, e->module_idx);
     patch_disarm(e);
 
     if (g_mode == LIBCOV_MODE_LEAPFROG) {

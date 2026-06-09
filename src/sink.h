@@ -43,6 +43,7 @@
 #include <stddef.h>
 
 #include "tunables.h"   /* LIBCOV_MAP_SIZE_POW2, LIBCOV_NGRAM_N, LIBCOV_NGRAM_ROTATE */
+#include "patchlist_format.h"  /* LIBCOV_MAX_MODULES */
 
 #define LIBCOV_MAP_SIZE      (1u << LIBCOV_MAP_SIZE_POW2)
 #define LIBCOV_MAP_MASK      (LIBCOV_MAP_SIZE - 1u)
@@ -72,10 +73,15 @@ extern size_t libcov_shm_size;
 
 extern uint8_t *libcov_bitmap;
 
-/* Runtime base address of the instrumented module (== util_module_base
- * result, set in config_load). sink_hash_pc subtracts this before
- * hashing so the bitmap layout is ASLR-invariant: the same patch site
- * indexes into the same bucket on every fresh execve of a PIE target.
+/* Per-module runtime load bases, indexed by the module_idx field on each
+ * patch_entry. Populated by config_load from /proc/self/maps for each
+ * named module in the LCV3 header's name table.
+ *
+ * sink_hash_pc subtracts the entry's module base before hashing so the
+ * bitmap layout is ASLR-invariant: the same patch site indexes into the
+ * same bucket on every fresh execve of a PIE target. With multi-module
+ * support the right base depends on which module the site lives in, so
+ * we look it up by module_idx (carried on the patch_entry).
  *
  * Without this subtraction, hashing the absolute PC produces a fresh
  * pseudo-random bucket set per process under ASLR; the cumulative
@@ -85,12 +91,13 @@ extern uint8_t *libcov_bitmap;
  * randomize_va_space=0 (which used to be common in fuzz farms) and
  * surfaces immediately on the default Linux setting (= 2).
  *
- * Value 0 means "not initialised"; sink_hash_pc then falls back to
- * hashing absolute PC (preserves the legacy behaviour and avoids
- * accidentally producing identical indices for distinct addresses
- * pre-init -- which only matters for log lines emitted before
- * config_load runs). */
-extern uintptr_t libcov_module_base;
+ * Slot 0 of libcov_module_bases is always the primary module (the first
+ * --module argument to gen_patchlist.py); slots 1..N are auxiliary
+ * libraries in declaration order. Slots >= module_count are 0. A 0 base
+ * for a referenced slot means config_load couldn't resolve the module
+ * and refused to finish loading, so this state never reaches the
+ * handler. */
+extern uintptr_t libcov_module_bases[LIBCOV_MAX_MODULES];
 
 #if defined(LIBCOV_THREADING_MT)
 extern __thread uint16_t libcov_prev_loc[LIBCOV_NGRAM_WIN];
@@ -98,11 +105,13 @@ extern __thread uint16_t libcov_prev_loc[LIBCOV_NGRAM_WIN];
 extern uint16_t libcov_prev_loc[LIBCOV_NGRAM_WIN];
 #endif
 
-static inline uint16_t sink_hash_pc(uintptr_t pc) {
-    /* Hash module-offset (pc - base), not absolute pc, so PIE/ASLR
-     * doesn't randomise the bitmap layout per execve. See the comment
-     * on libcov_module_base above. */
-    uint64_t v = (uint64_t)(pc - libcov_module_base);
+static inline uint16_t sink_hash_pc(uintptr_t pc, uint8_t module_idx) {
+    /* Hash module-offset (pc - base[module_idx]), not absolute pc, so
+     * PIE/ASLR doesn't randomise the bitmap layout per execve. See the
+     * comment on libcov_module_bases above. The bitmap is shared across
+     * modules; cross-module hash collisions are possible but accepted
+     * (same trade-off as same-module collisions on a 16-bit index). */
+    uint64_t v = (uint64_t)(pc - libcov_module_bases[module_idx]);
     v ^= v >> 33;
     v *= 0xff51afd7ed558ccdULL;
     v ^= v >> 33;
@@ -120,8 +129,8 @@ static inline uint16_t sink_ngram_rot(uint16_t v, unsigned j) {
 }
 #endif
 
-static inline void sink_emit(uintptr_t pc) {
-    uint16_t cur = sink_hash_pc(pc);
+static inline void sink_emit(uintptr_t pc, uint8_t module_idx) {
+    uint16_t cur = sink_hash_pc(pc, module_idx);
 
     /* Fold the last N-1 PCs into the bucket index. N=1 collapses to
      * idx = hash(pc) (the for-loop body is preprocessed away). N=2

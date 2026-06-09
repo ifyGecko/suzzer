@@ -82,7 +82,7 @@ if [[ "$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 0)" -gt 0 ]]
 fi
 
 # Generate the patch lists -- ST and MT are not interchangeable. libcov
-# enforces the LCV2 threading hint: an ST-generated list given to
+# enforces the LCV3 threading hint: an ST-generated list given to
 # libcov_mt is refused at init, leaving the library inert (bitmap stays
 # empty -> validation B/C fail with cryptic results). So we generate
 # one of each.

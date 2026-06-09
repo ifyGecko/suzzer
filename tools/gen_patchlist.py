@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-gen_patchlist.py -- produce an LCV2 binary patch list for a target binary.
+gen_patchlist.py -- produce an LCV3 binary patch list for one or more
+modules (the main executable and optionally a set of shared libraries).
 
-Drives rizin via the rzpipe Python module: one long-lived rizin process,
-`aaa` runs exactly once at startup, and every subsequent query reuses the
-cached analysis. The previous shell-subprocess implementation re-ran
-`aaa` for every command and was wall-clock dominated by it on
-medium-sized binaries.
+Drives rizin via the rzpipe Python module: one long-lived rizin process
+per module, `aaa` runs exactly once per module at startup, and every
+subsequent query reuses the cached analysis. The previous shell-
+subprocess implementation re-ran `aaa` for every command and was
+wall-clock dominated by it on medium-sized binaries.
 
 Per-arch behavior:
   x86_64, aarch64, arm (ARM mode), powerpc, riscv64: patch block terminators
@@ -14,19 +15,33 @@ Per-arch behavior:
   mips, mips64:                                      patch block ENTRIES
                                                      (avoids branch delay slots)
 
+x86_64 patches are head-only UD2 (2 bytes) regardless of original
+instruction length; the tail of a variable-length x86 instruction is
+never touched. ST and MT use the same patch shape.
+
 Threading-mode selection (--threading):
-  st (default) -- single-threaded libcov:
-                  full insn length recorded (x86: up to 15 bytes);
-                  arm/disarm writes len bytes (UD2 + NOP pad on x86).
-  mt           -- multi-threaded libcov:
-                  every record's `len` reduced to the arch's atomic
-                  write width (x86=2, aarch64/arm/mips/ppc=4,
-                  thumb/riscv-compressed=2). Required so the runtime can
-                  perform a single naturally-aligned store, which is the
-                  largest atomic write the ISA guarantees.
-                  For x86, also skips any site whose 2-byte write would
-                  straddle a 64-byte cache line (Intel does not guarantee
-                  atomicity in that case).
+  st (default) -- single-threaded libcov: arch-natural patch width
+                  (x86=2, fixed-width 4-byte ISAs=4, Thumb/RV-C=2).
+  mt           -- multi-threaded libcov: same widths, plus alignment
+                  filtering so every site's write is a single naturally-
+                  aligned store (the largest atomic write each ISA
+                  guarantees). For x86, also skips any site whose 2-byte
+                  write would straddle a 64-byte cache line (Intel does
+                  not guarantee atomicity in that case).
+
+Multi-module instrumentation:
+  The positional `binary` is always module index 0 (typically the main
+  executable). Additional shared libraries can be instrumented in the
+  same patch list by passing `--module NAME:PATH` one or more times:
+
+      gen_patchlist.py target_exe out.lcv \\
+          --module libfoo.so:/path/to/libfoo.so \\
+          --module libasdf.so:/path/to/libasdf.so
+
+  NAME is the basename the runtime looks up in /proc/self/maps at init
+  time; PATH is the file rizin analyzes. Each module's records are
+  tagged with its index so the runtime can subtract the correct module
+  load base for the ASLR-invariant coverage hash.
 
 Selective instrumentation (--root / --cutoff / --max-depth):
   By default the generator emits sites for every function that survives
@@ -73,15 +88,24 @@ Selective instrumentation (--root / --cutoff / --max-depth):
       separate feature on the backlog.
 
 Output layout matches src/patchlist_format.h:
-  LCV2 header: magic[4]='LCV2', version=2, count, threading, flags, reserved
-  record:      u64 offset, u8 len, u8 orig[15]
+  LCV3 header (24 bytes): magic[4]='LCV3', version=3, count, threading,
+                           flags, module_count, reserved,
+                           modules_offset, modules_size
+  record (14 bytes):       u64 offset, u8 len, u8 module_idx, u8 orig[4]
+  name table:              module_count NUL-terminated basenames at
+                           modules_offset
 
 Usage:
-  # full-binary (legacy):
+  # single module (the main executable):
   ./gen_patchlist.py <binary> <out.lcv> [--include-pat REGEX]
                                         [--exclude-pat REGEX]
                                         [--strategy auto|entry|terminator]
                                         [--threading st|mt]
+
+  # multi-module (executable + two shared libraries):
+  ./gen_patchlist.py <binary> <out.lcv> \\
+        --module libfoo.so:/path/to/libfoo.so \\
+        --module libasdf.so:/path/to/libasdf.so
 
   # selective (instrument only the slice rooted at parse_request,
   # but don't recurse into the logging or crypto subsystems):
@@ -100,10 +124,23 @@ import sys
 import rzpipe
 
 
-# Threading-hint values written into the LCV2 header.
+# Threading-hint values written into the LCV3 header.
 TH_ANY = 0
 TH_ST  = 1
 TH_MT  = 2
+
+# Bytes of original instruction stored per record. Must match
+# LIBCOV_PATCH_ORIG_MAX in src/patchlist_format.h.
+LCV3_ORIG_LEN = 4
+
+# LCV3 record layout: u64 offset, u8 len, u8 module_idx, u8 orig[4].
+LCV3_RECORD_STRUCT = struct.Struct("<QBB4s")
+assert LCV3_RECORD_STRUCT.size == 14
+
+# LCV3 header layout: magic[4], version, count, threading, flags,
+# module_count, reserved, modules_offset, modules_size.
+LCV3_HEADER_STRUCT = struct.Struct("<4sIIBBBBII")
+assert LCV3_HEADER_STRUCT.size == 24
 
 
 # rizin still emits a few ANSI CSI sequences (clear-line etc.) even from
@@ -434,7 +471,14 @@ def bfs_reachable(roots, adj, cutoffs, max_depth=None):
     return out
 
 
-def run(args, rz):
+def collect_module_records(args, rz, module_idx, module_name):
+    """Walk one module's functions and return its patch records.
+
+    Returns (records, mt_skipped_alignment). Each record is a tuple
+    (offset, len, module_idx, orig_bytes) ready to be packed into the
+    LCV3 wire format. The caller is responsible for combining records
+    across modules and writing the final file.
+    """
     inc = re.compile(args.include_pat) if args.include_pat else None
     exc = re.compile(args.exclude_pat) if args.exclude_pat else None
 
@@ -443,11 +487,10 @@ def run(args, rz):
     arch  = info["arch"]
     bits  = info["bits"]
     strategy = args.strategy if args.strategy != "auto" else default_strategy(arch, bits)
-    threading_hint = TH_MT if args.threading == "mt" else TH_ST
 
     if args.verbose:
-        print(f"arch={arch} bits={bits} endian={info['endian']} "
-              f"baddr=0x{baddr:x} strategy={strategy} threading={args.threading}",
+        print(f"module[{module_idx}] '{module_name}': arch={arch} bits={bits} "
+              f"endian={info['endian']} baddr=0x{baddr:x} strategy={strategy}",
               file=sys.stderr)
 
     # One canonical `aflj` snapshot, reused for filtering, slice
@@ -505,7 +548,7 @@ def run(args, rz):
                       file=sys.stderr)
             print("(--print-reachable: exiting before writing patchlist)",
                   file=sys.stderr)
-            return
+            return None, 0
 
         before = len(fns)
         fns = [f for f in fns if int(f["offset"]) in reachable_offsets]
@@ -552,8 +595,30 @@ def run(args, rz):
             if len(orig) != size:
                 continue
 
+            # Skip sites whose ORIGINAL instruction is shorter than the
+            # smallest illegal we can emit (2 bytes for every supported
+            # arch). Must run BEFORE the per-arch clamps below, otherwise
+            # a 1-byte x86 ret would have its record `len` bumped to 2
+            # while orig still holds only 1 real byte; the runtime would
+            # then write a 2-byte UD2 over the ret + the first byte of
+            # the next instruction, and disarm would restore only 1 byte
+            # of orig followed by a zero padding byte -- corrupting that
+            # next instruction.
+            if size < 2:
+                if args.verbose:
+                    print(f"  skip 0x{addr:x} len={size} (too short for illegal encoding)",
+                          file=sys.stderr)
+                continue
+
             # Thumb override (ST and MT both): write only first 2 bytes.
             if arch == "arm" and fn["bits"] == 16:
+                size = 2
+                orig = orig[:2]
+
+            # x86 head-only UD2: always 2 bytes regardless of original
+            # instruction length. Matches LIBCOV_ARCH_X86_64_MAX_PATCH_LEN
+            # in src/tunables_x86_64.h.
+            if arch == "x86":
                 size = 2
                 orig = orig[:2]
 
@@ -571,38 +636,108 @@ def run(args, rz):
                 size = width
                 orig = orig[:width]
 
-            if size < 2 or size > 15:
+            if size < 2 or size > LCV3_ORIG_LEN:
                 if args.verbose:
                     print(f"  skip 0x{addr:x} len={size} (out of range)",
                           file=sys.stderr)
                 continue
 
             offset = addr - baddr
-            records.append((offset, size, orig))
+            records.append((offset, size, module_idx, orig))
             seen.add(addr)
             if args.verbose:
                 print(f"  patch 0x{addr:x} off=0x{offset:x} len={size} "
-                      f"bytes={orig.hex()} ({fn['name']})", file=sys.stderr)
+                      f"midx={module_idx} bytes={orig.hex()} ({fn['name']})",
+                      file=sys.stderr)
 
-    with open(args.output, "wb") as f:
-        # LCV2 header: magic, version, count, threading, flags, reserved
-        f.write(b"LCV2")
-        f.write(struct.pack("<II", 2, len(records)))
-        f.write(struct.pack("<BBH", threading_hint, 0, 0))
-        for offset, size, orig in records:
-            padded = orig + b"\x00" * (15 - size)
-            f.write(struct.pack("<QB15s", offset, size, padded))
+    return records, mt_skipped_alignment
 
-    print(f"wrote {len(records)} records to {args.output} "
-          f"(threading={args.threading}"
-          + (f", skipped {mt_skipped_alignment} mt-unsafe sites" if mt_skipped_alignment else "")
-          + ")", file=sys.stderr)
+
+def write_lcv3(output_path, module_names, records, threading_hint):
+    """Pack module records + name table into the LCV3 wire format."""
+    name_blob = b"".join(n.encode("utf-8") + b"\x00" for n in module_names)
+    header_size  = LCV3_HEADER_STRUCT.size
+    records_size = LCV3_RECORD_STRUCT.size * len(records)
+    modules_offset = header_size + records_size
+    modules_size   = len(name_blob)
+
+    with open(output_path, "wb") as f:
+        f.write(LCV3_HEADER_STRUCT.pack(
+            b"LCV3", 3, len(records),
+            threading_hint, 0, len(module_names), 0,
+            modules_offset, modules_size))
+        for offset, size, module_idx, orig in records:
+            padded = orig + b"\x00" * (LCV3_ORIG_LEN - len(orig))
+            f.write(LCV3_RECORD_STRUCT.pack(offset, size, module_idx, padded))
+        f.write(name_blob)
+
+
+def run(args):
+    """Collect records from every requested module and emit an LCV3 file."""
+    threading_hint = TH_MT if args.threading == "mt" else TH_ST
+
+    # Module index 0 is always the positional `binary`. Additional
+    # `--module name:path` flags become module indices 1, 2, ... in the
+    # order they appear on the command line.
+    primary_name = args.binary.rsplit("/", 1)[-1]
+    module_specs = [(primary_name, args.binary)]
+    for spec in args.module:
+        if ":" not in spec:
+            sys.exit(f"error: --module requires NAME:PATH form, got '{spec}'")
+        name, path = spec.split(":", 1)
+        if not name or not path:
+            sys.exit(f"error: --module '{spec}' has empty NAME or PATH")
+        module_specs.append((name, path))
+
+    if len(module_specs) > 255:
+        sys.exit(f"error: too many modules ({len(module_specs)}); LCV3 caps at 255")
+
+    all_records = []
+    total_skipped = 0
+    for module_idx, (name, path) in enumerate(module_specs):
+        if args.verbose:
+            print(f"opening rizin on module[{module_idx}] '{name}' ({path})",
+                  file=sys.stderr)
+        rz = open_rizin(path)
+        try:
+            result = collect_module_records(args, rz, module_idx, name)
+        finally:
+            try:
+                rz.quit()
+            except Exception:
+                pass
+        if result is None or result[0] is None:
+            # --print-reachable returned early; no file written.
+            return
+        records, skipped = result
+        all_records.extend(records)
+        total_skipped += skipped
+
+    write_lcv3(args.output, [n for n, _ in module_specs], all_records,
+               threading_hint)
+
+    skipped_note = (f", skipped {total_skipped} mt-unsafe sites"
+                    if total_skipped else "")
+    print(f"wrote {len(all_records)} records across {len(module_specs)} "
+          f"module(s) to {args.output} (threading={args.threading}{skipped_note})",
+          file=sys.stderr)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("binary")
+    ap.add_argument("binary",
+                    help="primary module to instrument (module index 0). "
+                         "Typically the main executable; the runtime resolves "
+                         "its load base from /proc/self/maps using the file's "
+                         "basename.")
     ap.add_argument("output")
+    ap.add_argument("--module", action="append", default=[],
+                    metavar="NAME:PATH",
+                    help="add an auxiliary module to instrument alongside the "
+                         "primary binary. NAME is the basename the runtime "
+                         "looks up in /proc/self/maps (e.g. 'libfoo.so'); "
+                         "PATH is the ELF file rizin analyses. Repeatable; "
+                         "each --module gets the next module_idx starting at 1.")
     ap.add_argument("--include-pat", default=None,
                     help="only include functions whose name matches this regex")
     ap.add_argument("--exclude-pat",
@@ -642,14 +777,7 @@ def main():
             and not args.root:
         ap.error("--cutoff / --max-depth / --print-reachable require --root")
 
-    rz = open_rizin(args.binary)
-    try:
-        run(args, rz)
-    finally:
-        try:
-            rz.quit()
-        except Exception:
-            pass
+    run(args)
 
 
 if __name__ == "__main__":

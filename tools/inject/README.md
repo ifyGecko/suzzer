@@ -115,7 +115,7 @@ Debug:
 
 ## ST vs MT patch lists
 
-libcov enforces the LCV2 threading hint at init: handing an ST-generated
+libcov enforces the LCV3 threading hint at init: handing an ST-generated
 patch list to `libcov_mt.so` (or vice versa) is refused, and the library
 becomes inert (no patches, empty bitmap). Generate the right kind:
 

@@ -84,7 +84,7 @@ LD_PRELOAD libcov.so loaded into target process:
   │  constructor(101) — libcov_init                             │
   │    1. open log fd (LIBCOV_LOG or stderr)                    │
   │    2. resolve module base via /proc/self/maps               │
-  │    3. mmap LCV1 patch list                                  │
+  │    3. mmap LCV3 patch list                                  │
   │    4. mmap 64KB shm bitmap                                  │
   │    5. allocate sorted patch_table[]                         │
   │    6. for each entry: mprotect→memcpy(illegal insn)→        │
@@ -174,36 +174,25 @@ that another thread is executing is a race.
 
 ---
 
-## 4. Wire format -- LCV1 and LCV2
+## 4. Wire format -- LCV3
 
 Patch lists are flat binary, little-endian regardless of target endian.
-The library accepts both header versions; the generator emits LCV2.
+The library accepts only LCV3; there is no backward-compatibility path
+for earlier versions.
 
-### 4.1a LCV1 header (legacy, 16 bytes)
-
-```c
-struct patchlist_header_v1 {
-    char     magic[4];     // "LCV1"
-    uint32_t version;      // 1
-    uint32_t count;        // number of records
-    uint32_t reserved;     // 0
-} __attribute__((packed));
-```
-
-LCV1 carries no threading hint; the loader treats it as "ANY", so a
-legacy LCV1 patch list is accepted by both ST and MT libraries. This
-preserves bytewise compatibility with any existing patch lists.
-
-### 4.1b LCV2 header (current, 16 bytes)
+### 4.1 LCV3 header (24 bytes)
 
 ```c
-struct patchlist_header_v2 {
-    char     magic[4];     // "LCV2"
-    uint32_t version;      // 2
-    uint32_t count;        // number of records
-    uint8_t  threading;    // 0=ANY, 1=ST, 2=MT
-    uint8_t  flags;        // reserved
-    uint16_t reserved;
+struct patchlist_header_v3 {
+    char     magic[4];        // "LCV3"
+    uint32_t version;         // 3
+    uint32_t count;           // number of records
+    uint8_t  threading;       // 0=ANY, 1=ST, 2=MT
+    uint8_t  flags;           // reserved, must be 0
+    uint8_t  module_count;    // 1..255
+    uint8_t  reserved;
+    uint32_t modules_offset;  // file offset of module name table
+    uint32_t modules_size;    // bytes in the name table
 } __attribute__((packed));
 ```
 
@@ -212,39 +201,61 @@ patch list (per-arch atomic-width records, x86 cache-line-safe sites
 only) given to `libcov_st.so` (or vice-versa) is refused at init with
 a clear log line rather than producing subtly-wrong coverage.
 
-Multi-module support is the next iteration of the wire format. LCV2's
-header has room for a module-table offset; LCV3 will append a name
-table after the records and add a `module_idx` byte to each record.
+`module_count` is the number of entries in the trailing module name
+table. The runtime resolves one load base per module name at init from
+`/proc/self/maps` and stores them in `libcov_module_bases[]`.
 
-### 4.2 Record (24 bytes)
+### 4.2 Record (14 bytes)
 
 ```c
 struct patchlist_record {
-    uint64_t offset;       // from module load base
-    uint8_t  len;          // 1..15 original instruction length
-    uint8_t  orig[15];     // original bytes; only [0..len) meaningful
+    uint64_t offset;       // from libcov_module_bases[module_idx]
+    uint8_t  len;          // bytes to patch and restore (2 or 4)
+    uint8_t  module_idx;   // index into the name table
+    uint8_t  orig[4];      // first `len` bytes meaningful
 } __attribute__((packed));
 ```
 
-### 4.3 Endian handling
+Per-record `len` lets back-to-back 2-byte ISAs (arm-Thumb, riscv64-C)
+coexist with 4-byte ISAs in the same list without one site's arm
+clobbering a neighboring armed site. `orig[4]` is sized for the widest
+cross-arch case (4-byte fixed-width ISAs); x86 (UD2) and 2-byte ISAs
+store 2 meaningful bytes and ignore the tail. See §17.1.1 for the
+per-arch patch-byte table.
 
-The library reads `version`, `count`, and `offset` through `le32toh` /
-`le64toh` from `<endian.h>`, so a big-endian target running on a BE
-build of libcov correctly parses an LE wire file. Without this, a BE
-target would read version=1 as 0x01000000 and reject the file.
+### 4.3 Module name table
 
-### 4.4 Address resolution
+A flat blob of `module_count` NUL-terminated basenames concatenated at
+`modules_offset` (typically immediately after the records). Names are
+the basenames the runtime looks up in `/proc/self/maps` -- e.g.
+`"target_simple\0libfoo.so\0libasdf.so\0"`. Index 0 is the primary
+module (typically the executable); indices 1..N are auxiliary modules
+in the order the generator was given them.
 
-`offset` is relative to the module load base. The library calls
-`util_module_base()` which parses `/proc/self/maps` and returns
-`lo - file_offset` for the first mapping of the named module (default:
-basename of `/proc/self/exe`, override via `LIBCOV_MODULE`). For non-PIE
-binaries the result is the binary's linked base (e.g. 0x400000 on
-x86_64, 0x10000 on 32-bit ARM). For PIE binaries it is the ASLR'd load
-address. The generator emits `offset = absolute_addr - rizin.bin.baddr`,
-which composes correctly with either case.
+### 4.4 Endian handling
 
-### 4.5 Why a custom format
+The library reads multi-byte header fields and `offset` through
+`le32toh` / `le64toh` from `<endian.h>`, so a big-endian target running
+on a BE build of libcov correctly parses an LE wire file. Without this,
+a BE target would read version=3 as 0x03000000 and reject the file.
+
+### 4.5 Address resolution
+
+Each record's `offset` is relative to `libcov_module_bases[module_idx]`.
+At init `config_load` walks the name table and calls
+`util_module_base(name)` for each entry; `util_module_base` parses
+`/proc/self/maps` and returns `lo - file_offset` for the first mapping
+whose path basename matches. For non-PIE binaries the result is the
+binary's linked base (e.g. 0x400000 on x86_64, 0x10000 on 32-bit ARM).
+For PIE binaries and shared libraries it is the ASLR'd load address.
+The generator emits `offset = absolute_addr - rizin.bin.baddr`, which
+composes correctly with either case.
+
+If any named module is not currently mapped, `config_load` refuses to
+finish loading and logs which name failed -- better to fail loudly at
+init than to leave half the patch table silently misindexed.
+
+### 4.6 Why a custom format
 
 Alternatives considered: text/CSV (slow parse on weak embedded CPUs;
 parser bugs); a serialized struct from libelf; YAML/JSON. The flat
@@ -259,8 +270,8 @@ has zero parser surface area to get wrong.
 src/
   libcov.c              constructor + sigaction/signal interception
   util.c, util.h        /proc/self/maps parsing + init-time logger
-  config.c, config.h    LCV1+LCV2 mmap loader + sorted patch_entry table;
-                        threading-hint enforcement
+  config.c, config.h    LCV3 mmap loader + per-module base resolution +
+                        sorted patch_entry table; threading-hint enforcement
   patch.h               arm/disarm/lookup interface (shared by ST and MT)
   patch_st.c            ST patch engine: mprotect dance + memcpy
   patch_mt.c            MT patch engine: /proc/self/mem + per-entry spinlock
@@ -278,7 +289,7 @@ src/
                         MT-only; PRIVATE_EXPEDITED_SYNC_CORE wrapper
                         with init-time detection + graceful fallback
   arch.h                backend interface (extern symbol contract)
-  arch_x86_64.c         x86 UD2 (ST+NOP padding, MT head-only via #ifdef)
+  arch_x86_64.c         x86 UD2 head-only (ST+MT share, no NOP padding)
   arch_aarch64.c        UDF #0 / 4-byte fixed (ST+MT share)
   arch_arm.c            ARM UDF + Thumb UDF.N (ST+MT share)
   arch_mips.c           MIPS32 user-mode MFC0 / SIGILL (ST+MT share)
@@ -289,13 +300,14 @@ src/
   tunables.h            project-wide knobs (trap signo, bitmap size, log buf)
   tunables_<arch>.h     per-backend knobs (illegal encoding(s) + widths);
                         one per backend, every knob -D-overridable
-  patchlist_format.h    on-disk LCV1/LCV2 wire format + runtime patch_entry
+  patchlist_format.h    on-disk LCV3 wire format + runtime patch_entry
                         (formerly config.h; renamed to avoid confusion with
                         tunables headers)
 
 tools/
-  gen_patchlist.py      rizin-based LCV2 generator; per-arch strategies;
-                        --threading st|mt selects record-length encoding
+  gen_patchlist.py      rizin-based LCV3 generator; per-arch strategies;
+                        --threading st|mt selects record-length encoding;
+                        --module name:path adds auxiliary modules
   gen_boundary.py       rizin-based LCVB1 sidecar generator; resolves
                         symbol names to their first-BB terminator
   mutate.py             generic AFL++-style mutation engine; stdlib-only;
@@ -757,7 +769,7 @@ can run user code that uses libc.
 1. libcov_log_init()      // open LIBCOV_LOG if set
 2. parse LIBCOV_MODE       // default leapfrog
 3. sink_init(env)          // mmap bitmap
-4. config_load(patchlist)  // mmap LCV1, build patch_table
+4. config_load(patchlist)  // mmap LCV3, resolve module bases, build patch_table
 5. patch_arm_all()         // mprotect+write+mprotect+flush every entry
 6. handler_install(mode)   // sigaction(LIBCOV_TRAP_SIGNO, &sa, &g_prev_sa)
 7. set g_initialized = 1
@@ -1049,10 +1061,10 @@ dedup. Demonstrates the bitmap-driven driver pattern.
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `LIBCOV_PATCHLIST` | (none — library inert if unset) | Path to LCV1 patch list |
+| `LIBCOV_PATCHLIST` | (none — library inert if unset) | Path to LCV3 patch list |
 | `LIBCOV_SHM_PATH` | `/libcov_<pid>` | Bitmap location (shm name or FS path) |
 | `LIBCOV_MODE` | `leapfrog` | `oneshot` or `leapfrog` |
-| `LIBCOV_MODULE` | basename of `/proc/self/exe` | Module name in `/proc/self/maps` |
+| `LIBCOV_MODULE` | basename of `/proc/self/exe` | Module name for boundary-mode sidecar resolution. The patch list itself carries its own module name table (LCV3) so this only affects `LIBCOV_BOUNDARY_LIST` lookups. |
 | `LIBCOV_LOG` | unset (stderr) | Init-time log path |
 
 All read once in the constructor. Changing them after init has no
@@ -1192,9 +1204,10 @@ candidate whose 2-byte write would straddle a 64-byte cache line
 ### 17.3 Threading-hint enforcement
 
 Each variant's `config.c` is compiled with `-DLIBCOV_THREADING_ST` or
-`-DLIBCOV_THREADING_MT`. LCV2 patch lists carry a matching hint.
-Mismatched hint -> refused at init with a clear log line. Legacy LCV1
-patch lists carry no hint and are accepted by both libraries.
+`-DLIBCOV_THREADING_MT`. The LCV3 header carries a matching threading
+hint (0=ANY, 1=ST, 2=MT); a mismatched hint is refused at init with a
+clear log line. Patch lists emitted with the ANY hint are accepted by
+both variants.
 
 ### 17.4 Signal-safety contract (both bricks)
 
@@ -1262,31 +1275,27 @@ Captured in TODO.md.
 
 These are inherent to the present scope, not bugs:
 
-1. **One module per patch list.** LCV2 still covers a single named
-   module (typically the main executable). Multi-module (LCV3 with a
-   module name table) is in TODO.md. The LCV2 header already has room
-   for the format extension.
-2. **No JIT / self-modifying code coverage.** Code generated after init
+1. **No JIT / self-modifying code coverage.** Code generated after init
    isn't in the patch list and isn't instrumented.
-3. **No iteration boundary for daemons.** The library writes the bitmap
+2. **No iteration boundary for daemons.** The library writes the bitmap
    continuously; per-input scoping is the driver's responsibility.
-4. **No remote transport.** Coverage is local-only (shared memory). A
+3. **No remote transport.** Coverage is local-only (shared memory). A
    relay binary is planned (see TODO.md).
-5. **No `pthread_sigmask`/`sigprocmask` interception.** A daemon that
+4. **No `pthread_sigmask`/`sigprocmask` interception.** A daemon that
    blocks our trap signal at the thread-mask level will die on a
    synchronous trap.
-6. **W^X-strict kernels that refuse any transient writable mapping over
+5. **W^X-strict kernels that refuse any transient writable mapping over
    text** will trip the ST patch path's `mprotect(R|W)`. The MT path
    sidesteps this via `/proc/self/mem` on permissive kernels and falls
    back to the same `R|W` mprotect dance on hardened kernels.
-7. **MT cross-validation is limited under qemu-user.** qemu-user only
+6. **MT cross-validation is limited under qemu-user.** qemu-user only
    invalidates its TCG translation cache on `mprotect` with a perm
    change, and that perm change strips `PROT_EXEC` long enough to
    SIGSEGV peer guest fetches. We therefore run the full MT cross
    suite only on `x86_64` and `aarch64` (where qemu happens to
    cooperate); for the other 9 backends the MT cross check is build +
    link + generator only. Real-hardware MT validation is in TODO.md.
-8. **Raw-`clone(2)` thread targets are not covered by the MT stress
+7. **Raw-`clone(2)` thread targets are not covered by the MT stress
    test.** `target_simple_mt.c` uses pthreads. A `clone()`-based
    stress harness is captured in TODO.md.
 

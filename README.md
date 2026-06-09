@@ -115,7 +115,7 @@ make ARCH=aarch64
 
 # 2. generate a patch list. --threading st by default; --threading mt for
 #    libcov_mt.so (the two patch lists are not interchangeable and the
-#    library refuses a mismatched LCV2 hint).
+#    library refuses a mismatched LCV3 hint).
 ./tools/gen_patchlist.py build/aarch64/target_simple /tmp/t.lcv \
     --include-pat '^dbg\.(main|classify|loop_sum|cmdline)$'
 
@@ -198,10 +198,10 @@ to be instrumented.
 
 | Var | Default | Meaning |
 |---|---|---|
-| `LIBCOV_PATCHLIST` | *(required)* | Path to LCV1/LCV2 patch list. If unset, the library is inert. |
+| `LIBCOV_PATCHLIST` | *(required)* | Path to LCV3 patch list. If unset, the library is inert. |
 | `LIBCOV_SHM_PATH` | `/libcov_<pid>` | Bitmap path. Leading `/` and no other slashes → `shm_open`; otherwise a filesystem path. Falls back to `$TMPDIR/<name>` if `shm_open` fails. |
 | `LIBCOV_MODE` | `leapfrog` | `oneshot` (each site fires once, fastest) or `leapfrog` (re-arm previous site each trap; gives hit counts). |
-| `LIBCOV_MODULE` | basename of `argv[0]` | Module name in `/proc/self/maps` whose base is used for offset resolution. |
+| `LIBCOV_MODULE` | basename of `argv[0]` | Module name for boundary-mode sidecar resolution only. The patch list itself carries its own module name table (LCV3) so this only affects `LIBCOV_BOUNDARY_LIST` lookups. |
 | `LIBCOV_LOG` | unset (stderr) | Init-time diagnostic log. Never written from the signal handler. |
 | `LIBCOV_BOUNDARY_LIST` | unset | Path to LCVB1 iteration-boundary sidecar. Iteration framing is inert if unset. |
 | `LIBCOV_BOUNDARY_REARM` | `none` | `none` / `all` / `touched`. What to re-arm at each boundary fire. |
@@ -363,44 +363,58 @@ last-writer-wins on `gen_current`; the seqlock check on the reader
 side handles the brief window where `gen_current` has advanced but the
 target slot hasn't yet been stamped.
 
-## Patch list format (LCV1 and LCV2)
+## Patch list format (LCV3)
 
-The library accepts two header versions. The legacy LCV1 layout is
-preserved as a read-only format; the generator emits LCV2.
+The library accepts only LCV3. The generator (`tools/gen_patchlist.py`)
+emits LCV3 and the library mmaps it at init.
 
-LCV1 header (legacy, 16 bytes):
-
-```c
-char     magic[4]  = "LCV1";
-uint32_t version   = 1;
-uint32_t count;
-uint32_t reserved;
-```
-
-LCV2 header (current, 16 bytes):
+LCV3 header (24 bytes):
 
 ```c
-char     magic[4]  = "LCV2";
-uint32_t version   = 2;
-uint32_t count;
-uint8_t  threading;  // 0=ANY, 1=ST, 2=MT
-uint8_t  flags;      // reserved for future use
-uint16_t reserved;
+char     magic[4]       = "LCV3";
+uint32_t version        = 3;
+uint32_t count;            // number of records
+uint8_t  threading;        // 0=ANY, 1=ST, 2=MT
+uint8_t  flags;            // reserved, must be 0
+uint8_t  module_count;     // 1..255
+uint8_t  reserved;
+uint32_t modules_offset;   // file offset of module name table
+uint32_t modules_size;     // bytes in the name table
 ```
 
-Records (24 bytes each, same in both versions):
+Records (14 bytes each):
 
 ```c
-uint64_t offset;   // from module load base
-uint8_t  len;      // original insn length, 1..15
-uint8_t  orig[15]; // original bytes; only [0..len) meaningful
+uint64_t offset;       // from libcov_module_bases[module_idx]
+uint8_t  len;          // bytes to patch and restore (2 or 4)
+uint8_t  module_idx;   // index into the name table
+uint8_t  orig[4];      // first `len` bytes meaningful
 ```
+
+After the records, the file contains a module name table -- a flat
+blob of `module_count` NUL-terminated basenames concatenated at
+`modules_offset` (e.g. `"target_simple\0libfoo.so\0"`). Index 0 is the
+primary module (the positional `binary` arg to gen_patchlist); indices
+1..N are the `--module NAME:PATH` modules in command-line order.
 
 All little-endian. The library byte-swaps on big-endian targets. A
 mismatched `threading` hint (e.g. an MT-generated list given to
 `libcov_st.so`) is refused at init with a clear log line.
 
-`tools/gen_patchlist.py` emits LCV2 and the library mmaps it at init.
+To instrument multiple modules in one patch list:
+
+```
+./tools/gen_patchlist.py build/x86_64/target_exe /tmp/t.lcv \
+    --module libfoo.so:/path/to/libfoo.so \
+    --module libasdf.so:/path/to/libasdf.so
+```
+
+At init `config_load` calls `util_module_base(name)` for each module
+name. The base is the first matching mapping in `/proc/self/maps` minus
+its `pgoffset`. Each entry's runtime address is then
+`libcov_module_bases[module_idx] + record.offset`. If any named module
+is not currently mapped, init refuses to finish loading and logs the
+unresolved name.
 
 ## Boundary sidecar format (LCVB1)
 
@@ -483,10 +497,6 @@ across runs are easier with ASLR off.
   TCG layer. MT correctness for the other 9 backends is established by
   build-and-link smoke + the per-arch atomic-write argument in
   `src/patch_mt.c`; real-hardware validation is a TODO.
-- **One module per patch list.** LCV2 currently still covers a single
-  target module (the main executable). Multi-module support (header
-  module table + per-record module index) is the next iteration of the
-  wire format; LCV2's header already has room.
 - **No JIT/self-modifying code support.** Newly-generated code is not in
   the patch list and won't be instrumented.
 - **W^X-strict kernels** that refuse a transient `RW` on a code page will
@@ -503,9 +513,10 @@ across runs are easier with ASLR off.
 src/
   libcov.c            constructor; env parsing; sigaction/signal interception
   util.c/.h           /proc/self/maps parsing; init-time logger
-  config.c            LCV1+LCV2 mmap loader; sorted patch_entry table (endian-safe);
+  config.c            LCV3 mmap loader; per-module base resolution from
+                      /proc/self/maps; sorted patch_entry table (endian-safe);
                       threading-hint enforcement
-  patchlist_format.h  on-disk LCV1/LCV2 wire format + runtime patch_entry struct
+  patchlist_format.h  on-disk LCV3 wire format + runtime patch_entry struct
                       (renamed from config.h; not a tunables file)
   tunables.h          project-wide knobs (trap signo default SIGILL, bitmap size,
                       log buf); every knob -D-overridable
@@ -524,8 +535,7 @@ src/
                       per-thread depth + touched-set under MT
   membarrier.h/.c     MT-only; PRIVATE_EXPEDITED_SYNC_CORE wrapper with fallback
   arch.h              backend interface (extern symbols, no #ifdefs)
-  arch_x86_64.c       x86 UD2 (ST: + NOP pad / 2..15 bytes;
-                      MT: head-only via #ifdef LIBCOV_THREADING_MT / 2 bytes)
+  arch_x86_64.c       x86 UD2 head-only / 2 bytes (ST+MT share)
   arch_aarch64.c      UDF #0 / 4-byte fixed (ST+MT)
   arch_arm.c          ARM UDF + Thumb UDF.N / 2 or 4 bytes (ST+MT)
   arch_mips.c         user-mode MFC0 / 4-byte fixed MIPS32 BE+LE (ST+MT)
@@ -537,17 +547,21 @@ test/
   target_simple.c             single-shot ground-truth target (10+ branches)
   target_simple_mt.c          pthread stress target for MT validation
   target_loop.c               stdin-driven loop target with iter_begin marker
+  target_multimod.c           multi-module target (links libmultimod_helper.so)
+  libmultimod_helper.c/.h     helper shared library for multi-module test
   fuzz_driver.c               boundary-aware driver (seqlock reader)
   run_validation.sh           native ST regression test (single-shot)
   run_validation_mt.sh        native MT regression test + stress
   run_validation_boundary.sh  native boundary-mode test + (MODE, REARM) matrix
+  run_validation_multimod.sh  native multi-module LCV3 test (exe + helper.so)
   run_cross.sh                all-arch ST validation under qemu-user-static
   run_cross_mt.sh             all-arch MT validation (full run for x86_64+aarch64;
                               build-only for the other 9 due to qemu-user TCG limits)
 tools/
-  gen_patchlist.py    rizin-based LCV2 generator; per-arch strategy
+  gen_patchlist.py    rizin-based LCV3 generator; per-arch strategy
                       (terminator vs entry, Thumb-aware, delay-slot-aware,
-                      ppc64 local-entry-aware); --threading st|mt
+                      ppc64 local-entry-aware); --threading st|mt;
+                      --module name:path adds auxiliary modules
   gen_boundary.py     rizin-based LCVB1 sidecar generator; resolves symbol
                       names to their first-BB terminator
   mutate.py           generic AFL++-style mutation engine (library + CLI):

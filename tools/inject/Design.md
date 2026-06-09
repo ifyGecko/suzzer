@@ -795,7 +795,7 @@ boundary mode here, so no explicit sync point), then snapshots the
 bitmap.
 
 Both ST and MT runs use SEPARATE patch lists (`--threading st` vs
-`--threading mt`) because libcov enforces the LCV2 threading hint at
+`--threading mt`) because libcov enforces the LCV3 threading hint at
 init. Documented + handled by the script.
 
 ### 13.2 `run_validation_inject_cross.sh`
@@ -928,7 +928,7 @@ Out of scope, documented to set expectations:
 | Return-trap sentinel | The unmapped address (default `0xdead0000`) we plant as the fake return PC for remote function calls. SIGSEGV-at-sentinel signals "function done". |
 | Scratch page | The single 4 KB RW-only mmap'd page in target memory used to stage env strings + libpath string. |
 | Stack-based return / LR-based return | x86_64 is stack-based (RET pops); aarch64/arm/ppc/riscv are LR-based (RET branches through LR/x30/r14/lr/ra). Backend vtable's `stack_return_addr` distinguishes. |
-| LCV2 threading hint | libcov's per-patchlist annotation (`--threading st|mt` in gen_patchlist) that libcov enforces at init. Wrong type -> libcov refuses + stays inert. |
+| LCV3 threading hint | libcov's per-patchlist annotation (`--threading st|mt` in gen_patchlist) that libcov enforces at init. Wrong type -> libcov refuses + stays inert. |
 | Procmem variant | The ptrace-LESS injector (phase 7). Uses SIGSTOP + /proc/<pid>/mem writes + sigreturn-frame forging instead of PTRACE_ATTACH. |
 | Trap-on-return convention | Our remote-call mechanism. See §4. |
 | Single-step-syscall convention | Our remote-syscall mechanism. See §5. |
