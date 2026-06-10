@@ -79,7 +79,7 @@
 /* Quarantine FIFO depth. Bigger -> catches longer-lived UAFs at the
  * cost of more held virtual / physical memory.                     */
 #ifndef LIBDEM_QUARANTINE_SLOTS
-  #define LIBDEM_QUARANTINE_SLOTS 1024
+  #define LIBDEM_QUARANTINE_SLOTS 128
 #endif
 
 /* Header canary stored in the 4 bytes just below the returned pointer.
