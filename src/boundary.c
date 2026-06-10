@@ -253,6 +253,21 @@ int boundary_init(void) {
     g_slot_stride = g_hdr->slot_stride;
     g_ring_base   = (uint8_t *)libcov_shm_base + g_hdr->ring_offset;
 
+    /* A5: under boundary mode the live bitmap rotates through ring slots.
+     * Switch libcov_bitmap to slot[1].bitmap now -- gen=1 is the first
+     * gen that publish_snapshot() will stamp, so writes accumulated
+     * during the rest of init (target constructors, the first parse
+     * call, etc.) end up exactly where the first publish needs them.
+     *
+     * The dedicated bitmap area (hdr->bitmap_offset) goes unused under
+     * boundary mode. Drivers under boundary mode read ring slots only,
+     * so this is invisible to them. Legacy (no-boundary) users keep
+     * the libcov_bitmap pointer at hdr->bitmap_offset from sink_init
+     * -- this branch isn't taken when LIBCOV_BOUNDARY_LIST is unset. */
+    struct libcov_ring_slot_hdr *first_slot = slot_at(1);
+    __atomic_store_n(&first_slot->slot_gen, (uint64_t)0, __ATOMIC_RELEASE);
+    libcov_bitmap = slot_bitmap(first_slot);
+
     uint32_t mt_flag = 0;
 #if defined(LIBCOV_THREADING_MT)
     mt_flag = LIBCOV_SHM_FLAG_MT;
@@ -287,26 +302,40 @@ static inline void touched_append(struct patch_entry *e) {
     }
 }
 
-/* Publish the live bitmap to ring[gen % RING] and clear the live bitmap.
- * Per-slot generation stamps let the driver detect torn reads via the
- * seqlock pattern. The caller has already incremented hdr->gen_current
- * (via fetch_add); we don't touch it here. The reader's seqlock check
- * accommodates the brief window where gen_current points at `gen` but
- * the slot's stamp is still the previous value. */
+/* Publish the live bitmap to ring[gen % RING] and rotate the live
+ * pointer to the next slot's bitmap area. Per-slot generation stamps
+ * let the driver detect torn reads via the seqlock pattern. The caller
+ * has already incremented hdr->gen_current (via fetch_add); we don't
+ * touch it here. The reader's seqlock check accommodates the brief
+ * window where gen_current points at `gen` but the slot's stamp is
+ * still the previous value.
+ *
+ * A5: pointer-swap publish.
+ * The live bitmap (libcov_bitmap) IS slot[gen % RING].bitmap -- writers
+ * have been incrementing it directly. So publishing gen=N is just:
+ *   1. stamp slot[N].header (tid, ns, slot_gen=N)
+ *   2. move libcov_bitmap to slot[(N+1) % RING].bitmap
+ *   3. zero the new live area
+ *
+ * This eliminates the per-publish 64-256 KB memcpy(slot, live, MAP_SIZE)
+ * the old layout required. Cost is one MAP_SIZE memset (the new live
+ * area) instead of memcpy + memset (two MAP_SIZE passes).
+ *
+ * Wire-format: the shm header still describes a dedicated bitmap area
+ * at hdr->bitmap_offset. When boundary mode is active, libcov_bitmap is
+ * initialised inside the ring (see boundary_init below), so the
+ * dedicated area goes unused under boundary mode. Drivers under
+ * boundary mode read ring slots only -- that contract is unchanged. */
 static void publish_snapshot(uint64_t gen) {
     struct libcov_ring_slot_hdr *s = slot_at(gen);
-
-    /* Mark slot in-progress (slot_gen=0) before touching its bitmap. */
-    __atomic_store_n(&s->slot_gen, (uint64_t)0, __ATOMIC_RELEASE);
-
-    /* Copy live bitmap into the slot's bitmap region. */
-    memcpy(slot_bitmap(s), libcov_bitmap, LIBCOV_MAP_SIZE);
 
     s->tid   = cur_tid();
     s->ns    = now_ns();
     s->flags = 0;
 
-    /* Stamp the slot with our gen as the final visibility signal. */
+    /* Stamp the slot with our gen as the final visibility signal. The
+     * slot's bitmap data IS what writers have been emitting into all
+     * iter. */
     __atomic_store_n(&s->slot_gen, gen, __ATOMIC_RELEASE);
 
     /* Best-effort notify. */
@@ -315,18 +344,33 @@ static void publish_snapshot(uint64_t gen) {
         (void)write(g_eventfd, &one, sizeof one);
     }
 
-    /* Clear live bitmap so iter N+1 starts at zero. Also clear the whole
-     * prev-PC window (N-gram coverage uses the last N-1 PCs as context;
-     * AFL-style at N=2 reduces to a single uint16_t) so cross-iteration
-     * context doesn't leak. Under MT, racing emits from peer threads may
-     * land in the wrong iteration's snapshot by a few edges; that jitter
-     * is bounded (each peer thread does one emit at most before noticing
-     * the boundary's clear) and acceptable for AFL-style fuzzing. */
+    /* Rotate the live bitmap pointer to the next slot's data area. New
+     * emits will land there. The next slot's previous slot_gen (from the
+     * generation that wrapped around RING ago) is invalidated by writing
+     * 0 before the bitmap is cleared, so a driver that's exactly RING
+     * generations behind doesn't see a half-zeroed slot stamped with a
+     * stale gen. */
+    struct libcov_ring_slot_hdr *next = slot_at(gen + 1);
+    __atomic_store_n(&next->slot_gen, (uint64_t)0, __ATOMIC_RELEASE);
+    libcov_bitmap = slot_bitmap(next);
     memset(libcov_bitmap, 0, LIBCOV_MAP_SIZE);
+
+    /* Clear the whole prev-PC window (N-gram coverage uses the last
+     * N-1 PCs as context; AFL-style at N=2 reduces to a single
+     * uint16_t) so cross-iteration context doesn't leak. Under MT,
+     * racing emits from peer threads may land in the wrong iteration's
+     * snapshot by a few edges; that jitter is bounded (each peer
+     * thread does one emit at most before noticing the boundary's
+     * clear) and acceptable for AFL-style fuzzing. */
     memset(libcov_prev_loc, 0, sizeof libcov_prev_loc);
 }
 
 static void apply_rearm_policy(struct patch_entry *exclude) {
+    /* A1: every rearm uses _unsynced; the handler issues one
+     * patch_sync_batch_end() at the tail. Under MT with membarrier(SYNC_CORE)
+     * this collapses N IPIs per boundary fire into 1. Under ST the
+     * _unsynced/_synced variants are aliases and this loop is identical
+     * to the previous behaviour. */
     switch (g_rearm) {
     case LIBCOV_REARM_NONE:
         break;
@@ -339,7 +383,7 @@ static void apply_rearm_policy(struct patch_entry *exclude) {
 #else
             if (p->patched) continue;
 #endif
-            patch_arm(p);
+            patch_arm_unsynced(p);
         }
         break;
     case LIBCOV_REARM_ALL: {
@@ -352,7 +396,7 @@ static void apply_rearm_policy(struct patch_entry *exclude) {
 #else
             if (t[i].patched) continue;
 #endif
-            patch_arm(&t[i]);
+            patch_arm_unsynced(&t[i]);
         }
         break;
     }
@@ -384,14 +428,15 @@ void boundary_on_trap(uintptr_t pc, struct patch_entry *e) {
 
     /* Flush any deferred marker re-arm from a previous boundary fire on
      * this thread -- but only if this trap is at a different pc
-     * (otherwise we'd re-trap on the same site we're trying to leave). */
+     * (otherwise we'd re-trap on the same site we're trying to leave).
+     * A1: unsynced; the handler tail's patch_sync_batch_end() covers it. */
     if (g_pending_marker_rearm && g_pending_marker_rearm != e) {
 #if defined(LIBCOV_THREADING_MT)
         if (!__atomic_load_n(&g_pending_marker_rearm->patched,
                              __ATOMIC_RELAXED))
-            patch_arm(g_pending_marker_rearm);
+            patch_arm_unsynced(g_pending_marker_rearm);
 #else
-        if (!g_pending_marker_rearm->patched) patch_arm(g_pending_marker_rearm);
+        if (!g_pending_marker_rearm->patched) patch_arm_unsynced(g_pending_marker_rearm);
 #endif
         g_pending_marker_rearm = NULL;
     }

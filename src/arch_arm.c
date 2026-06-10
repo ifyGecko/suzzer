@@ -19,14 +19,22 @@ const char    *libcov_arch_name     = LIBCOV_ARCH_ARM_NAME;
 const uint8_t  libcov_min_patch_len = LIBCOV_ARCH_ARM_MIN_PATCH_LEN;
 const uint8_t  libcov_max_patch_len = LIBCOV_ARCH_ARM_MAX_PATCH_LEN;
 
+/* Pre-baked trap patterns in .rodata. ARM mode = 4 bytes, Thumb = 2.
+ * libcov_arch_illegal_bytes() dispatches on len. */
+static const uint32_t k_illegal_arm   = LIBCOV_ARCH_ARM_ILLEGAL_ARM;
+static const uint16_t k_illegal_thumb = LIBCOV_ARCH_ARM_ILLEGAL_THUMB;
+
 void libcov_arch_write_illegal(void *dst, uint8_t len) {
     if (len == 4) {
-        const uint32_t arm_udf = LIBCOV_ARCH_ARM_ILLEGAL_ARM;
-        memcpy(dst, &arm_udf, 4);
+        memcpy(dst, &k_illegal_arm, 4);
     } else {
-        const uint16_t thumb_udf = LIBCOV_ARCH_ARM_ILLEGAL_THUMB;
-        memcpy(dst, &thumb_udf, 2);
+        memcpy(dst, &k_illegal_thumb, 2);
     }
+}
+
+const void *libcov_arch_illegal_bytes(uint8_t len) {
+    return (len == 4) ? (const void *)&k_illegal_arm
+                      : (const void *)&k_illegal_thumb;
 }
 
 uintptr_t libcov_arch_pc_from_uctx(const ucontext_t *uc) {

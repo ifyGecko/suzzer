@@ -32,6 +32,13 @@ extern const uint8_t  libcov_max_patch_len;  /* largest patchable insn (bytes) *
  *    two c.unimps (= 4-byte 0x00000000), which is also illegal. */
 void libcov_arch_write_illegal(void *dst, uint8_t len);
 
+/* Return a pointer to a static-const buffer holding the trap-raising
+ * sequence for `len` bytes. The buffer is at least `len` bytes long.
+ * Used by patch_mt.c's hot path so the trap encoding can be pwrite'd
+ * directly out of `.rodata` instead of being staged on the stack via
+ * libcov_arch_write_illegal() on every arm/disarm cycle. */
+const void *libcov_arch_illegal_bytes(uint8_t len);
+
 /* PC of the trapped instruction (faulting address). */
 uintptr_t libcov_arch_pc_from_uctx(const ucontext_t *uc);
 

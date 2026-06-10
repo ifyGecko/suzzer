@@ -65,9 +65,14 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
     /* Concurrent traps at the same site from multiple threads converge here.
      * The first one's patch_disarm wins the cmpxchg and does the byte write;
      * losers no-op. Both paths record an edge in TLS prev_loc + the shared
-     * atomic bitmap. */
+     * atomic bitmap.
+     *
+     * A1: we deliberately use the _unsynced patch variants throughout the
+     * trap body and issue ONE patch_sync_batch_end() at the tail. That
+     * coalesces the per-write membarrier IPIs (disarm + leapfrog arm +
+     * any boundary rearms) into a single broadcast. */
     sink_emit(pc, e->module_idx);
-    patch_disarm(e);
+    patch_disarm_unsynced(e);
 
     if (g_mode == LIBCOV_MODE_LEAPFROG) {
         /* Per-thread leapfrog. The arm cmpxchg in patch_arm guards against
@@ -76,7 +81,7 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
         struct patch_entry *last = g_last_restored;
         if (last && last != e &&
             !__atomic_load_n(&last->patched, __ATOMIC_RELAXED)) {
-            patch_arm(last);
+            patch_arm_unsynced(last);
         }
         g_last_restored = e;
     }
@@ -86,8 +91,13 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
      * checks whether pc is a marker on this thread, and if so publishes
      * a snapshot + clears the live bitmap + applies the configured
      * boundary re-arm policy. Per-thread depth + touched-set state means
-     * concurrent worker threads scope their own iterations cleanly. */
+     * concurrent worker threads scope their own iterations cleanly.
+     * boundary_on_trap also uses _unsynced internally for its rearm
+     * loops so the trailing IPI below covers everything. */
     boundary_on_trap(pc, e);
+
+    /* A1: single trailing IPI for every write this handler did. */
+    patch_sync_batch_end();
 }
 
 int handler_install(enum libcov_mode mode) {

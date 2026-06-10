@@ -39,4 +39,15 @@
 void membarrier_init(void);
 void membarrier_sync_core(void);
 
+/* Whether PRIVATE_EXPEDITED_SYNC_CORE was successfully registered. When
+ * true, membarrier_sync_core() actually broadcasts an IPI that serializes
+ * every CPU the process has run on -- including the writer's. When false,
+ * membarrier_sync_core() is a no-op and the caller is responsible for
+ * issuing __builtin___clear_cache() locally for the writer's CPU.
+ *
+ * patch_mt.c uses this to elide the local clear_cache() when the IPI
+ * already covers it, and to elide the trailing membarrier when the IPI
+ * isn't available. */
+int  membarrier_has_sync_core(void);
+
 #endif

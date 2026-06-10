@@ -64,6 +64,13 @@ static long    g_pagesize      = 0;
 static int     g_mem_fd        = -1;
 static int     g_initialized   = 0;
 
+/* Cached at mt_init_once. When 1, membarrier(SYNC_CORE) covers the
+ * writer's own CPU pipeline too -- so we can skip the per-write
+ * __builtin___clear_cache and rely on a single trailing IPI. When 0,
+ * each write must clear_cache locally and the trailing IPI is a no-op.
+ * See patch_sync_batch_end() and the doc on patch.h's _unsynced variants. */
+static int     g_have_sync_core = 0;
+
 /* Global spinlock that serializes the mprotect+write+mprotect dance in
  * the fallback path of write_bytes(). The per-entry e->lock is keyed on
  * a patch_entry, but mprotect's permission bits are keyed on the page.
@@ -87,6 +94,7 @@ static void mt_init_once(void) {
         libcov_logf("patch_mt: /proc/self/mem fd=%d (mprotect-free writes)", g_mem_fd);
     }
     membarrier_init();
+    g_have_sync_core = membarrier_has_sync_core();
     g_initialized = 1;
 }
 
@@ -188,15 +196,29 @@ static inline void entry_unlock(struct patch_entry *e) {
     __atomic_store_n(&e->lock, 0, __ATOMIC_RELEASE);
 }
 
-int patch_arm(struct patch_entry *e) {
+/* Write-bytes core, no sync. On kernels without membarrier(SYNC_CORE)
+ * we still need a writer-local clear_cache here so the writer's own CPU
+ * sees the new bytes the next time it fetches; the trailing
+ * patch_sync_batch_end() can then be a no-op. When SYNC_CORE is active
+ * we skip clear_cache and rely on the IPI broadcast to serialize every
+ * CPU (writer included) -- that's the A4 saving.
+ *
+ * Always inlined by gcc -O2 in practice; named for readability. */
+static inline int patch_write_inner(struct patch_entry *e, const void *bytes) {
+    if (write_bytes(e->addr, bytes, e->len) != 0) return -1;
+    if (!g_have_sync_core) {
+        __builtin___clear_cache((char *)e->addr, (char *)e->addr + e->len);
+    }
+    return 0;
+}
+
+int patch_arm_unsynced(struct patch_entry *e) {
     entry_lock(e);
     int rv = 0;
     if (!e->patched) {
-        unsigned char buf[16];
-        libcov_arch_write_illegal(buf, e->len);
-        if (write_bytes(e->addr, buf, e->len) == 0) {
-            __builtin___clear_cache((char *)e->addr, (char *)e->addr + e->len);
-            membarrier_sync_core();
+        /* A3: pwrite straight out of .rodata-backed trap pattern, no stack
+         * staging via libcov_arch_write_illegal(). */
+        if (patch_write_inner(e, libcov_arch_illegal_bytes(e->len)) == 0) {
             e->patched = 1;
         } else {
             rv = -1;
@@ -206,19 +228,39 @@ int patch_arm(struct patch_entry *e) {
     return rv;
 }
 
-int patch_disarm(struct patch_entry *e) {
+int patch_disarm_unsynced(struct patch_entry *e) {
     entry_lock(e);
     int rv = 0;
     if (e->patched) {
-        if (write_bytes(e->addr, e->orig, e->len) == 0) {
-            __builtin___clear_cache((char *)e->addr, (char *)e->addr + e->len);
-            membarrier_sync_core();
+        if (patch_write_inner(e, e->orig) == 0) {
             e->patched = 0;
         } else {
             rv = -1;
         }
     }
     entry_unlock(e);
+    return rv;
+}
+
+void patch_sync_batch_end(void) {
+    /* One IPI for the whole batch (handler trap pair, boundary rearm).
+     * No-op when membarrier isn't available -- in that case
+     * patch_write_inner already did a writer-local clear_cache per
+     * write, so peer threads on weakly-ordered ISAs still pick up the
+     * change on their next fetch (modulo the documented residual race
+     * window for the SYNC_CORE-less fallback path). */
+    if (g_have_sync_core) membarrier_sync_core();
+}
+
+int patch_arm(struct patch_entry *e) {
+    int rv = patch_arm_unsynced(e);
+    if (rv == 0) patch_sync_batch_end();
+    return rv;
+}
+
+int patch_disarm(struct patch_entry *e) {
+    int rv = patch_disarm_unsynced(e);
+    if (rv == 0) patch_sync_batch_end();
     return rv;
 }
 
@@ -258,15 +300,55 @@ size_t patch_arm_all(void) {
     return armed;
 }
 
-/* Signal-safe binary search. Returned pointer aliases the global table. */
+/* A2: per-thread direct-mapped PC cache in front of the bsearch.
+ *
+ * The handler under leapfrog re-traps a small handful of hot sites
+ * repeatedly (loops, frequently-taken edges). bsearch is O(log n) and
+ * cache-cold for cold sites; the direct-mapped cache turns hot lookups
+ * into a single compare-and-load. Cache holds entry pointers (NOT state)
+ * so re-arm/disarm transitions don't invalidate it -- entries are
+ * permanent in the patch table for the process's lifetime.
+ *
+ * NULL slots mean "uninitialized" -- never trust a NULL `pc` slot. Misses
+ * fall back to bsearch and update the slot.
+ *
+ * 16 entries chosen as a good Pareto point: each slot is 16B (pc + ptr)
+ * for 256B total, well inside L1d. Per-thread TLS so concurrent worker
+ * threads don't fight each other's working sets. */
+#define LIBCOV_PC_CACHE_SIZE 16
+#define LIBCOV_PC_CACHE_MASK (LIBCOV_PC_CACHE_SIZE - 1)
+
+struct pc_cache_slot {
+    uintptr_t           pc;
+    struct patch_entry *e;
+};
+static __thread struct pc_cache_slot g_pc_cache[LIBCOV_PC_CACHE_SIZE];
+
+static inline unsigned pc_cache_idx(uintptr_t pc) {
+    /* Fibonacci hash. Top LIBCOV_PC_CACHE_SIZE_LOG2 bits of the multiply
+     * give a low-collision distribution across the address space. */
+    return (unsigned)((pc * 0x9E3779B97F4A7C15ULL) >> 60) & LIBCOV_PC_CACHE_MASK;
+}
+
+/* Signal-safe binary search with a per-thread PC cache in front. The
+ * returned pointer aliases the global table. */
 struct patch_entry *patch_lookup(uintptr_t addr) {
+    unsigned idx = pc_cache_idx(addr);
+    if (g_pc_cache[idx].pc == addr) {
+        struct patch_entry *e = g_pc_cache[idx].e;
+        if (e) return e;
+    }
     size_t n;
     struct patch_entry *t = config_table_mut(&n);
     if (!t || n == 0) return NULL;
     size_t lo = 0, hi = n;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        if (t[mid].addr == addr) return &t[mid];
+        if (t[mid].addr == addr) {
+            g_pc_cache[idx].pc = addr;
+            g_pc_cache[idx].e  = &t[mid];
+            return &t[mid];
+        }
         if (t[mid].addr <  addr) lo = mid + 1;
         else                     hi = mid;
     }

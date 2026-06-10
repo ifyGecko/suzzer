@@ -80,20 +80,62 @@ size_t patch_arm_all(void) {
     return armed;
 }
 
-/* Signal-safe binary search. Returned pointer aliases the global table. */
+/* A2: direct-mapped PC cache in front of the bsearch.
+ *
+ * ST sees the same hot-trap locality as MT (leapfrog re-traps a small
+ * set of hot sites repeatedly) and benefits from the same one-compare-
+ * one-load shortcut. ST is single-threaded so the cache is a single
+ * process-global table (no TLS overhead).
+ *
+ * See patch_mt.c for the full rationale; the code is duplicated here
+ * intentionally to keep the ST hot path on plain globals (no TLS
+ * descriptor lookup) -- the whole point of the ST brick is minimal
+ * surface in the trap handler. */
+#define LIBCOV_PC_CACHE_SIZE 16
+#define LIBCOV_PC_CACHE_MASK (LIBCOV_PC_CACHE_SIZE - 1)
+
+struct pc_cache_slot {
+    uintptr_t           pc;
+    struct patch_entry *e;
+};
+static struct pc_cache_slot g_pc_cache[LIBCOV_PC_CACHE_SIZE];
+
+static inline unsigned pc_cache_idx(uintptr_t pc) {
+    return (unsigned)((pc * 0x9E3779B97F4A7C15ULL) >> 60) & LIBCOV_PC_CACHE_MASK;
+}
+
+/* Signal-safe binary search with a PC cache in front. */
 struct patch_entry *patch_lookup(uintptr_t addr) {
+    unsigned idx = pc_cache_idx(addr);
+    if (g_pc_cache[idx].pc == addr) {
+        struct patch_entry *e = g_pc_cache[idx].e;
+        if (e) return e;
+    }
     size_t n;
     struct patch_entry *t = config_table_mut(&n);
     if (!t || n == 0) return NULL;
     size_t lo = 0, hi = n;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        if (t[mid].addr == addr) return &t[mid];
+        if (t[mid].addr == addr) {
+            g_pc_cache[idx].pc = addr;
+            g_pc_cache[idx].e  = &t[mid];
+            return &t[mid];
+        }
         if (t[mid].addr <  addr) lo = mid + 1;
         else                     hi = mid;
     }
     return NULL;
 }
+
+/* ST aliases of the batched-rearm primitives. There's no membarrier IPI
+ * to coalesce in ST (single thread, single core view), so the unsynced
+ * variants do exactly what the synced ones do and patch_sync_batch_end
+ * is a no-op. Symmetry with patch_mt.c lets handler_st/boundary share
+ * one call shape regardless of threading mode. */
+int patch_arm_unsynced(struct patch_entry *e)    { return patch_arm(e); }
+int patch_disarm_unsynced(struct patch_entry *e) { return patch_disarm(e); }
+void patch_sync_batch_end(void) { }
 
 size_t patch_rearm_set(struct patch_entry **set, size_t n) {
     size_t armed = 0;

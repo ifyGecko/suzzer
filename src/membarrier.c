@@ -59,8 +59,13 @@ void membarrier_sync_core(void) {
     if (g_have_sync_core) {
         (void)sys_membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE, 0);
     }
-    /* Else no-op: the caller has already issued clear_cache on this thread.
-     * On x86 (strong ordering + snoopy cache) nothing more is needed.
-     * On weak ISAs without membarrier, a peer thread may briefly observe
-     * stale bytes -- documented in membarrier.h. */
+    /* Else no-op: the caller is responsible for issuing clear_cache on the
+     * writer's thread (see membarrier_has_sync_core()). On x86 (strong
+     * ordering + snoopy cache) nothing more is needed. On weak ISAs
+     * without membarrier, a peer thread may briefly observe stale bytes
+     * -- documented in membarrier.h. */
+}
+
+int membarrier_has_sync_core(void) {
+    return g_have_sync_core;
 }
