@@ -131,6 +131,28 @@
   /* leave undefined -> use sysconf */
 #endif
 
+/* When 1, free() drops the physical pages backing the quarantined
+ * region via madvise(MADV_DONTNEED) before mprotect(PROT_NONE)'ing it.
+ * The PROT_NONE still makes any UAF/double-free SIGSEGV (the access
+ * can't happen, so DONTNEED's "next read returns zero" semantic never
+ * fires) -- we just stop holding the RSS while the entry sits in
+ * quarantine waiting to be munmap'd.
+ *
+ * This matters a lot for fuzzers targeting parsers that allocate
+ * large containers (string tables, section data, debug info, etc.):
+ * a few KB-MB allocations × 1024 quarantine slots would otherwise
+ * pin hundreds of MB of resident memory per harness lifetime, even
+ * though every byte is unreachable.
+ *
+ * Disable (set to 0) on kernels where MADV_DONTNEED on anonymous
+ * pages has surprising semantics, or where the syscall is unavailable
+ * (very old / heavily stripped embedded kernels). The behavioural
+ * outcome of disabling: bug detection is unchanged; per-process RSS
+ * grows back to roughly (slots × avg_alloc_size).             */
+#ifndef LIBDEM_RELEASE_RSS_ON_FREE
+  #define LIBDEM_RELEASE_RSS_ON_FREE 1
+#endif
+
 /* When 1, draw a runtime-random canary at constructor time via the
  * getrandom(2) syscall. Defeats targets that read the canary value.
  * Off by default; not every embedded kernel exposes the syscall.   */
@@ -436,6 +458,17 @@ void free(void *ptr) {
   void  *base;
   size_t span;
   dem_region(ptr, len, &base, &span);
+
+#if LIBDEM_RELEASE_RSS_ON_FREE
+  /* Release the physical pages backing this allocation while it sits
+   * in quarantine. Combined with the PROT_NONE below this makes the
+   * pages unreachable AND unbacked -- UAF/double-free still segfaults
+   * (the access can't happen) but the kernel reclaims the RSS now
+   * instead of when the slot is munmap'd 1023 frees later. Ignore the
+   * return: a kernel that refuses MADV_DONTNEED here (e.g. on a hugepage
+   * VMA) just leaves the pages resident, which is the pre-D1 behaviour. */
+  (void)madvise(base, span, MADV_DONTNEED);
+#endif
 
   /* Disarm the region. Any subsequent read/write -- including the
    * canary check on a double-free -- will segfault.                */
