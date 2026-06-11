@@ -304,6 +304,43 @@ static void q_push(void *base, size_t span) {
   if (evict_base) (void)munmap(evict_base, evict_span);
 }
 
+/* Drain the quarantine: munmap every region currently held and reset
+ * the ring to empty. Intended for persistent-mode fuzz harnesses that
+ * iterate the target inside a single long-lived process: between
+ * iterations the harness calls this so the prior iteration's freed
+ * allocations stop carrying their VA / RSS / slot occupancy forward.
+ *
+ * Trade-off worth understanding before calling: UAF / double-free
+ * detection only fires while the offending region is still
+ * quarantined. Flushing therefore drops the detection window for
+ * everything freed before the flush -- which is precisely the point
+ * for persistent loop fuzzing, where the harness is asserting that
+ * no live pointers from iteration N may leak into iteration N+1.
+ *
+ * Drains one slot at a time so munmap() runs outside the spinlock,
+ * matching q_push()'s eviction path.                                */
+void libdem_flush_quarantine(void) {
+  for (;;) {
+    void  *base;
+    size_t span;
+    size_t tail;
+
+    q_lock_acquire();
+    if (q_count == 0) {
+      q_lock_release();
+      return;
+    }
+    tail = (q_head + LIBDEM_QUARANTINE_SLOTS - q_count) %
+           LIBDEM_QUARANTINE_SLOTS;
+    base = q_ring[tail].base;
+    span = q_ring[tail].span;
+    q_count--;
+    q_lock_release();
+
+    (void)munmap(base, span);
+  }
+}
+
 /* ---------------------------------------------------------------- */
 /* Constructor: page-size lookup + optional canary randomization.   */
 /* ---------------------------------------------------------------- */
