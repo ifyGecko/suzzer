@@ -193,6 +193,11 @@ int config_load(const char *path) {
         memcpy(g_table[i].orig, r + 10, LIBCOV_PATCH_ORIG_MAX);
         g_table[i].patched    = 0;
         g_table[i].lock       = 0;
+        /* Dense bitmap index for the site-id coverage model. Assigned as
+         * the file record index here, BEFORE the qsort below, so it stays
+         * anchored to the on-disk order (ASLR-invariant, decodable). The
+         * sort carries the field along with the rest of the struct. */
+        g_table[i].site_id    = (uint32_t)i;
         per_module_armed[midx]++;
     }
     munmap(map, st.st_size);

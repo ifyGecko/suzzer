@@ -65,6 +65,63 @@
 #endif
 
 /* ------------------------------------------------------------------ */
+/* Coverage model: site_id-indexed (default) vs hashed-PC (legacy)    */
+/* ------------------------------------------------------------------ */
+
+/* LIBCOV_COVERAGE_MODEL_SITE
+ *   Selects how sink_emit() derives the bitmap bucket index.
+ *
+ *     1 (default) -- site-id model. Each patch site has a dense id in
+ *                    [0, N) assigned at config_load time (the file record
+ *                    index). The bucket index *base* is that id, so at
+ *                    N-gram length 1 (block coverage) idx == site_id and
+ *                    the map has ZERO collisions. For N>=2 the last N-1
+ *                    site ids are folded in (spread across the map first)
+ *                    for path sensitivity, so collisions are possible only
+ *                    in the fold step. The bitmap auto-sizes from the patch
+ *                    count (see LIBCOV_MAP_FUDGE) -- LIBCOV_MAP_SIZE_POW2 is
+ *                    NOT used in this mode.
+ *
+ *     0            -- legacy hashed-PC model. idx base = hash(pc) masked to
+ *                     a fixed (1 << LIBCOV_MAP_SIZE_POW2) map, last N-1 PCs
+ *                     XOR-folded. Bit-for-bit identical to historical libcov.
+ *
+ *   Override at build: -DLIBCOV_COVERAGE_MODEL_SITE=0
+ */
+#ifndef LIBCOV_COVERAGE_MODEL_SITE
+#define LIBCOV_COVERAGE_MODEL_SITE 1
+#endif
+
+/* LIBCOV_MAP_FUDGE
+ *   Headroom multiplier for the auto-sized site-id map:
+ *     map_size = next_pow2(n_sites * LIBCOV_MAP_FUDGE), clamped.
+ *   The extra slots above n_sites give the N-gram fold room to spread so
+ *   distinct (cur, history) tuples collide less. Only consulted when
+ *   LIBCOV_COVERAGE_MODEL_SITE=1. Default 16 (grounded for N=3 in IDEAS.md).
+ *   For pure block coverage (N=1) the fudge only wastes (harmless) memory --
+ *   a smaller value such as 2 is sufficient there.
+ *
+ *   Override at build: -DLIBCOV_MAP_FUDGE=8
+ */
+#ifndef LIBCOV_MAP_FUDGE
+#define LIBCOV_MAP_FUDGE 16u
+#endif
+
+/* LIBCOV_MAP_MIN_POW2 / LIBCOV_MAP_MAX_POW2
+ *   Soft clamps on the auto-sized site-id map (log2 byte length). The map
+ *   never shrinks below 1<<MIN nor grows past 1<<MAX *for the fudge term* --
+ *   but a hard floor of next_pow2(n_sites) is always honoured even above
+ *   1<<MAX, so site_id always fits the mask and the N=1 zero-collision
+ *   guarantee holds regardless of clamps.
+ */
+#ifndef LIBCOV_MAP_MIN_POW2
+#define LIBCOV_MAP_MIN_POW2 12
+#endif
+#ifndef LIBCOV_MAP_MAX_POW2
+#define LIBCOV_MAP_MAX_POW2 24
+#endif
+
+/* ------------------------------------------------------------------ */
 /* Coverage collection scheme (N-gram window)                         */
 /* ------------------------------------------------------------------ */
 

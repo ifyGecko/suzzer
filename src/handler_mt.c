@@ -71,7 +71,7 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
      * trap body and issue ONE patch_sync_batch_end() at the tail. That
      * coalesces the per-write membarrier IPIs (disarm + leapfrog arm +
      * any boundary rearms) into a single broadcast. */
-    sink_emit(pc, e->module_idx);
+    sink_emit(pc, e->module_idx, e->site_id);
     patch_disarm_unsynced(e);
 
     if (g_mode == LIBCOV_MODE_LEAPFROG) {

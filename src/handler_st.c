@@ -53,9 +53,9 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
     }
 
     /* Record coverage edge BEFORE restoring, so prev/cur ordering is stable.
-     * module_idx tells the sink which module base to subtract for the
-     * ASLR-invariant hash. */
-    sink_emit(pc, e->module_idx);
+     * module_idx selects the module base for the hashed-PC model; site_id is
+     * the dense bucket base for the site-id model. The active model picks. */
+    sink_emit(pc, e->module_idx, e->site_id);
 
     /* Restore the original instruction so execution can resume. */
     patch_disarm(e);

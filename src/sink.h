@@ -45,8 +45,18 @@
 #include "tunables.h"   /* LIBCOV_MAP_SIZE_POW2, LIBCOV_NGRAM_N, LIBCOV_NGRAM_ROTATE */
 #include "patchlist_format.h"  /* LIBCOV_MAX_MODULES */
 
+/* Legacy default map dimensions. Under the hashed-PC model the map is this
+ * size; under the site-id model the map auto-sizes from the patch count and
+ * these macros are unused. The authoritative runtime size/mask live in the
+ * globals below -- the hot path masks with libcov_map_mask, not the macro. */
 #define LIBCOV_MAP_SIZE      (1u << LIBCOV_MAP_SIZE_POW2)
 #define LIBCOV_MAP_MASK      (LIBCOV_MAP_SIZE - 1u)
+
+/* Runtime bitmap dimensions, set by sink_init(). Always a power of two.
+ * Read in the trap-handler hot path (one global load, negligible vs the
+ * SIGILL round-trip). */
+extern uint32_t libcov_map_size;
+extern uint32_t libcov_map_mask;
 
 /* Compile-time clamp on N. Bumping this cap requires accepting a few
  * more TLS bytes per thread and (slightly) more collision pressure;
@@ -63,8 +73,11 @@ _Static_assert(LIBCOV_NGRAM_N >= 1 && LIBCOV_NGRAM_N <= 8,
 #endif
 
 /* Allocate header + live bitmap + ring; map them as one contiguous shm
- * region. ring_size is clamped to [2, 16]. */
-int sink_init(const char *path, unsigned ring_size);
+ * region. ring_size is clamped to [2, 16]. map_size is the live bitmap
+ * byte length (must be a power of two); it is recorded in libcov_map_size /
+ * libcov_map_mask and in the shm header. Computed by the caller from the
+ * patch count (site-id model) or the legacy constant (hashed-PC model). */
+int sink_init(const char *path, unsigned ring_size, size_t map_size);
 
 /* The mmap base (== &header). Used by boundary.c to compute ring/bitmap
  * pointers from the header's *_offset fields. */
@@ -100,42 +113,69 @@ extern uint8_t *libcov_bitmap;
 extern uintptr_t libcov_module_bases[LIBCOV_MAX_MODULES];
 
 #if defined(LIBCOV_THREADING_MT)
-extern __thread uint16_t libcov_prev_loc[LIBCOV_NGRAM_WIN];
+extern __thread uint32_t libcov_prev_loc[LIBCOV_NGRAM_WIN];
 #else
-extern uint16_t libcov_prev_loc[LIBCOV_NGRAM_WIN];
+extern uint32_t libcov_prev_loc[LIBCOV_NGRAM_WIN];
 #endif
 
-static inline uint16_t sink_hash_pc(uintptr_t pc, uint8_t module_idx) {
+static inline uint32_t sink_hash_pc(uintptr_t pc, uint8_t module_idx) {
     /* Hash module-offset (pc - base[module_idx]), not absolute pc, so
      * PIE/ASLR doesn't randomise the bitmap layout per execve. See the
      * comment on libcov_module_bases above. The bitmap is shared across
      * modules; cross-module hash collisions are possible but accepted
-     * (same trade-off as same-module collisions on a 16-bit index). */
+     * (same trade-off as same-module collisions on the index). */
     uint64_t v = (uint64_t)(pc - libcov_module_bases[module_idx]);
     v ^= v >> 33;
     v *= 0xff51afd7ed558ccdULL;
     v ^= v >> 33;
-    return (uint16_t)(v & LIBCOV_MAP_MASK);
+    return (uint32_t)(v & libcov_map_mask);
+}
+
+/* Spread a dense site_id across the whole map before it enters the N-gram
+ * window, so folded history scatters over all buckets even though the raw
+ * ids are small consecutive integers. The current site still contributes
+ * its *raw* id to the index base (collision-free at N=1); only spread
+ * history is XOR-folded, so collisions arise solely in the fold step. */
+static inline uint32_t sink_spread(uint32_t id) {
+    uint64_t v = (uint64_t)id;
+    v ^= v >> 33;
+    v *= 0xff51afd7ed558ccdULL;
+    v ^= v >> 33;
+    return (uint32_t)(v & libcov_map_mask);
 }
 
 #if LIBCOV_NGRAM_ROTATE
 /* Position-dependent rotate so {A,B,C} and {C,B,A} index differently.
- * The rotation amounts are chosen non-zero and coprime-ish vs. 16 so
+ * The rotation amounts are chosen non-zero and coprime-ish vs. 32 so
  * adjacent slots don't share rotation amounts. */
-static inline uint16_t sink_ngram_rot(uint16_t v, unsigned j) {
-    unsigned r = ((j + 1u) * 3u) & 15u;   /* 3, 6, 9, 12, 15, 2, 5 */
+static inline uint32_t sink_ngram_rot(uint32_t v, unsigned j) {
+    unsigned r = ((j + 1u) * 5u) & 31u;   /* 5, 10, 15, 20, 25, 30, 3 */
     if (!r) return v;
-    return (uint16_t)((v << r) | (v >> (16u - r)));
+    return (uint32_t)((v << r) | (v >> (32u - r)));
 }
 #endif
 
-static inline void sink_emit(uintptr_t pc, uint8_t module_idx) {
-    uint16_t cur = sink_hash_pc(pc, module_idx);
+/* Coverage emit. The handler always passes pc, module_idx, and site_id;
+ * the active coverage model selects which it uses for the bucket base. */
+static inline void sink_emit(uintptr_t pc, uint8_t module_idx, uint32_t site_id) {
+#if LIBCOV_COVERAGE_MODEL_SITE
+    uint32_t cur     = site_id;              /* raw id -> exact index base */
+    uint32_t cur_win = sink_spread(site_id); /* spread copy for the window  */
+    (void)pc; (void)module_idx;
+#else
+    uint32_t cur     = sink_hash_pc(pc, module_idx);
+    uint32_t cur_win = cur;
+#endif
+#if LIBCOV_NGRAM_N < 2
+    (void)cur_win;   /* window unused at N=1 */
+#endif
 
-    /* Fold the last N-1 PCs into the bucket index. N=1 collapses to
-     * idx = hash(pc) (the for-loop body is preprocessed away). N=2
-     * collapses to idx = cur ^ prev[0] -- AFL's exact math. */
-    uint16_t idx = cur;
+    /* Fold the last N-1 entries into the bucket index. N=1 collapses to
+     * idx = cur (the for-loop body is preprocessed away): under the site-id
+     * model that is exactly site_id, so the map has zero collisions. N=2
+     * collapses to idx = cur ^ prev[0] -- AFL's exact math under the
+     * hashed-PC model. */
+    uint32_t idx = cur;
 #if LIBCOV_NGRAM_N >= 2
     for (int j = 0; j < LIBCOV_NGRAM_WIN; j++) {
 #  if LIBCOV_NGRAM_ROTATE
@@ -145,7 +185,7 @@ static inline void sink_emit(uintptr_t pc, uint8_t module_idx) {
 #  endif
     }
 #endif
-    idx &= LIBCOV_MAP_MASK;
+    idx &= libcov_map_mask;
 
 #if defined(LIBCOV_THREADING_MT)
     /* Saturating atomic increment: load + CAS loop, never decrement past 255. */
@@ -161,14 +201,21 @@ static inline void sink_emit(uintptr_t pc, uint8_t module_idx) {
     if (libcov_bitmap[idx] != 255) libcov_bitmap[idx]++;
 #endif
 
-    /* Shift the window: oldest slot (prev[WIN-1]) drops off; freshest
-     * slot (prev[0]) holds (cur >> 1). The shift is what makes AFL's
-     * A->B and B->A index to different buckets at N=2; the same shift
-     * keeps short reorderings distinguishable at higher N. */
+    /* Shift the window: oldest slot (prev[WIN-1]) drops off; freshest slot
+     * (prev[0]) takes the current entry. Under the hashed-PC model the
+     * stored value is (cur >> 1) -- AFL's shift that makes A->B and B->A
+     * index to different buckets at N=2 -- preserving bit-for-bit identity.
+     * Under the site-id model the stored value is the spread copy: the raw
+     * current id and the spread history are already asymmetric, so the
+     * shift is unnecessary and would only throw away a bit of the spread. */
 #if LIBCOV_NGRAM_N >= 2
     for (int j = LIBCOV_NGRAM_WIN - 1; j > 0; j--)
         libcov_prev_loc[j] = libcov_prev_loc[j - 1];
-    libcov_prev_loc[0] = (uint16_t)(cur >> 1);
+#  if LIBCOV_COVERAGE_MODEL_SITE
+    libcov_prev_loc[0] = cur_win;
+#  else
+    libcov_prev_loc[0] = (cur_win >> 1);
+#  endif
 #endif
 }
 

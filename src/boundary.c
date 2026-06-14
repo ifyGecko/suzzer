@@ -353,7 +353,7 @@ static void publish_snapshot(uint64_t gen) {
     struct libcov_ring_slot_hdr *next = slot_at(gen + 1);
     __atomic_store_n(&next->slot_gen, (uint64_t)0, __ATOMIC_RELEASE);
     libcov_bitmap = slot_bitmap(next);
-    memset(libcov_bitmap, 0, LIBCOV_MAP_SIZE);
+    memset(libcov_bitmap, 0, libcov_map_size);
 
     /* Clear the whole prev-PC window (N-gram coverage uses the last
      * N-1 PCs as context; AFL-style at N=2 reduces to a single

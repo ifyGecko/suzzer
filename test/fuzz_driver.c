@@ -48,15 +48,15 @@ static int open_shm(const char *path, void **base_out, size_t *size_out) {
     return 0;
 }
 
-static unsigned count_set(const uint8_t *map) {
+static unsigned count_set(const uint8_t *map, size_t map_size) {
     unsigned c = 0;
-    for (unsigned i = 0; i < LIBCOV_MAP_SIZE; i++) if (map[i]) c++;
+    for (size_t i = 0; i < map_size; i++) if (map[i]) c++;
     return c;
 }
 
-static unsigned count_new(const uint8_t *cur, uint8_t *cumulative) {
+static unsigned count_new(const uint8_t *cur, uint8_t *cumulative, size_t map_size) {
     unsigned newly = 0;
-    for (unsigned i = 0; i < LIBCOV_MAP_SIZE; i++) {
+    for (size_t i = 0; i < map_size; i++) {
         if (cur[i] && !cumulative[i]) { newly++; cumulative[i] = cur[i]; }
     }
     return newly;
@@ -80,7 +80,7 @@ static int read_slot(void *shm_base, uint64_t target_gen, uint8_t *out,
     uint64_t pre = __atomic_load_n(&s->slot_gen, __ATOMIC_ACQUIRE);
     if (pre != target_gen) return 1;  /* writer hasn't stamped this slot yet */
 
-    memcpy(out, (uint8_t *)(s + 1), LIBCOV_MAP_SIZE);
+    memcpy(out, (uint8_t *)(s + 1), hdr->map_size);
     uint64_t tid = s->tid;
     uint64_t ns  = s->ns;
 
@@ -111,7 +111,7 @@ static uint64_t wait_gen_advance(void *shm_base, uint64_t prev_gen,
 }
 
 static void drain_to(void *shm_base, uint64_t *prev_gen, uint64_t target_gen,
-                     uint8_t *scratch, uint8_t *cumulative,
+                     uint8_t *scratch, uint8_t *cumulative, size_t map_size,
                      const char *label) {
     while (*prev_gen < target_gen) {
         uint64_t g = *prev_gen + 1;
@@ -141,9 +141,9 @@ static void drain_to(void *shm_base, uint64_t *prev_gen, uint64_t target_gen,
             return;
         }
 
-        unsigned hit = count_set(scratch);
-        unsigned newly = count_new(scratch, cumulative);
-        unsigned total = count_set(cumulative);
+        unsigned hit = count_set(scratch, map_size);
+        unsigned newly = count_new(scratch, cumulative, map_size);
+        unsigned total = count_set(cumulative, map_size);
         printf("gen=%-3lu (%s) tid=%lu ns=%lu hit=%u new=%u total=%u\n",
                (unsigned long)g, label, (unsigned long)tid, (unsigned long)ns,
                hit, newly, total);
@@ -251,9 +251,24 @@ int main(int argc, char **argv) {
         waited_ms += 10;
     }
 
-    uint8_t scratch[LIBCOV_MAP_SIZE];
-    uint8_t cumulative[LIBCOV_MAP_SIZE];
-    memset(cumulative, 0, sizeof cumulative);
+    /* Bitmap size is runtime (site-id model auto-sizes from the patch
+     * count). Read it from the shm header and allocate accordingly rather
+     * than assuming the compile-time LIBCOV_MAP_SIZE. */
+    size_t map_size = __atomic_load_n((uint32_t *)&hdr->map_size, __ATOMIC_ACQUIRE);
+    if (map_size == 0) {
+        fprintf(stderr, "driver: shm header reports map_size=0\n");
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+        return 1;
+    }
+    uint8_t *scratch    = malloc(map_size);
+    uint8_t *cumulative = calloc(1, map_size);
+    if (!scratch || !cumulative) {
+        fprintf(stderr, "driver: OOM allocating %zu-byte bitmaps\n", map_size);
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+        return 1;
+    }
 
     uint64_t consumed_gen = 0;
     char line[1024];
@@ -275,7 +290,7 @@ int main(int argc, char **argv) {
         uint64_t new_gen = wait_gen_advance(shm_base, prev_gen, 2000);
         char label[64];
         snprintf(label, sizeof label, "input#%u='%s'", input_idx++, line);
-        drain_to(shm_base, &consumed_gen, new_gen, scratch, cumulative, label);
+        drain_to(shm_base, &consumed_gen, new_gen, scratch, cumulative, map_size, label);
     }
 
     /* Close pipe to signal EOF; the target's post-loop iter_begin then
@@ -283,18 +298,20 @@ int main(int argc, char **argv) {
     close(pipefd[1]);
 
     uint64_t final_gen = wait_gen_advance(shm_base, consumed_gen, 2000);
-    drain_to(shm_base, &consumed_gen, final_gen, scratch, cumulative, "EOF-flush");
+    drain_to(shm_base, &consumed_gen, final_gen, scratch, cumulative, map_size, "EOF-flush");
 
     int st = 0;
     waitpid(pid, &st, 0);
 
     printf("driver: target exited %d  total_edges=%u  consumed_gen=%lu  gen_init=%lu\n",
            WIFEXITED(st) ? WEXITSTATUS(st) : -WTERMSIG(st),
-           count_set(cumulative),
+           count_set(cumulative, map_size),
            (unsigned long)consumed_gen,
            (unsigned long)__atomic_load_n((uint64_t *)&hdr->gen_init,
                                           __ATOMIC_ACQUIRE));
 
+    free(scratch);
+    free(cumulative);
     munmap(shm_base, shm_size);
     unlink(shm_path);
     return 0;

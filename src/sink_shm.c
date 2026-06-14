@@ -16,6 +16,12 @@ void   *libcov_shm_base = NULL;
 size_t  libcov_shm_size = 0;
 uint8_t *libcov_bitmap  = NULL;
 
+/* Runtime bitmap dimensions, set in sink_init. Power-of-two byte length and
+ * its mask; read in the trap-handler hot path. Initialised to the legacy
+ * default so any pre-init read is well-defined. */
+uint32_t libcov_map_size = LIBCOV_MAP_SIZE;
+uint32_t libcov_map_mask = LIBCOV_MAP_MASK;
+
 /* Per-module load bases. Populated in config.c::config_load() from
  * util_module_base() for each module name in the LCV3 header's name
  * table. Indexed by patch_entry.module_idx in sink_hash_pc. Entries
@@ -28,9 +34,9 @@ uintptr_t libcov_module_bases[LIBCOV_MAX_MODULES] = {0};
  * slot so the array never has zero length. The declaration in sink.h
  * picks the same qualifier; keep them in sync. */
 #if defined(LIBCOV_THREADING_MT)
-__thread uint16_t libcov_prev_loc[LIBCOV_NGRAM_WIN] = {0};
+__thread uint32_t libcov_prev_loc[LIBCOV_NGRAM_WIN] = {0};
 #else
-uint16_t libcov_prev_loc[LIBCOV_NGRAM_WIN] = {0};
+uint32_t libcov_prev_loc[LIBCOV_NGRAM_WIN] = {0};
 #endif
 
 static int try_shm_open(const char *name, int *fd_out) {
@@ -54,12 +60,13 @@ static int try_file_open(const char *path, int *fd_out) {
 }
 
 /* Total shm size = header + live bitmap + ring*slot_stride. */
-static size_t compute_shm_size(unsigned ring_size, size_t *bitmap_off_out,
+static size_t compute_shm_size(unsigned ring_size, size_t map_size,
+                               size_t *bitmap_off_out,
                                size_t *ring_off_out, size_t *slot_stride_out) {
     size_t hdr      = sizeof(struct libcov_shm_header);
     size_t bmap_off = hdr;
-    size_t ring_off = bmap_off + LIBCOV_MAP_SIZE;
-    size_t stride   = sizeof(struct libcov_ring_slot_hdr) + LIBCOV_MAP_SIZE;
+    size_t ring_off = bmap_off + map_size;
+    size_t stride   = sizeof(struct libcov_ring_slot_hdr) + map_size;
     size_t total    = ring_off + (size_t)ring_size * stride;
     if (bitmap_off_out)  *bitmap_off_out = bmap_off;
     if (ring_off_out)    *ring_off_out   = ring_off;
@@ -67,7 +74,7 @@ static size_t compute_shm_size(unsigned ring_size, size_t *bitmap_off_out,
     return total;
 }
 
-int sink_init(const char *path, unsigned ring_size) {
+int sink_init(const char *path, unsigned ring_size, size_t map_size) {
     char default_path[128];
     if (!path || !*path) {
         snprintf(default_path, sizeof default_path, "/libcov_%d", (int)getpid());
@@ -77,8 +84,20 @@ int sink_init(const char *path, unsigned ring_size) {
     if (ring_size < 2)  ring_size = 2;
     if (ring_size > 16) ring_size = 16;
 
+    /* map_size must be a non-zero power of two (the hot path masks with
+     * map_size-1). Fall back to the legacy default if a caller passes
+     * something malformed rather than corrupting every bucket index. */
+    if (map_size == 0 || (map_size & (map_size - 1)) != 0) {
+        libcov_logf("sink: map_size=%zu not a power of two; using legacy %u",
+                    map_size, (unsigned)LIBCOV_MAP_SIZE);
+        map_size = LIBCOV_MAP_SIZE;
+    }
+    libcov_map_size = (uint32_t)map_size;
+    libcov_map_mask = (uint32_t)map_size - 1u;
+
     size_t bitmap_off, ring_off, slot_stride;
-    size_t total = compute_shm_size(ring_size, &bitmap_off, &ring_off, &slot_stride);
+    size_t total = compute_shm_size(ring_size, map_size,
+                                    &bitmap_off, &ring_off, &slot_stride);
 
     int fd = -1;
     /* Heuristic: if path looks like a filesystem path (contains a non-leading
@@ -131,7 +150,7 @@ int sink_init(const char *path, unsigned ring_size) {
     memcpy(hdr->magic, LIBCOV_SHM_MAGIC, 4);
     hdr->version       = (uint16_t)LIBCOV_SHM_VERSION;
     hdr->ring_size     = (uint16_t)ring_size;
-    hdr->map_size      = LIBCOV_MAP_SIZE;
+    hdr->map_size      = (uint32_t)map_size;
     hdr->slot_stride   = (uint32_t)slot_stride;
     hdr->flags         = 0;        /* SHM_FLAG_ACTIVE set later by boundary_init */
     hdr->gen_current   = 0;

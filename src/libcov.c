@@ -26,6 +26,34 @@ static unsigned parse_ring_size(void) {
     return (unsigned)v;
 }
 
+static size_t next_pow2(size_t v) {
+    size_t p = 1;
+    while (p < v) p <<= 1;
+    return p;
+}
+
+/* Pick the live-bitmap byte length. Site-id model: next_pow2(n*FUDGE),
+ * clamped to [1<<MIN, 1<<MAX] for the fudge term, but never below
+ * next_pow2(n) so every site_id fits the mask (the N=1 zero-collision
+ * guarantee) even when the fudge would exceed the cap. Hashed-PC model:
+ * the legacy compile-time constant. */
+static size_t compute_map_size(size_t n_sites) {
+#if LIBCOV_COVERAGE_MODEL_SITE
+    if (n_sites == 0) n_sites = 1;
+    size_t floor_min  = (size_t)1u << LIBCOV_MAP_MIN_POW2;
+    size_t cap        = (size_t)1u << LIBCOV_MAP_MAX_POW2;
+    size_t hard_floor = next_pow2(n_sites);
+    size_t sz         = next_pow2(n_sites * (size_t)LIBCOV_MAP_FUDGE);
+    if (sz > cap)        sz = cap;
+    if (sz < floor_min)  sz = floor_min;
+    if (sz < hard_floor) sz = hard_floor;   /* honoured even above the cap */
+    return sz;
+#else
+    (void)n_sites;
+    return (size_t)1u << LIBCOV_MAP_SIZE_POW2;
+#endif
+}
+
 __attribute__((constructor(101)))
 static void libcov_init(void) {
     libcov_log_init();
@@ -41,12 +69,20 @@ static void libcov_init(void) {
     const char *mode_str = getenv("LIBCOV_MODE");
     if (mode_str && !strcmp(mode_str, "oneshot")) mode = LIBCOV_MODE_ONESHOT;
 
-    if (sink_init(getenv("LIBCOV_SHM_PATH"), parse_ring_size()) != 0) {
-        libcov_logf("init: sink_init failed");
-        return;
-    }
+    /* config_load first: it only resolves module bases + builds the patch
+     * table (no shm/bitmap touch), and the site-id model needs the patch
+     * count N to auto-size the bitmap before sink_init allocates it. */
     if (config_load(patchlist) != 0) {
         libcov_logf("init: config_load failed");
+        return;
+    }
+    size_t n_sites = 0;
+    config_table(&n_sites);
+    size_t map_size = compute_map_size(n_sites);
+    libcov_logf("init: coverage model=%s n_sites=%zu map_size=%zu",
+                LIBCOV_COVERAGE_MODEL_SITE ? "site" : "hash", n_sites, map_size);
+    if (sink_init(getenv("LIBCOV_SHM_PATH"), parse_ring_size(), map_size) != 0) {
+        libcov_logf("init: sink_init failed");
         return;
     }
     if (patch_arm_all() == 0) {

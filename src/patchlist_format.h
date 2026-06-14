@@ -103,7 +103,13 @@ struct patchlist_record {
  * bytes inconsistent with `patched`. ST-mode ignores this field.
  *
  * `module_idx` is carried from the wire record so the trap handler can
- * subtract the correct module base in sink_hash_pc (ASLR invariance). */
+ * subtract the correct module base in sink_hash_pc (ASLR invariance).
+ *
+ * `site_id` is a dense identifier in [0, count) assigned at config_load
+ * time as the file record index, BEFORE the table is sorted by addr (the
+ * sort carries it along). It is the bitmap bucket base under the site-id
+ * coverage model and is ASLR-invariant + decodable straight back to the
+ * Nth patchlist record. Not part of the on-disk wire record. */
 struct patch_entry {
     uintptr_t addr;
     uint8_t   len;
@@ -111,6 +117,7 @@ struct patch_entry {
     uint8_t   orig[LIBCOV_PATCH_ORIG_MAX];
     uint8_t   patched;
     uint8_t   lock;
+    uint32_t  site_id;
 };
 
 int  config_load(const char *path);
