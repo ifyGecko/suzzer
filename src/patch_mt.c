@@ -178,10 +178,11 @@ static int protect_range(uintptr_t addr, size_t len, int prot) {
  * critical section can take its own trap). */
 static inline void fallback_lock(void) {
     uint8_t expected = 0;
+    unsigned spins = 0;
     while (!__atomic_compare_exchange_n(&g_fallback_lock, &expected, 1,
                                         0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
         expected = 0;
-        __asm__ volatile ("" ::: "memory");
+        libcov_spin_backoff(&spins);
     }
 }
 
@@ -254,9 +255,9 @@ int patch_validate(const struct patch_entry *e) {
     return memcmp((void *)e->addr, e->orig, e->len) == 0 ? 0 : -1;
 }
 
-/* Acquire e->lock by spinning on a 0->1 cmpxchg. Bounded wait because the
- * critical section is just one pwrite + clear_cache + membarrier (single
- * digit microseconds). Safe in a signal handler:
+/* Acquire e->lock by spinning on a 0->1 cmpxchg, yielding after a bounded
+ * spin (libcov_spin_backoff) so a preempted holder can run. The critical
+ * section is one store + clear_cache. Safe in a signal handler:
  *
  *  - The same thread never recursively acquires the same entry's lock:
  *    patch_arm/disarm are called outside the trap PC's basic block, so a
@@ -267,10 +268,11 @@ int patch_validate(const struct patch_entry *e) {
  *    signal-context caller. */
 static inline void entry_lock(struct patch_entry *e) {
     uint8_t expected = 0;
+    unsigned spins = 0;
     while (!__atomic_compare_exchange_n(&e->lock, &expected, 1,
                                         0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
         expected = 0;
-        __asm__ volatile ("" ::: "memory");
+        libcov_spin_backoff(&spins);
     }
 }
 

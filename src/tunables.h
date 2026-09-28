@@ -188,6 +188,28 @@
 #endif
 
 /* ------------------------------------------------------------------ */
+/* Iteration boundaries (boundary.c)                                  */
+/* ------------------------------------------------------------------ */
+
+/* LIBCOV_MARKER_REARM_TIMEOUT_NS
+ *   A boundary marker that trapped stays disarmed until every thread that
+ *   trapped on it has trapped again somewhere else (proof it executed the
+ *   marker's original instruction; re-arming sooner makes it re-trap and
+ *   fire a spurious boundary). If a holder hasn't trapped again within
+ *   this many nanoseconds, the marker is re-armed anyway, so one idle or
+ *   exited thread can't keep it disarmed for every other worker.
+ *
+ *   Default 1 ms. Larger values mean fewer spurious fires from threads
+ *   descheduled right after their marker trap, at the cost of other
+ *   workers missing boundaries for longer when a holder goes idle.
+ *
+ *   Override at build: -DLIBCOV_MARKER_REARM_TIMEOUT_NS=5000000ULL
+ */
+#ifndef LIBCOV_MARKER_REARM_TIMEOUT_NS
+#define LIBCOV_MARKER_REARM_TIMEOUT_NS 1000000ULL
+#endif
+
+/* ------------------------------------------------------------------ */
 /* Init-time logging (util.c)                                         */
 /* ------------------------------------------------------------------ */
 

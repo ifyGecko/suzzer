@@ -63,9 +63,11 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
     if (g_mode == LIBCOV_MODE_LEAPFROG) {
         /* Per-thread leapfrog. The arm cmpxchg in patch_arm guards against
          * arming a site that another thread already armed via its own
-         * leapfrog -- in that case our arm is a no-op, which is correct. */
+         * leapfrog -- in that case our arm is a no-op, which is correct.
+         * Boundary markers are skipped: boundary.c re-arms them once every
+         * thread that trapped on them has moved past. */
         struct patch_entry *last = g_last_restored;
-        if (last && last != e &&
+        if (last && last != e && !last->marker &&
             !__atomic_load_n(&last->patched, __ATOMIC_RELAXED)) {
             patch_arm_unsynced(last);
         }
@@ -84,10 +86,6 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
 
     /* A1: single trailing IPI for every write this handler did. */
     patch_sync_batch_end();
-
-    /* Last step: a marker this trap disarmed may now be re-armed by any
-     * thread (boundary.c, g_pending_markers). */
-    boundary_trap_exit();
 }
 
 int handler_install(enum libcov_mode mode, struct sigaction *prev_out) {

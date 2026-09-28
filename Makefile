@@ -94,6 +94,14 @@ ifeq ($(ARCH),arm)
   CFLAGS += -marm
 endif
 
+# Every TLS variable libcov touches in the trap handler (prev_loc window,
+# PC cache, leapfrog state, boundary scratch) must resolve without
+# __tls_get_addr, which can allocate. initial-exec makes each access a
+# fixed offset from the thread pointer. Fine for LD_PRELOAD (loaded at
+# startup); a dlopen'ed libcov needs glibc's static TLS surplus, which
+# comfortably covers libcov's few hundred bytes.
+CFLAGS += -ftls-model=initial-exec
+
 # Pick threading-specific source set. Some files (config.c, sink_shm.c) are
 # the same source compiled with a different -D toggle; others (patch_*.c,
 # handler_*.c) are separate sources entirely.

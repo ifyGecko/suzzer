@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sched.h>
 #include <stdarg.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -122,4 +123,16 @@ void util_self_range(uintptr_t *lo_out, uintptr_t *hi_out) {
     }
     fclose(f);
     if (hi_all > lo_all) { *lo_out = lo_all; *hi_out = hi_all; }
+}
+
+void libcov_spin_backoff(unsigned *spins) {
+    if (++*spins >= LIBCOV_SPIN_YIELD_AFTER) {
+        *spins = 0;
+        sched_yield();
+    } else {
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#endif
+        __asm__ volatile ("" ::: "memory");
+    }
 }

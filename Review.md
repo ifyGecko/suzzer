@@ -1,7 +1,7 @@
 # Review.md — libcov coverage-options review
 
 > **Status (2026-09):** superseded by `TODO.md`, which is the live backlog.
-> C1 and C4 are fixed; C3 and C7 are partly fixed; the remaining items are
+> C1, C4, C7 and L5 are fixed; C3 is partly fixed; the remaining items are
 > tracked there by priority. The safety table at the end has been corrected
 > to match; the per-item text below is the original review, kept for its
 > reasoning.

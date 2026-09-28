@@ -105,6 +105,14 @@ struct patchlist_record {
  * `module_idx` is carried from the wire record so the trap handler can
  * subtract the correct module base in sink_hash_pc (ASLR invariance).
  *
+ * `marker` is set by boundary_init on the sites that are iteration-boundary
+ * markers. Their re-arm is owned by boundary.c's pending protocol; the
+ * leapfrog and bulk re-arm paths skip them (re-arming a marker another
+ * thread is still inside the handler for makes that thread re-trap).
+ *
+ * `touched` is set while the entry sits in boundary.c's REARM=touched
+ * queue, so each disarmed site is queued at most once.
+ *
  * `site_id` is a dense identifier in [0, count) assigned at config_load
  * time as the file record index, BEFORE the table is sorted by addr (the
  * sort carries it along). It is the bitmap bucket base under the site-id
@@ -117,6 +125,8 @@ struct patch_entry {
     uint8_t   orig[LIBCOV_PATCH_ORIG_MAX];
     uint8_t   patched;
     uint8_t   lock;
+    uint8_t   marker;
+    uint8_t   touched;
     uint32_t  site_id;
 };
 

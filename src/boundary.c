@@ -9,8 +9,9 @@
  * (gettid via SYS_gettid), write. All of these are documented as safe.
  *
  * Threading: marker table + sidecar metadata are shared and read-only
- * after init (apart from each marker's atomic `pending` flag). Depth and
- * the touched set are __thread under LIBCOV_THREADING_MT.
+ * after init (apart from each marker's atomic pending/holders state).
+ * Depth and the live bitmap are __thread under LIBCOV_THREADING_MT; the
+ * REARM=touched queue is process-wide (see g_tq).
  *
  * Live bitmaps. ST keeps one live bitmap that IS the next ring slot
  * (pointer-swap publish, no copy). MT can't: with one shared live bitmap,
@@ -30,6 +31,7 @@
 #include "patch.h"
 #include "sink.h"
 #include "util.h"
+#include "tunables.h"   /* LIBCOV_MARKER_REARM_TIMEOUT_NS */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,7 +65,9 @@ struct marker {
     struct patch_entry *pe;           /* the patch site at addr (NULL: unpatched) */
     uint8_t             kind;         /* LIBCOV_BOUNDARY_KIND_BEGIN / END */
     uint8_t             depth_filter; /* 1 = depth-zero only */
-    uint8_t             pending;      /* atomic: MARKER_{IDLE,HELD,RELEASED} */
+    uint8_t             pending;      /* atomic: disarmed, awaiting re-arm */
+    uint32_t            holders;      /* atomic: threads not yet past it */
+    uint64_t            last_hold_ns; /* atomic: CLOCK_MONOTONIC of last trap */
 };
 static struct marker *g_markers = NULL;
 static size_t         g_marker_count = 0;
@@ -91,21 +95,31 @@ static unsigned                  g_ring_size = 0;
  * fd; libcov never closes it. */
 static int g_eventfd = -1;
 
-/* Upper bound for per-thread touched array sizing. Set to patchlist count
- * at init. */
-static size_t g_touched_cap = 0;
+/* REARM=touched queue: every site disarmed by a trap since the last
+ * boundary, from ANY thread; each boundary fire re-arms (drains) it.
+ *
+ * It used to be per-thread, re-armed only at that thread's own boundary.
+ * Under MT with shared code that starves: a site worker A re-armed is
+ * disarmed again by worker B's trap and lands in B's set, so A stops
+ * trapping, and once every worker is in that state no boundary ever
+ * fires again (measured: 2 of 400 expected snapshots with 4 workers).
+ *
+ * Lock-free append from the handler: an entry is queued only if its
+ * `touched` flag goes 0->1, so at most n_sites entries are outstanding.
+ * The ring holds 2*n_sites because one drain pass can free up to n_sites
+ * slots that are refilled before the pass advances g_tq_head past them.
+ * Draining is single-threaded (g_tq_drain_lock try-lock); a boundary that
+ * finds a drain in progress leaves the work to it. */
+static struct patch_entry **g_tq       = NULL;
+static size_t               g_tq_size  = 0;   /* 2 * n_sites */
+static uint64_t             g_tq_tail  = 0;   /* atomic: next slot to fill */
+static uint64_t             g_tq_head  = 0;   /* next slot to drain (drainer only) */
+static uint8_t              g_tq_drain_lock = 0;
 
 /* ---- per-thread (MT) / global (ST) ------------------------------- */
 
 static TLS uint32_t g_depth = 0;
 
-/* "Touched this iter" set -- a stack of patch_entry pointers appended on
- * every disarm during the current iteration, drained at boundary. Sized
- * to the full patchlist count at init; never grows past that. Allocated
- * lazily per thread so MT workers get their own scratch without paying
- * for it at process init. */
-static TLS struct patch_entry **g_touched     = NULL;
-static TLS size_t               g_touched_len = 0;
 
 /* Deferred marker re-arm, process-wide. A marker that just trapped must
  * stay disarmed until the thread that hit it has executed the original
@@ -115,21 +129,26 @@ static TLS size_t               g_touched_len = 0;
  * worker until that worker trapped again, so their boundaries were
  * silently missed.)
  *
- * States of marker.pending:
- *   HELD     -- the marker trapped and its thread is still in the handler
- *               (publishing, re-arming, membarrier). Nobody re-arms it.
- *   RELEASED -- boundary_trap_exit() ran: the thread is about to return
- *               and execute the original instruction. The next trap at a
- *               different site, on ANY thread, re-arms it.
+ * Each marker trap sets marker.pending and increments marker.holders.
+ * A holder is released by its own NEXT trap at a different site: that
+ * trap proves the thread executed the marker's original instruction. The
+ * next trap on ANY thread then re-arms a marker that is pending with no
+ * holders.
  *
- * Releasing only at handler exit matters: the handler body takes tens of
- * microseconds, during which a busy peer traps many times. The residual
- * window is the owner's sigreturn itself; a peer re-arming inside it
- * causes one extra, near-empty boundary fire for the owner. */
-enum { MARKER_IDLE = 0, MARKER_HELD = 1, MARKER_RELEASED = 2 };
-static uint32_t g_pending_markers = 0;   /* atomic: markers not IDLE */
+ * Why not release at handler exit: the thread still has to sigreturn and
+ * fetch the marker's instruction, and with several busy workers a peer
+ * re-arms it inside that microsecond-scale gap a large fraction of the
+ * time (measured: ~25% of all snapshots were spurious re-trap fires with
+ * 4 workers). Why count holders rather than one owner: when workers hit
+ * the marker at nearly the same moment, B's trap is already in flight
+ * when A disarms it, and B must get past it too.
+ *
+ * A holder that never traps again (idle, blocked, exited) would keep the
+ * marker disarmed for everyone, so after LIBCOV_MARKER_REARM_TIMEOUT_NS
+ * since the last trap on it the marker is re-armed regardless. */
+static uint32_t g_pending_markers = 0;   /* atomic: markers with pending=1 */
 
-/* The marker this thread's current trap is holding, if any. */
+/* The marker this thread holds (trapped on, not yet proven past), if any. */
 static TLS struct marker *g_held_marker = NULL;
 
 #if defined(LIBCOV_THREADING_MT)
@@ -276,6 +295,20 @@ static int load_sidecar(const char *path, uintptr_t module_base) {
 
 /* ---- env parsing ------------------------------------------------------ */
 
+/* The notify write happens inside the trap handler, so only an eventfd is
+ * acceptable: a full pipe would block the target in the handler forever,
+ * and a pipe whose reader is gone raises SIGPIPE and kills it. We don't
+ * set O_NONBLOCK ourselves -- the open file description is shared with
+ * the driver, and it would change the driver's reads too. */
+static int fd_is_eventfd(int fd) {
+    char path[64], target[64];
+    snprintf(path, sizeof path, "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(path, target, sizeof target - 1);
+    if (n < 0) return 0;
+    target[n] = 0;
+    return strcmp(target, "anon_inode:[eventfd]") == 0;
+}
+
 static enum libcov_rearm_policy parse_rearm(const char *s) {
     if (!s || !*s)         return LIBCOV_REARM_NONE;
     if (!strcmp(s, "all"))     return LIBCOV_REARM_ALL;
@@ -317,23 +350,26 @@ int boundary_init(void) {
     const char *efd_str = getenv("LIBCOV_BOUNDARY_NOTIFY_FD");
     if (efd_str && *efd_str) {
         int fd = atoi(efd_str);
-        if (fd > 0) {
+        if (fd > 0 && fd_is_eventfd(fd)) {
             g_eventfd = fd;
             libcov_logf("boundary: notify fd=%d", fd);
+        } else {
+            libcov_logf("boundary: WARNING -- LIBCOV_BOUNDARY_NOTIFY_FD=%s is not "
+                        "an inherited eventfd; ignoring it (drivers fall back to "
+                        "polling gen_current)", efd_str);
         }
     }
 
-    /* Cap for per-thread touched-set storage. Allocation is deferred to
-     * first use per thread (in touched_append) so non-trapping threads
-     * cost nothing. */
-    size_t patch_n = 0;
-    config_table_mut(&patch_n);
-    g_touched_cap = patch_n;
-    /* Pre-allocate the init thread's touched set so ST (and the MT main
-     * thread) never calls calloc from inside the signal handler. Other MT
-     * threads still allocate lazily on first trap -- see TODO.md. */
-    if (g_rearm == LIBCOV_REARM_TOUCHED && g_touched_cap > 0)
-        g_touched = calloc(g_touched_cap, sizeof(struct patch_entry *));
+    if (g_rearm == LIBCOV_REARM_TOUCHED) {
+        size_t patch_n = 0;
+        config_table_mut(&patch_n);
+        g_tq_size = 2 * patch_n;
+        g_tq = g_tq_size ? calloc(g_tq_size, sizeof *g_tq) : NULL;
+        if (!g_tq) {
+            libcov_logf("boundary: cannot allocate the REARM=touched queue");
+            return -1;
+        }
+    }
 
     g_ring_size   = g_hdr->ring_size;
     g_slot_stride = g_hdr->slot_stride;
@@ -343,6 +379,7 @@ int boundary_init(void) {
      * that isn't a patched site never traps, so it can never fire. */
     for (size_t i = 0; i < g_marker_count; i++) {
         g_markers[i].pe = patch_lookup(g_markers[i].addr);
+        if (g_markers[i].pe) g_markers[i].pe->marker = 1;
         if (!g_markers[i].pe)
             libcov_logf("boundary: WARNING -- marker 0x%lx is not a patched site "
                         "and will never fire (check gen_boundary.py --patchlist)",
@@ -355,6 +392,7 @@ int boundary_init(void) {
     else
         libcov_logf("boundary: pthread_key_create failed; per-thread live "
                     "bitmaps will not be freed at thread exit");
+
     /* The live bitmap stays the shared one at hdr->bitmap_offset until a
      * thread fires its first boundary (see the file header). */
 #else
@@ -394,19 +432,39 @@ int boundary_init(void) {
 
 /* ---- hot path: trap handler integration ------------------------------- */
 
-/* Lazy per-thread allocation of the touched-set scratch. Allocation in a
- * signal handler is technically not async-signal-safe in general, but
- * malloc() in glibc under our usage pattern (no longjmp / no fork from
- * inside the handler) is safe in practice. If this turns out to be a
- * problem on a specific target we can preallocate at thread_init. */
+/* Queue a site disarmed by this trap for the next boundary's re-arm.
+ * Markers are re-armed by the pending protocol instead. */
 static inline void touched_append(struct patch_entry *e) {
-    if (!g_touched && g_touched_cap > 0) {
-        g_touched = calloc(g_touched_cap, sizeof(struct patch_entry *));
-        if (!g_touched) return;  /* OOM -- silently degrade to REARM=all-style scan */
+    if (e->marker) return;
+    uint8_t zero = 0;
+    if (!__atomic_compare_exchange_n(&e->touched, &zero, 1, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        return;   /* already queued */
+    uint64_t idx = __atomic_fetch_add(&g_tq_tail, 1, __ATOMIC_ACQ_REL);
+    __atomic_store_n(&g_tq[idx % g_tq_size], e, __ATOMIC_RELEASE);
+}
+
+/* Re-arm everything queued so far. Stops at a slot whose appender has
+ * reserved it but not yet stored the pointer; the next drain picks it
+ * up. The flag is cleared BEFORE arming: a trap right after the arm must
+ * be able to queue the site again. */
+static void touched_drain(void) {
+    uint8_t unlocked = 0;
+    if (!__atomic_compare_exchange_n(&g_tq_drain_lock, &unlocked, 1, 0,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        return;
+    uint64_t tail = __atomic_load_n(&g_tq_tail, __ATOMIC_ACQUIRE);
+    uint64_t i = g_tq_head;
+    for (; i < tail; i++) {
+        struct patch_entry *p =
+            __atomic_exchange_n(&g_tq[i % g_tq_size], NULL, __ATOMIC_ACQ_REL);
+        if (!p) break;
+        __atomic_store_n(&p->touched, 0, __ATOMIC_RELEASE);
+        if (!__atomic_load_n(&p->patched, __ATOMIC_RELAXED))
+            patch_arm_unsynced(p);
     }
-    if (g_touched_len < g_touched_cap) {
-        g_touched[g_touched_len++] = e;
-    }
+    g_tq_head = i;
+    __atomic_store_n(&g_tq_drain_lock, 0, __ATOMIC_RELEASE);
 }
 
 #if !defined(LIBCOV_THREADING_MT)
@@ -483,10 +541,11 @@ static void publish_snapshot(uint64_t gen) {
 #if defined(LIBCOV_THREADING_MT)
 static inline void slot_lock(uint8_t *l) {
     uint8_t expected = 0;
+    unsigned spins = 0;
     while (!__atomic_compare_exchange_n(l, &expected, 1, 0,
                                         __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
         expected = 0;
-        __asm__ volatile ("" ::: "memory");
+        libcov_spin_backoff(&spins);
     }
 }
 
@@ -538,22 +597,13 @@ static void apply_rearm_policy(struct patch_entry *exclude) {
     case LIBCOV_REARM_NONE:
         break;
     case LIBCOV_REARM_TOUCHED:
-        for (size_t i = 0; i < g_touched_len; i++) {
-            struct patch_entry *p = g_touched[i];
-            if (!p || p == exclude) continue;
-#if defined(LIBCOV_THREADING_MT)
-            if (__atomic_load_n(&p->patched, __ATOMIC_RELAXED)) continue;
-#else
-            if (p->patched) continue;
-#endif
-            patch_arm_unsynced(p);
-        }
+        touched_drain();   /* never holds markers, so never `exclude` */
         break;
     case LIBCOV_REARM_ALL: {
         size_t n;
         struct patch_entry *t = config_table_mut(&n);
         for (size_t i = 0; i < n; i++) {
-            if (&t[i] == exclude) continue;
+            if (&t[i] == exclude || t[i].marker) continue;
 #if defined(LIBCOV_THREADING_MT)
             if (__atomic_load_n(&t[i].patched, __ATOMIC_RELAXED)) continue;
 #else
@@ -564,20 +614,28 @@ static void apply_rearm_policy(struct patch_entry *exclude) {
         break;
     }
     }
-    g_touched_len = 0;
-    /* The excluded (current) site is the marker; its re-arm is deferred
-     * through the marker's pending flag (see g_pending_markers). */
+    /* Markers (including the excluded current site) are skipped above:
+     * their re-arm goes through the pending protocol (g_pending_markers),
+     * which waits until the thread that hit them has left the handler. */
 }
 
-/* Re-arm every RELEASED marker, whichever thread hit it, except the site
- * trapping right now. Fast path: one load when nothing is pending. */
+/* Re-arm every pending marker that no thread is still handling, whichever
+ * thread hit it, except the site trapping right now. Fast path: one load
+ * when nothing is pending. */
 static void flush_pending_markers(struct patch_entry *cur) {
     if (!__atomic_load_n(&g_pending_markers, __ATOMIC_ACQUIRE)) return;
+    uint64_t now = 0;
     for (size_t i = 0; i < g_marker_count; i++) {
         struct marker *m = &g_markers[i];
         if (m->pe == cur) continue;
-        uint8_t released = MARKER_RELEASED;
-        if (!__atomic_compare_exchange_n(&m->pending, &released, MARKER_IDLE, 0,
+        if (!__atomic_load_n(&m->pending, __ATOMIC_ACQUIRE)) continue;
+        if (__atomic_load_n(&m->holders, __ATOMIC_ACQUIRE)) {
+            if (!now) now = now_ns();
+            uint64_t t = __atomic_load_n(&m->last_hold_ns, __ATOMIC_RELAXED);
+            if (now - t < LIBCOV_MARKER_REARM_TIMEOUT_NS) continue;
+        }
+        uint8_t one = 1;
+        if (!__atomic_compare_exchange_n(&m->pending, &one, 0, 0,
                                          __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
             continue;
         __atomic_sub_fetch(&g_pending_markers, 1, __ATOMIC_RELEASE);
@@ -587,27 +645,26 @@ static void flush_pending_markers(struct patch_entry *cur) {
     }
 }
 
-/* Hold a marker that this thread just trapped on. A marker already HELD
- * by a peer that trapped on it at the same moment (MT: both traps
- * converged) keeps the peer as holder; we then have nothing to release. */
+/* This thread just trapped on marker m: keep it disarmed until this
+ * thread's next trap elsewhere (release_held_marker). */
 static void hold_marker(struct marker *m) {
-    uint8_t cur = __atomic_load_n(&m->pending, __ATOMIC_RELAXED);
-    for (;;) {
-        if (!m->pe || cur == MARKER_HELD) return;
-        if (__atomic_compare_exchange_n(&m->pending, &cur, MARKER_HELD, 0,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-            break;
-    }
-    if (cur == MARKER_IDLE)
+    if (!m->pe || g_held_marker == m) return;
+    __atomic_store_n(&m->last_hold_ns, now_ns(), __ATOMIC_RELAXED);
+    __atomic_add_fetch(&m->holders, 1, __ATOMIC_ACQ_REL);
+    uint8_t zero = 0;
+    if (__atomic_compare_exchange_n(&m->pending, &zero, 1, 0,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
         __atomic_add_fetch(&g_pending_markers, 1, __ATOMIC_RELEASE);
     g_held_marker = m;
 }
 
-void boundary_trap_exit(void) {
+/* This thread trapped at a site other than the marker it holds, so it
+ * has executed past that marker. */
+static void release_held_marker(struct patch_entry *cur) {
     struct marker *m = g_held_marker;
-    if (!m) return;
+    if (!m || m->pe == cur) return;
     g_held_marker = NULL;
-    __atomic_store_n(&m->pending, MARKER_RELEASED, __ATOMIC_RELEASE);
+    __atomic_sub_fetch(&m->holders, 1, __ATOMIC_RELEASE);
 }
 
 static void maybe_record_init(uint64_t gen) {
@@ -624,10 +681,10 @@ void boundary_on_trap(uintptr_t pc, struct patch_entry *e) {
     /* Re-arm markers left disarmed by earlier marker traps (any thread),
      * but never the site trapping right now -- we'd re-trap on the
      * instruction we're about to return to. */
+    release_held_marker(e);
     flush_pending_markers(e);
 
-    /* Track this disarm so 'touched' re-arm can find it later. Only needed
-     * (and only allocates) under REARM=touched. */
+    /* Queue this disarm for the next boundary's REARM=touched re-arm. */
     if (e && g_rearm == LIBCOV_REARM_TOUCHED) touched_append(e);
 
     struct marker *m = marker_lookup(pc);

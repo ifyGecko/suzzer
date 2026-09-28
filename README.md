@@ -294,9 +294,10 @@ boundary list is loaded)
 - `all` -- on each boundary fire, re-arm every disarmed site in the
   patch table. Heaviest, but gives full per-iter edge sets even in
   `MODE=oneshot`.
-- `touched` -- on each boundary fire, re-arm only the sites that fired
-  this iteration. Mid-cost between `none` and `all`; same per-iter
-  semantics as `all` in practice.
+- `touched` -- on each boundary fire, re-arm only the sites that have
+  trapped since the previous boundary fire (on any thread). Mid-cost
+  between `none` and `all`; same per-iter semantics as `all` in
+  practice.
 
 Recommended pairings:
 
@@ -377,8 +378,8 @@ it from per-input attribution.
 
 ### Threading
 
-Per-thread state is `__thread` under `libcov_mt.so`: depth counter,
-touched-set scratch, and the live bitmap itself.
+Per-thread state is `__thread` under `libcov_mt.so`: the depth counter
+and the live bitmap itself.
 
 - **Worker threads get private live bitmaps.** A thread's first boundary
   fire switches it from the shared bitmap to its own; every later fire
@@ -392,13 +393,22 @@ touched-set scratch, and the live bitmap itself.
   marker) keep emitting into the shared bitmap at `bitmap_offset`, which
   under MT boundary mode is a cumulative map of non-iteration coverage.
   (Under ST boundary mode that area is unused.)
-- **Markers are re-armed process-wide.** Any thread's next trap re-arms
-  a marker another thread hit, once that thread has left its handler.
+- **Markers are re-armed process-wide,** by any thread's trap, once
+  every thread that trapped on the marker has trapped again somewhere
+  else (proof it executed the marker's original instruction), or after
+  `LIBCOV_MARKER_REARM_TIMEOUT_NS` (`src/tunables.h`, 1 ms) if one
+  hasn't. Re-arming any sooner makes that thread re-trap and fire a
+  spurious, near-empty boundary.
+- **`REARM=touched` is process-wide:** a boundary re-arms every site any
+  thread disarmed since the last boundary. (Per-thread sets starved
+  under oneshot: workers kept disarming each other's re-armed sites
+  until no thread trapped and boundaries stopped.)
 - **MT coverage is sampled.** A site one thread has disarmed doesn't
-  trap for another until it's re-armed, so with concurrent workers a few
-  percent of boundaries are missed (two iterations of that worker merge
-  into one snapshot) and a few extra, near-empty snapshots appear (a
-  worker re-traps a marker a peer re-armed early).
+  trap for another until it's re-armed. For markers this means that
+  while one worker holds the marker, other workers pass it untrapped
+  and two of their iterations merge into one snapshot. Measured on
+  `target_loop_mt`: ~1-3% of boundaries missed with 2 workers, ~5-20%
+  with 4, ~20-30% with 8. Snapshots never mix threads.
 
 Publish costs one `map_size` copy per iteration under MT; ST keeps the
 zero-copy pointer swap. Generations are assigned by `fetch_add` on
@@ -595,7 +605,7 @@ src/
   sink.h              AFL-style edge hash; macro-gated TLS prev_loc + atomic emit (MT)
   sink_shm.c          shm region (header + bitmap + ring); prev_loc def
   boundary.h/.c       LCVB1 parser; marker lookup; snapshot publish; re-arm;
-                      per-thread depth + touched-set under MT
+                      per-thread depth + live bitmaps under MT
   membarrier.h/.c     MT-only; PRIVATE_EXPEDITED_SYNC_CORE wrapper with fallback
   arch.h              backend interface (extern symbols, no #ifdefs)
   arch_x86_64.c       x86 UD2 head-only / 2 bytes (ST+MT share)

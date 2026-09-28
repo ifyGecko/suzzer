@@ -11,7 +11,13 @@
 #   2. run 'a' and 'b' workers concurrently and require that no per-
 #      iteration snapshot contains both UA and UB buckets, and that each
 #      publishing tid only ever produces one kind of snapshot;
-#   3. require every generation to be readable (no OVERRUN / MISSING).
+#   3. require every generation to be readable (no OVERRUN / MISSING);
+#   4. with 4 workers (two per path), require boundaries to keep firing:
+#      no stall, and at least MIN_FRACTION_4 of the expected snapshots.
+#      (A marker is one shared trap site, so while one worker is between
+#      its marker trap and its next trap, others pass it untrapped and
+#      two of their iterations merge. That costs ~10-20% with 4 workers;
+#      a stall costs ~100%.)
 #
 # A small number of stray buckets is tolerated (MISMATCH_TOLERANCE):
 # under MT a site disarmed by one thread doesn't trap for the other, which
@@ -27,6 +33,7 @@ TARGET="$ROOT/build/$ARCH/target_loop_mt"
 DUMP="$ROOT/build/$ARCH/ring_dump"
 ITERS="${ITERS:-150}"
 MISMATCH_TOLERANCE="${MISMATCH_TOLERANCE:-1}"
+MIN_FRACTION_4="${MIN_FRACTION_4:-0.6}"
 
 for f in "$LIB" "$TARGET" "$DUMP"; do
     [[ -e "$f" ]] || { echo "missing $f. Run 'make THREADING=mt' and 'make -C test mt ARCH=$ARCH BUILD=$ROOT/build/$ARCH'." >&2; exit 1; }
@@ -56,14 +63,15 @@ run_dump() {  # <out> <workers> <iters>
 check_combo() {  # <mode> <rearm>
     local mode="$1" rearm="$2"
     export LIBCOV_MODE="$mode" LIBCOV_BOUNDARY_REARM="$rearm"
-    run_dump "$WORK/a.out"  a  "$ITERS"
-    run_dump "$WORK/b.out"  b  "$ITERS"
-    run_dump "$WORK/ab.out" ab "$ITERS"
-    python3 - "$WORK/a.out" "$WORK/b.out" "$WORK/ab.out" \
-              "$MISMATCH_TOLERANCE" "$mode" "$rearm" "$ITERS" <<'EOF'
+    run_dump "$WORK/a.out"    a    "$ITERS"
+    run_dump "$WORK/b.out"    b    "$ITERS"
+    run_dump "$WORK/ab.out"   ab   "$ITERS"
+    run_dump "$WORK/aabb.out" aabb "$ITERS"
+    python3 - "$WORK/a.out" "$WORK/b.out" "$WORK/ab.out" "$WORK/aabb.out" \
+              "$MISMATCH_TOLERANCE" "$mode" "$rearm" "$ITERS" "$MIN_FRACTION_4" <<'EOF'
 import re, sys
-a_path, b_path, ab_path, tol, mode, rearm, iters = sys.argv[1:]
-tol, iters = int(tol), int(iters)
+a_path, b_path, ab_path, aabb_path, tol, mode, rearm, iters, frac4 = sys.argv[1:]
+tol, iters, frac4 = int(tol), int(iters), float(frac4)
 
 def load(path):
     gens, init = [], 0
@@ -91,33 +99,39 @@ tag = f"MODE={mode} REARM={rearm}"
 if len(ua) < 3 or len(ub) < 3:
     sys.exit(f"FAIL {tag}: solo signatures too small (|UA|={len(ua)} |UB|={len(ub)})")
 
-gens = load(ab_path)
-# About one publish per worker iteration (each worker's first iter_begin
-# only switches it to its own live bitmap). Not exact under MT: while one
-# worker's handler holds the marker disarmed, the other can run
-# iter_begin without trapping (two iterations merge into one snapshot),
-# and a peer's re-arm can catch the marker before its thread has executed
-# it (one extra, near-empty snapshot). Require 90%; losing whole threads'
-# worth of boundaries is what this guards against.
-if len(gens) < 0.9 * 2 * iters:
-    sys.exit(f"FAIL {tag}: only {len(gens)} per-iteration gens (want ~{2 * iters})")
+def check(path, workers, floor):
+    gens = load(path)
+    # About one publish per worker iteration (each worker's first
+    # iter_begin only switches it to its own live bitmap), minus merges
+    # where a worker passed the marker while a peer held it disarmed.
+    want = workers * iters
+    if len(gens) < floor * want:
+        sys.exit(f"FAIL {tag} x{workers}: only {len(gens)} per-iteration gens "
+                 f"(want >= {floor:.0%} of {want})")
+    tiny = sum(1 for _, _, idx in gens if len(idx) <= 1)
+    if tiny > 0.05 * len(gens):
+        sys.exit(f"FAIL {tag} x{workers}: {tiny}/{len(gens)} near-empty snapshots "
+                 f"(spurious marker re-traps)")
+    mixed, kinds = [], {}
+    for gen, tid, idx in gens:
+        na, nb = len(idx & ua), len(idx & ub)
+        if na > tol and nb > tol:
+            mixed.append((gen, na, nb))
+        kind = "a" if na > nb else "b" if nb > na else None
+        if kind:
+            kinds.setdefault(tid, set()).add(kind)
+    if mixed:
+        head = ", ".join(f"gen={g}(a={x},b={y})" for g, x, y in mixed[:5])
+        sys.exit(f"FAIL {tag} x{workers}: {len(mixed)}/{len(gens)} snapshots mix "
+                 f"workers: {head}")
+    multi = {t: k for t, k in kinds.items() if len(k) > 1}
+    if multi:
+        sys.exit(f"FAIL {tag} x{workers}: tids published both kinds: {multi}")
+    print(f"   OK: {tag} x{workers}: {len(gens)}/{want} snapshots, none mixed, "
+          f"{tiny} near-empty (|UA|={len(ua)} |UB|={len(ub)}, tids={len(kinds)})")
 
-mixed, kinds = [], {}
-for gen, tid, idx in gens:
-    na, nb = len(idx & ua), len(idx & ub)
-    if na > tol and nb > tol:
-        mixed.append((gen, na, nb))
-    kind = "a" if na > nb else "b" if nb > na else None
-    if kind:
-        kinds.setdefault(tid, set()).add(kind)
-if mixed:
-    head = ", ".join(f"gen={g}(a={x},b={y})" for g, x, y in mixed[:5])
-    sys.exit(f"FAIL {tag}: {len(mixed)}/{len(gens)} snapshots mix both workers: {head}")
-multi = {t: k for t, k in kinds.items() if len(k) > 1}
-if multi:
-    sys.exit(f"FAIL {tag}: tids published both kinds of snapshot: {multi}")
-print(f"   OK: {tag}: {len(gens)} per-iteration snapshots, none mixed "
-      f"(|UA|={len(ua)} |UB|={len(ub)}, tids={len(kinds)})")
+check(ab_path, 2, 0.9)
+check(aabb_path, 4, frac4)
 EOF
 }
 

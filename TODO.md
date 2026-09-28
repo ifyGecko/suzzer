@@ -57,7 +57,7 @@ the MT stress test fail against the pre-fix code.
   CAS counter. (Review C4)
 - **`calloc` in the handler for every boundary config.** It now happens
   only under `REARM=touched`, and the init thread's set is pre-allocated.
-  (Review C7, partly; see P1 below)
+  (Review C7, partly; finished below)
 - **Begin-only sidecar with `depth_filter`.** This now logs a WARNING at
   load, and `gen_boundary.py` warns too. (Review C3, partly)
 - **Seqlock fences.** A writer fence was added between `slot_gen=0` and
@@ -94,6 +94,32 @@ the MT stress test fail against the pre-fix code.
   disarmed for the others until that worker trapped again. Markers now
   carry a HELD/RELEASED state: the next trap on any thread re-arms a
   marker once its thread has left the handler.
+- **`calloc` in the trap handler** (Review C7). The REARM=touched set
+  is now one process-wide queue allocated at init (see below), so
+  nothing allocates in the handler except the MT per-thread live bitmap,
+  which uses `mmap`.
+- **REARM=touched starved with several MT workers.** Per-thread touched
+  sets meant a site one worker re-armed was disarmed by another and only
+  re-armed at *that* worker's boundary; with 4 workers boundaries
+  stopped entirely. The queue is now process-wide, drained at any
+  boundary.
+- **Markers were re-armed too early under MT.** Leapfrog and the bulk
+  re-arm loops re-armed a marker that another thread had just trapped on
+  but not yet executed, so it re-trapped: ~35% of snapshots were
+  spurious near-empty fires with 4 workers. Markers are now flagged in
+  `patch_entry` and re-armed only once every thread that trapped on them
+  has trapped elsewhere (or after `LIBCOV_MARKER_REARM_TIMEOUT_NS`).
+  `run_validation_boundary_mt.sh` now also runs 4 workers and fails on
+  stalls and on >5% near-empty snapshots.
+- **Notify fd** (Review L5). `LIBCOV_BOUNDARY_NOTIFY_FD` is accepted only
+  if it's an eventfd (`/proc/self/fd/N` → `anon_inode:[eventfd]`); a pipe
+  could block the handler forever or SIGPIPE the target. Regression check
+  in `run_validation_boundary.sh`.
+- **Spinlocks yield** after 64 spins (`libcov_spin_backoff`), so a
+  preempted holder on a single-core SCHED_FIFO system can run.
+- **TLS model.** The library is built with `-ftls-model=initial-exec`, so
+  handler TLS never goes through `__tls_get_addr` (`STATIC_TLS` is set in
+  the dynamic section).
 - **README drift.** Fixed: the 64 KB bitmap claims, the x86 patch
   length, the chaining claim, the missing coverage-model docs, the
   "threads scope iterations cleanly" claim, and the `LIBCOV_MODULE`
@@ -125,10 +151,13 @@ the MT stress test fail against the pre-fix code.
 
 - [ ] **MT leapfrog/oneshot is sampled coverage.** A site that thread A
   has disarmed doesn't trap for thread B until it's re-armed, so B's
-  coverage there is missed. Markers are now re-armed process-wide (see
-  the fixed list), which narrows the window to A's handler duration; a
-  few percent of B's boundaries can still be missed, and a peer's re-arm
-  can make A re-trap a marker (an extra near-empty snapshot).
+  coverage there is missed. For markers: while any worker holds the
+  marker (between its marker trap and its next trap elsewhere), other
+  workers pass it untrapped and two of their iterations merge. Measured
+  on `target_loop_mt`: ~1-3% of boundaries missed with 2 workers,
+  ~5-20% with 4, ~20-30% with 8. Ideas: per-worker marker copies (one
+  marker site per worker function), or a second "exit" site after the
+  marker that re-arms it (a two-site leapfrog), both target-dependent.
   - For coverage: consider a "re-arm after K traps process-wide" policy,
     or accept and keep documenting that MT is sampled coverage (README
     now says so).
@@ -174,24 +203,6 @@ the MT stress test fail against the pre-fix code.
 
 ## P1: robustness
 
-- [ ] **`calloc` in the handler for MT worker threads under
-  `REARM=touched`** (`touched_append`). It deadlocks if the allocator is
-  instrumented or interposed and the trap fires while the allocator lock
-  is held. Use `mmap` (a raw syscall) for per-thread sets, or
-  pre-allocate a pool sized by `LIBCOV_MAX_THREADS`. (Review C7)
-- [ ] **Notify-fd hazards** (`publish_snapshot`). If `LIBCOV_BOUNDARY_NOTIFY_FD`
-  is a pipe:
-  - a full pipe blocks the target inside the signal handler forever;
-  - a pipe whose reader has gone raises SIGPIPE and kills the target.
-
-  At init, check that it's an eventfd (`readlink /proc/self/fd/N` ==
-  `anon_inode:[eventfd]`) and refuse anything else. Don't set
-  `O_NONBLOCK` on the fd: it's a shared open file description and would
-  change the driver's reads. (Review L5, understated there)
-- [ ] **Spinlocks never yield** (`patch_mt.c` `entry_lock`, `fallback_lock`).
-  On single-core embedded parts with SCHED_FIFO threads, a low-priority
-  holder can be starved forever. Call `sched_yield()` (a raw syscall)
-  after N spins.
 - [ ] **fork / re-exec re-initialises the shared region.** A daemon that
   re-execs itself (sshd per connection, nginx upgrade) inherits the
   environment, runs `sink_init` again, and memsets the header and ring
@@ -221,10 +232,6 @@ the MT stress test fail against the pre-fix code.
   with a SIGILL encoding) only shows up as a crash. At init, execute the
   trap encoding once in a private scratch page and verify it arrives as
   `LIBCOV_TRAP_SIGNO`. (Review L3)
-- [ ] **TLS model.** Signal-handler TLS (`libcov_prev_loc`, the PC
-  cache, `g_last_restored`) uses global-dynamic TLS. Build with
-  `-ftls-model=initial-exec` so `__tls_get_addr` (which may allocate)
-  can never run inside the handler, e.g. if libcov is ever dlopen'ed.
 - [ ] **Runtime logging.** The `sigaction` interposer logs to fd 2 after
   init, and a daemon may have reused fd 2 for a socket. `LIBCOV_LOG` is
   opened without `O_CLOEXEC`.

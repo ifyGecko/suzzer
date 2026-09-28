@@ -122,4 +122,40 @@ check_combo oneshot  all     4
 check_combo oneshot  touched 4
 
 echo
+echo ">> LIBCOV_BOUNDARY_NOTIFY_FD: eventfd accepted and signalled, pipe refused"
+# The notify write runs inside the trap handler; a pipe could block it
+# forever (full) or SIGPIPE the target (reader gone), so libcov must only
+# accept an eventfd.
+python3 - "$LIB" "$LCV" "$LCVB" "$TARGET" <<'PYEOF'
+import os, subprocess, sys
+lib, lcv, lcvb, target = sys.argv[1:]
+
+def run(fd):
+    env = dict(os.environ, LD_PRELOAD=lib, LIBCOV_PATCHLIST=lcv,
+               LIBCOV_BOUNDARY_LIST=lcvb, LIBCOV_MODE="leapfrog",
+               LIBCOV_SHM_PATH=f"/tmp/libcov_notify_{os.getpid()}",
+               LIBCOV_BOUNDARY_NOTIFY_FD=str(fd))
+    p = subprocess.run([target], input=b"42\n99\n", env=env, pass_fds=(fd,),
+                       capture_output=True, timeout=30)
+    try: os.unlink(env["LIBCOV_SHM_PATH"])
+    except FileNotFoundError: pass
+    return p.returncode, p.stderr.decode(errors="replace")
+
+efd = os.eventfd(0, os.EFD_NONBLOCK)
+rc, err = run(efd)
+if rc != 0 or f"notify fd={efd}" not in err:
+    sys.exit(f"FAIL: eventfd not accepted (rc={rc})\n{err}")
+count = os.eventfd_read(efd)
+if count < 3:
+    sys.exit(f"FAIL: eventfd signalled {count} times, want >= 3 (one per publish)")
+print(f"   OK: eventfd accepted, signalled {count} times")
+
+r, w = os.pipe()
+rc, err = run(w)
+if rc != 0 or "is not an inherited eventfd" not in err:
+    sys.exit(f"FAIL: pipe not refused (rc={rc})\n{err}")
+print("   OK: pipe refused with a warning")
+PYEOF
+
+echo
 echo "ALL BOUNDARY VALIDATIONS PASSED ($ARCH)"
