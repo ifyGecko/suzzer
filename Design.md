@@ -274,8 +274,8 @@ src/
                         sorted patch_entry table; threading-hint enforcement
   patch.h               arm/disarm/lookup interface (shared by ST and MT)
   patch_st.c            ST patch engine: mprotect dance + memcpy
-  patch_mt.c            MT patch engine: /proc/self/mem + per-entry spinlock
-                        + membarrier(SYNC_CORE)
+  patch_mt.c            MT patch engine: RWX-once pages + single atomic store
+                        + per-entry spinlock + clear_cache + membarrier(SYNC_CORE)
   handler.h             trap-handler interface
   handler_st.c          ST trap handler (global g_last_restored)
   handler_mt.c          MT trap handler (TLS g_last_restored)
@@ -1141,65 +1141,93 @@ exhausts the signal stack.
 
 The lock is signal-safe by construction:
 
-- The critical section is just `pwrite + clear_cache + membarrier`
-  (single-digit microseconds), so bounded spin.
+- The critical section is just one atomic store + `clear_cache`
+  (the batched `membarrier` runs after the lock is released), so bounded
+  spin.
 - A thread never recursively acquires the same entry's lock: arm/disarm
   are called outside the trap PC's basic block. A secondary trap inside
   the critical section can only be for a *different* entry.
 - No syscall sleeps inside the lock that would risk deadlocking the
   caller's signal context.
 
-#### 17.2.4 Mprotect-free patching via `/proc/self/mem`
+#### 17.2.4 Patching: RWX-once pages + single atomic store
 
-Byte writes go through `pwrite(g_mem_fd, ...)` against `/proc/self/mem`.
-The kernel bypasses VMA permission checks on the self-PID, so we never
-have to temporarily make the code page writable. Peer threads keep
-executing on the unchanged `R|X` mapping with no perm-change window.
+At init `patch_mt.c` mprotects every page holding a patch site
+`R|W|X` once (never dropping `X`, so peer threads keep executing).
+After that, arm/disarm is a single single-copy-atomic store of the 2- or
+4-byte encoding -- no syscall on the hot path, and a peer fetching the
+site sees either the old or the new instruction, never a mix of bytes.
 
-If `/proc/self/mem` open fails (e.g. Yama LSM with `ptrace_scope=2`),
-`patch_mt.c` falls back to the mprotect dance with a logged warning.
+`pwrite(/proc/self/mem)` used to be the primary path. It tears: the
+kernel copies through `memcpy`, which stores 2-4 byte lengths byte by
+byte, and a peer could execute half UD2 and half original instruction
+(`0f 07` = SYSRET -> SIGSEGV; about 1 run in 10 of the 16-thread
+stress test). It is now only a fallback, used when the kernel refuses
+`R|W|X` (W^X-strict / SELinux execmod), and init logs a WARNING that
+writes are no longer atomic. If `/proc/self/mem` can't be opened
+either, the last resort is an `R|W|X` mprotect + `memcpy` dance.
 
-The fallback dance is serialized globally by `g_fallback_lock` (a
+The mprotect fallback is serialized globally by `g_fallback_lock` (a
 signal-safe spinlock matching the per-entry pattern). The per-entry
 `e->lock` from 17.2.3 is keyed on a `patch_entry`, but mprotect's
-permission bits are keyed on the page: with a large patch set, multiple
-entries commonly share a code page, and two threads patching different
-entries on the same page would otherwise race on the page protection --
-one thread restores `R|X` while the other's `memcpy` is still pending,
-faulting the in-flight writer. The `/proc/self/mem` path does not need
-this serialization because `pwrite` bypasses VMA permission checks.
+permission bits are keyed on the page: two threads patching different
+entries on the same page would otherwise race on the page protection.
 
-#### 17.2.5 Cross-CPU instruction-cache visibility
+#### 17.2.5 Cross-CPU instruction visibility
 
-After each successful byte write, `patch_mt.c` issues
-`membarrier(PRIVATE_EXPEDITED_SYNC_CORE)`. On Linux 4.16+, this IPIs
-every CPU the process has run on, forcing each one to serialize its
-pipeline; peer threads see the new bytes on their next fetch.
+Two separate steps, both required on weakly-ordered ISAs:
 
-On older kernels (< 4.16), `membarrier_init` logs that SYNC_CORE is
-unavailable and the runtime relies on the local `clear_cache` only.
-The residual race window on weakly-ordered ISAs is small but non-zero
-and documented in `src/membarrier.c`. A future enhancement (noted in
-TODO.md) is to broadcast a no-op signal (`tgkill SIGURG`) to every
-peer thread; the signal-return path performs an instruction-
-serializing barrier on most arches and works on much older kernels.
+1. **Cache maintenance, after every write:** `__builtin___clear_cache`
+   over the patched bytes (aarch64 `DC CVAU` + `IC IVAU`, broadcast to
+   the inner-shareable domain; the arm/mips/riscv cacheflush syscalls;
+   ppc `dcbst`/`icbi`). It compiles to nothing on x86, whose I-cache is
+   coherent.
+2. **Context synchronization, once per batch:**
+   `membarrier(PRIVATE_EXPEDITED_SYNC_CORE)` via
+   `patch_sync_batch_end()`. It IPIs every CPU running the process so
+   each one discards instructions it already fetched. On x86 the IPI's
+   `iret` is the serializing event SDM 8.1.3 asks for.
+
+`membarrier` does not do step 1. (An earlier version skipped
+`clear_cache` whenever SYNC_CORE was available, which could leave
+peers -- and the writer -- fetching stale bytes on non-coherent
+I-caches.)
+
+Without SYNC_CORE (Linux < 4.16, or arches that gained it later),
+`patch_mt.c` logs a WARNING at init on weakly-ordered ISAs and relies
+on step 1 alone; peers pick up the change at their next
+context-synchronizing event. A future enhancement (noted in TODO.md) is
+to broadcast a no-op signal (`tgkill`) to every peer thread; the
+signal-return path is context-synchronizing and works on much older
+kernels.
+
+**Residual architectural gap.** The trap design is fixed: sites raise
+SIGILL from an illegal encoding. Neither UD2 nor UDF is in the
+architectures' blessed cross-modification sets (x86 SDM 8.1.3; AArch64
+CMODX allows only B/BL/NOP/BRK/SVC/HVC/SMC/ISB). For a peer fetching
+the site at the exact moment of the store, the spec permits
+CONSTRAINED UNPREDICTABLE behaviour. The atomic store plus steps 1-2
+make this window as small as it can be; real-hardware MT validation
+(TODO.md) is what confirms it is harmless in practice.
 
 #### 17.2.6 Atomic-write argument by arch
 
-`patch_mt.c` writes the trap encoding as a single naturally-aligned
-store. For this to be single-copy-atomic on the host CPU:
+`patch_mt.c` writes the trap encoding as a single store. For this to be
+single-copy-atomic on the host CPU:
 
 | Arch                                         | Atomic-write width | Source of atomicity                |
 |----------------------------------------------|--------------------|------------------------------------|
 | aarch64, arm-ARM, mips, mips64, ppc, ppc64   | 4 bytes            | ARM ARM B2.2.1; MIPS, Power ISA    |
 | arm-Thumb, riscv64                           | 2 bytes            | Aligned half-word stores by ISA    |
-| x86_64                                       | 2 bytes (UD2 head) | Intel SDM Vol 3 Sec 8.1.1          |
+| x86_64                                       | 2 bytes (UD2 head) | Intel SDM Vol 3 Sec 8.1.1 (aligned, or unaligned within one cache line) |
 
 For x86 specifically, the patch is the leading 2-byte UD2 only; the
 remaining bytes of the original variable-length instruction are never
-touched. The generator's `--threading mt` mode also skips any x86
-candidate whose 2-byte write would straddle a 64-byte cache line
-(Intel does not guarantee atomicity in that case).
+touched. Sites need not be 2-aligned: an unaligned 16-bit store is
+still atomic when both bytes are in one 64-byte cache line, and
+`write_bytes()` uses a plain `movw` for it. The generator's
+`--threading mt` mode skips only candidates whose write would straddle
+a line, so x86 MT instruments the same sites as ST in practice.
 
 ### 17.3 Threading-hint enforcement
 
@@ -1281,13 +1309,14 @@ These are inherent to the present scope, not bugs:
    continuously; per-input scoping is the driver's responsibility.
 3. **No remote transport.** Coverage is local-only (shared memory). A
    relay binary is planned (see TODO.md).
-4. **No `pthread_sigmask`/`sigprocmask` interception.** A daemon that
-   blocks our trap signal at the thread-mask level will die on a
-   synchronous trap.
+4. **Raw signal syscalls bypass interception.** `sigaction`, `signal`,
+   `sigprocmask` and `pthread_sigmask` are interposed, but raw
+   `rt_sigaction`/`rt_sigprocmask` syscalls and the `bsd_signal`/
+   `sigset`/`__sysv_signal` aliases are not (see TODO.md).
 5. **W^X-strict kernels that refuse any transient writable mapping over
    text** will trip the ST patch path's `mprotect(R|W)`. The MT path
-   sidesteps this via `/proc/self/mem` on permissive kernels and falls
-   back to the same `R|W` mprotect dance on hardened kernels.
+   needs `R|W|X` once at init; if refused it falls back to non-atomic
+   `pwrite(/proc/self/mem)` with a WARNING (see 17.2.4).
 6. **MT cross-validation is limited under qemu-user.** qemu-user only
    invalidates its TCG translation cache on `mprotect` with a perm
    change, and that perm change strips `PROT_EXEC` long enough to

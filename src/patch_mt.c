@@ -22,12 +22,21 @@
  *      only a last-resort fallback for kernels that refuse R|W|X (W^X-strict
  *      / SELinux execmod), with a loud warning at init.
  *
- *  (3) Cross-CPU instruction-cache coherence: after each successful write,
- *      we call membarrier(PRIVATE_EXPEDITED_SYNC_CORE). On x86 this is a
- *      kernel no-op (the architecture is strongly ordered + I-cache is
- *      snoopy). On weak ISAs it IPIs every CPU the process has run on,
- *      forcing each one to serialize its pipeline; peer threads see the
- *      new bytes on their next fetch.
+ *  (3) Cross-CPU instruction visibility is two separate steps, and both
+ *      are required on weakly-ordered ISAs:
+ *
+ *      a. Cache maintenance, after EVERY write: __builtin___clear_cache
+ *         (aarch64 DC CVAU + IC IVAU, broadcast to the inner-shareable
+ *         domain; arm/mips/riscv cacheflush syscalls; ppc dcbst/icbi).
+ *         This makes the new bytes reachable by instruction fetch on
+ *         every core. It compiles to nothing on x86 (coherent I-cache).
+ *      b. Context synchronization, once per batch: membarrier(PRIVATE_
+ *         EXPEDITED_SYNC_CORE) IPIs every CPU running this process so
+ *         each one discards already-fetched/prefetched instructions.
+ *
+ *      membarrier does NOT do (a): an earlier version skipped clear_cache
+ *      whenever SYNC_CORE was active, which could leave peers -- and the
+ *      writer itself -- fetching stale bytes on non-coherent I-caches.
  *
  * Atomicity argument for the byte-write:
  *
@@ -41,19 +50,31 @@
  *
  *  - x86_64: the backend writes only 2 bytes (UD2 head) and
  *    libcov_max_patch_len is 2 (see tunables_x86_64.h). Intel SDM 8.1.1
- *    guarantees aligned 16-bit stores are atomic; the generator's
- *    --threading mt mode emits only even addresses.
+ *    guarantees 16-bit stores are atomic when aligned, and (P6 onward)
+ *    also when unaligned but contained in one cache line. We therefore
+ *    accept any address whose 2 bytes don't span a 64-byte line; the
+ *    generator's --threading mt mode applies the same rule.
  *
  * What we still don't claim:
  *
  *  - If the patch list contains addresses that violate the alignment
  *    assumption above, write_bytes() refuses the direct store and uses
  *    the (non-atomic) fallback path.
- *  - Architectural cross-modifying-code rules: x86 SDM 8.1.3 and the
- *    AArch64 CMODX list (which does not include UDF) do not bless
- *    concurrently rewriting an instruction another core is executing,
- *    even with an atomic store. We rely on the store being single-copy
- *    atomic plus membarrier(SYNC_CORE); see TODO.md.
+ *  - Architectural cross-modifying-code rules. The trap design is fixed
+ *    (SIGILL from an illegal encoding), and neither UD2 nor UDF is in
+ *    the architectures' blessed sets: x86 SDM 8.1.3 wants the executing
+ *    core to serialize before running modified code, and the AArch64
+ *    CMODX list (B/BL/NOP/BRK/SVC/HVC/SMC/ISB) excludes UDF. A peer that
+ *    is fetching the site at the exact moment of the store may, per the
+ *    spec, execute a CONSTRAINED UNPREDICTABLE mix. What we provide:
+ *      - the store is single-copy atomic, so no torn encoding is ever
+ *        in memory;
+ *      - (3a) + (3b) above, so once patch_sync_batch_end() returns every
+ *        CPU observes the new bytes (x86: SYNC_CORE's IPI + iret is the
+ *        serializing event SDM 8.1.3 asks for).
+ *    The residual window is a fetch racing the store itself. In practice
+ *    that fetch returns the old or the new word, never a mix; this is the
+ *    point the real-hardware MT validation (TODO.md) is meant to confirm.
  */
 #define _GNU_SOURCE
 #include "patch.h"
@@ -77,11 +98,9 @@ static int     g_initialized   = 0;
  * arm/disarm can use a direct atomic store. See header comment (2). */
 static int     g_direct        = 0;
 
-/* Cached at mt_init_once. When 1, membarrier(SYNC_CORE) covers the
- * writer's own CPU pipeline too -- so we can skip the per-write
- * __builtin___clear_cache and rely on a single trailing IPI. When 0,
- * each write must clear_cache locally and the trailing IPI is a no-op.
- * See patch_sync_batch_end() and the doc on patch.h's _unsynced variants. */
+/* Cached at mt_init_once. When 1, patch_sync_batch_end() issues one
+ * membarrier(SYNC_CORE) IPI per batch; when 0 it is a no-op and peers
+ * rely on the per-write clear_cache alone (see header comment (3)). */
 static int     g_have_sync_core = 0;
 
 /* Global spinlock that serializes the mprotect+write+mprotect dance in
@@ -173,7 +192,27 @@ static inline void fallback_unlock(void) {
 /* Single write of `len` bytes at `addr`. The byte sequence is staged in a
  * caller-provided buffer first so the arch backend's write_illegal can
  * still target a normal pointer. Returns 0 on success. */
+/* x86 cache-line size used for the unaligned-store atomicity rule. 64 on
+ * every x86_64 part; the generator uses the same constant. */
+#define LIBCOV_X86_CACHE_LINE 64
+
 static int write_bytes(uintptr_t addr, const void *src, size_t len) {
+#if defined(__x86_64__)
+    /* x86: a 16-bit store that stays inside one cache line is single-copy
+     * atomic even when unaligned (SDM 8.1.1). Plain `movw` rather than
+     * __atomic_store_n, which requires natural alignment. x86 stores are
+     * already release-ordered; the "memory" clobber stops the compiler
+     * reordering around it. */
+    if (g_direct && len == 2 &&
+        (addr & (LIBCOV_X86_CACHE_LINE - 1)) <= LIBCOV_X86_CACHE_LINE - 2) {
+        uint16_t v; memcpy(&v, src, 2);
+        __asm__ volatile ("movw %1, %0"
+                          : "=m" (*(volatile uint16_t *)addr)
+                          : "r" (v)
+                          : "memory");
+        return 0;
+    }
+#endif
     /* Primary path: one single-copy-atomic store into the R|W|X page. */
     if (g_direct && (addr % len) == 0 && (len == 2 || len == 4)) {
         if (len == 2) {
@@ -239,19 +278,16 @@ static inline void entry_unlock(struct patch_entry *e) {
     __atomic_store_n(&e->lock, 0, __ATOMIC_RELEASE);
 }
 
-/* Write-bytes core, no sync. On kernels without membarrier(SYNC_CORE)
- * we still need a writer-local clear_cache here so the writer's own CPU
- * sees the new bytes the next time it fetches; the trailing
- * patch_sync_batch_end() can then be a no-op. When SYNC_CORE is active
- * we skip clear_cache and rely on the IPI broadcast to serialize every
- * CPU (writer included) -- that's the A4 saving.
+/* Write-bytes core, no cross-core sync. Cache maintenance is done here
+ * unconditionally (header comment (3a)): membarrier(SYNC_CORE) only
+ * context-synchronizes CPUs, it does not clean the D-cache or invalidate
+ * the I-cache, so it cannot stand in for clear_cache on weak ISAs.
+ * Compiles to nothing on x86.
  *
  * Always inlined by gcc -O2 in practice; named for readability. */
 static inline int patch_write_inner(struct patch_entry *e, const void *bytes) {
     if (write_bytes(e->addr, bytes, e->len) != 0) return -1;
-    if (!g_have_sync_core) {
-        __builtin___clear_cache((char *)e->addr, (char *)e->addr + e->len);
-    }
+    __builtin___clear_cache((char *)e->addr, (char *)e->addr + e->len);
     return 0;
 }
 
@@ -286,12 +322,12 @@ int patch_disarm_unsynced(struct patch_entry *e) {
 }
 
 void patch_sync_batch_end(void) {
-    /* One IPI for the whole batch (handler trap pair, boundary rearm).
-     * No-op when membarrier isn't available -- in that case
-     * patch_write_inner already did a writer-local clear_cache per
-     * write, so peer threads on weakly-ordered ISAs still pick up the
-     * change on their next fetch (modulo the documented residual race
-     * window for the SYNC_CORE-less fallback path). */
+    /* One IPI for the whole batch (handler trap pair, boundary rearm):
+     * the context-synchronization step (3b). Cache maintenance (3a) was
+     * already done per write in patch_write_inner. No-op when membarrier
+     * isn't available; peers then pick the change up whenever they next
+     * context-synchronize (exception return, etc.), which on weakly-
+     * ordered ISAs is the documented residual window (init WARNING). */
     if (g_have_sync_core) membarrier_sync_core();
 }
 

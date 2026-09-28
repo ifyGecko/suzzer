@@ -64,7 +64,7 @@ the MT stress test fail against the pre-fix code.
   the memset, and the driver has an acquire fence before its re-check.
 - **Generator: blocks ending in a 1-byte instruction were dropped.** The
   terminator strategy now walks back to the last instruction of at least
-  2 bytes. Under MT it also walks back past odd addresses. `target_simple`
+  2 bytes. Under MT it also walks back past sites MT can't write atomically. `target_simple`
   MT went from 8 to 30 sites.
 - **Generator: busy-loop on a missing binary.** rzpipe spins at 100% CPU
   forever when rizin can't open a file. There is now an up-front check.
@@ -72,6 +72,16 @@ the MT stress test fail against the pre-fix code.
   is now refused.
 - **`gen_boundary.py --patchlist`** checks that every marker is a
   patched site, and shares `pick_terminator()` with gen_patchlist.
+- **MT skipped cache maintenance under SYNC_CORE** (`patch_mt.c`).
+  `membarrier(SYNC_CORE)` only context-synchronizes; it doesn't clean
+  the D-cache or invalidate the I-cache. `clear_cache` now runs after
+  every write (a no-op on x86), with one membarrier per batch.
+- **x86 MT dropped odd-address sites.** Unaligned 16-bit stores within
+  a cache line are atomic, so the runtime uses `movw` for them and the
+  generator only rejects line-straddling sites. MT now instruments the
+  same sites as ST (`target_simple_mt`: 45 → 57).
+- **Design.md §17.2** described `/proc/self/mem` as the primary MT
+  write path. Rewritten for RWX-once + atomic store.
 - **README drift.** Fixed: the 64 KB bitmap claims, the x86 patch
   length, the chaining claim, the missing coverage-model docs, the
   "threads scope iterations cleanly" claim, and the `LIBCOV_MODULE`
@@ -81,22 +91,18 @@ the MT stress test fail against the pre-fix code.
 
 ## P0
 
-- [ ] **Instruction-modification rules across CPUs.** The MT path now
-  does single-copy-atomic stores, but the architectures don't
-  guarantee it's safe to rewrite an instruction another core may be
-  executing:
-  - x86 SDM 8.1.3 requires the executing core to serialize.
-  - AArch64 CMODX only permits B/BL/NOP/BRK/SVC/HVC/SMC/ISB, and not UDF.
-
-  Options:
-  - Use per-arch trap encodings that are in the blessed sets: `BRK` on
-    aarch64 (SIGTRAP), and `INT3` on x86 (1 byte, always atomic, SIGTRAP
-    with RIP+1).
-  - Allow `LIBCOV_TRAP_SIGNO` per arch, plus a per-arch "PC adjust on
-    trap / rewind on return" hook in `arch.h`.
-
-  INT3 also fixes the x86 "block made only of 1-byte instructions" gap
-  (below). Validate on real hardware.
+- [ ] **Instruction-modification rules across CPUs.** Design
+  constraint: traps stay SIGILL from illegal encodings (no INT3/BRK).
+  Neither UD2 nor UDF is in the blessed cross-modification sets (x86
+  SDM 8.1.3; AArch64 CMODX), so a peer fetching a site at the instant
+  of the store is architecturally unpredictable. Done so far: the
+  store is single-copy atomic, cache maintenance runs after every
+  write, and `membarrier(SYNC_CORE)` context-synchronizes every core
+  per batch (Design.md §17.2.5). Remaining:
+  - confirm on real hardware that the residual window is harmless
+    (next item);
+  - `tgkill` broadcast fallback for kernels without SYNC_CORE (see
+    Backlog → MT).
 - [ ] **Real-hardware MT validation.** 9 of 11 backends are build-only in
   `run_cross_mt.sh`. The new RWX + atomic store path has only run on
   x86_64 hardware (and under qemu for x86_64 and aarch64). CI boards:
@@ -131,7 +137,9 @@ the MT stress test fail against the pre-fix code.
   The Review.md safety table now reflects this (it used to rate MT +
   boundaries as "safe").
 - [ ] **x86: blocks made only of 1-byte instructions are unpatchable**
-  (`leave; ret`, `pop; ret`, a lone `ret`). This is solved by INT3 (P0).
+  (`leave; ret`, `pop; ret`, a lone `ret`). A limit of the 2-byte UD2
+  encoding; now documented in README. A generator-side mitigation would
+  be patching the block's predecessor edge instead.
 - [ ] **Paired-mode semantics.** When both BEGIN and END fire, the gap
   between iterations (END → next BEGIN) is published as its own
   generation, so a driver sees two generations per input. Decide whether
@@ -238,13 +246,6 @@ the MT stress test fail against the pre-fix code.
   mid-transition.** It's correct today because the handler never reads
   `patched` for the trapping entry and relies on the cmpxchg. Write that
   invariant down in a comment. (Review M4)
-- [ ] **The MT direct-store path requires `addr % len == 0`.** x86
-  guarantees atomicity for unaligned 16-bit stores within a cache line,
-  so x86 could relax this to "doesn't cross a cache line" (an unaligned
-  `mov` via an `aligned(1)` typedef). The generator would then also stop
-  rejecting odd addresses (`mt_addr_safe` in `tools/gen_patchlist.py`),
-  and most of the remaining x86 MT site loss would go away. Moot if
-  INT3 lands (P0).
 - [ ] **ST still does two `mprotect` calls per arm/disarm.** It could use
   the same RWX-once approach as MT: much faster, with no transient
   non-executable window. The current approach is kept for W^X
@@ -315,9 +316,6 @@ the MT stress test fail against the pre-fix code.
 - [ ] Add an MT boundary test with more than one concurrent worker. It
   would expose the snapshot mixing (P1).
 - [ ] Add a raw `clone(2)` MT stress harness (carried over).
-- [ ] Audit `Design.md` §17 against the new MT write path and signal
-  handling. It still describes `/proc/self/mem` as the primary
-  mechanism.
 
 ---
 

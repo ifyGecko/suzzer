@@ -8,18 +8,21 @@
  *                               it; logs the result via libcov_logf.
  *
  *   membarrier_sync_core()   -- hot-path. After writing new instruction
- *                               bytes, this issues an IPI to every CPU the
- *                               process has run on, forcing each one to
- *                               serialize its instruction pipeline. Other
- *                               threads are guaranteed to see the new bytes
- *                               on their next fetch.
+ *                               bytes AND doing the cache maintenance
+ *                               (__builtin___clear_cache), this issues an
+ *                               IPI to every CPU running the process,
+ *                               forcing each one to context-synchronize
+ *                               (discard prefetched instructions). It does
+ *                               NOT clean/invalidate caches itself -- that
+ *                               is always the writer's job.
  *
  * Kernel floor:
- *   - PRIVATE_EXPEDITED_SYNC_CORE: Linux 4.16+. On x86_64 it's a no-op the
- *     kernel skips entirely (TSO + snoopy cache makes it unnecessary), but
- *     the call is still cheap (zero-IPI in that case).
- *   - On older kernels (< 4.16): no SYNC_CORE. We fall back to "writer
- *     thread's clear_cache only" and log a warning at init. The residual
+ *   - PRIVATE_EXPEDITED_SYNC_CORE: Linux 4.16+ (per-arch; riscv gained it
+ *     much later). On x86_64 the IPI's return path (iret) is the
+ *     serializing instruction SDM 8.1.3 requires before running
+ *     cross-modified code.
+ *   - Without SYNC_CORE we rely on the per-write clear_cache only and log
+ *     a warning at init. The residual
  *     race on weakly-ordered ISAs (aarch64/arm/mips/ppc/riscv) is small but
  *     non-zero: a peer thread that fetched ahead may execute the old bytes
  *     once before its I-cache picks up the change. For correctness it's
@@ -40,14 +43,11 @@ void membarrier_init(void);
 void membarrier_sync_core(void);
 
 /* Whether PRIVATE_EXPEDITED_SYNC_CORE was successfully registered. When
- * true, membarrier_sync_core() actually broadcasts an IPI that serializes
- * every CPU the process has run on -- including the writer's. When false,
- * membarrier_sync_core() is a no-op and the caller is responsible for
- * issuing __builtin___clear_cache() locally for the writer's CPU.
- *
- * patch_mt.c uses this to elide the local clear_cache() when the IPI
- * already covers it, and to elide the trailing membarrier when the IPI
- * isn't available. */
+ * true, membarrier_sync_core() broadcasts a context-synchronizing IPI.
+ * When false, it is a no-op. Either way the caller must already have
+ * issued __builtin___clear_cache() for every modified range. patch_mt.c
+ * uses this to elide the trailing membarrier when it isn't available
+ * and to decide whether to log the weak-ISA init WARNING. */
 int  membarrier_has_sync_core(void);
 
 #endif

@@ -8,8 +8,8 @@ threading variants are built as separate LEGO bricks:
 - **`libcov_mt.so`** -- thread-safe: per-thread TLS prev_loc, atomic
   saturating bitmap, atomic per-site state machine (spinlock-serialized
   writes), single-copy-atomic stores into code pages made R|W|X once at
-  init, and `membarrier(SYNC_CORE)` for cross-CPU instruction-cache
-  visibility.
+  init, then per-write cache maintenance plus `membarrier(SYNC_CORE)`
+  for cross-CPU instruction visibility.
 
 Both variants share the same backends across 11 architectures. Pick the
 brick that fits your target.
@@ -37,7 +37,7 @@ per-backend tunables header (see [Tunables](#tunables)).
 
 | Backend           | Default trap insn        | Patch len | Notes                                   |
 |-------------------|--------------------------|-----------|-----------------------------------------|
-| x86_64            | UD2 (`0F 0B`)            | 2         | Head-only; MT sites must be 2-aligned   |
+| x86_64            | UD2 (`0F 0B`)            | 2         | Head-only; MT sites can't span a 64B line |
 | aarch64           | UDF #0 (`0x00000000`)    | 4         |                                         |
 | arm (ARM mode)    | UDF `0xE7F000F0`         | 4         |                                         |
 | arm (Thumb mode)  | UDF.N `0xDE00`           | 2         | Per-function bits=16 detection          |
@@ -281,8 +281,9 @@ Two orthogonal axes:
   - Under `libcov_mt.so`: safe under arbitrary thread counts. Each
     thread leapfrogs through its own TLS `g_last_restored`; per-entry
     spinlocks serialize concurrent arm/disarm byte writes; the AFL
-    bitmap uses saturating atomic increments; cross-CPU instruction-
-    cache coherence comes from `membarrier(SYNC_CORE)`.
+    bitmap uses saturating atomic increments; cross-CPU instruction
+    visibility comes from `clear_cache` after each write plus one
+    `membarrier(SYNC_CORE)` per batch.
 
 **Boundary re-arm policy** (`LIBCOV_BOUNDARY_REARM`, ignored when no
 boundary list is loaded)
@@ -528,6 +529,15 @@ across runs are easier with ASLR off.
   TCG layer. MT correctness for the other 9 backends is established by
   build-and-link smoke + the per-arch atomic-write argument in
   `src/patch_mt.c`; real-hardware validation is a TODO.
+- **Cross-modifying code is outside the ISA guarantees.** Sites trap
+  with SIGILL from an illegal encoding by design, and neither UD2 nor
+  UDF is in the x86 (SDM 8.1.3) or AArch64 (CMODX) sets that may be
+  rewritten while another core executes them. `libcov_mt.so` narrows
+  the window as far as it can (single-copy-atomic store, cache
+  maintenance, `membarrier(SYNC_CORE)`); see `Design.md` §17.2.5.
+- **x86 blocks made only of 1-byte instructions** (`leave; ret`,
+  `pop; ret`, a lone `ret`) can't hold the 2-byte UD2 and are not
+  instrumented.
 - **No JIT/self-modifying code support.** Newly-generated code is not in
   the patch list and won't be instrumented.
 - **W^X-strict kernels.** `libcov_st.so` uses two `mprotect` calls per
@@ -558,7 +568,8 @@ src/
                       bounds); one per backend, every knob -D-overridable
   patch.h             arm/disarm/lookup + batch rearm interface (same ABI both variants)
   patch_st.c          ST: mprotect + memcpy + cache flush; batch rearm
-  patch_mt.c          MT: /proc/self/mem + per-entry spinlock + membarrier(SYNC_CORE);
+  patch_mt.c          MT: RWX-once atomic store + per-entry spinlock + clear_cache
+                      + membarrier(SYNC_CORE);
                       batch rearm
   handler.h           trap-handler interface
   handler_st.c        ST handler; global g_last_restored

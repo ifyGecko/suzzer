@@ -23,12 +23,12 @@ never touched. ST and MT use the same patch shape.
 Threading-mode selection (--threading):
   st (default) -- single-threaded libcov: arch-natural patch width
                   (x86=2, fixed-width 4-byte ISAs=4, Thumb/RV-C=2).
-  mt           -- multi-threaded libcov: same widths, plus alignment
-                  filtering so every site's write is a single naturally-
-                  aligned store (the largest atomic write each ISA
-                  guarantees). For x86, also skips any site whose 2-byte
-                  write would straddle a 64-byte cache line (Intel does
-                  not guarantee atomicity in that case).
+  mt           -- multi-threaded libcov: same widths, plus filtering so
+                  every site's write is a single-copy-atomic store. On
+                  fixed-width ISAs that means naturally aligned. On x86
+                  any address works except one whose 2-byte write would
+                  straddle a 64-byte cache line (Intel guarantees atomicity
+                  for unaligned 16-bit stores only within a line).
 
 Multi-module instrumentation:
   The positional `binary` is always module index 0 (typically the main
@@ -286,9 +286,9 @@ def mt_atomic_width(arch, fn_bits):
     aarch64, mips, mips64, ppc, ppc64: 4 (aligned word).
     riscv64: 2 (covers both c.unimp and the leading half of a 4-byte zero
              insn, both decode as illegal at the first 2 bytes).
-    x86:   2 (UD2 fits in 2 bytes; SDM guarantees aligned 16-bit stores
-             are atomic; we additionally require it not span a cache line,
-             enforced by the cache-line check below).
+    x86:   2 (UD2 fits in 2 bytes; SDM 8.1.1 guarantees 16-bit stores are
+             atomic when they don't span a cache line, aligned or not --
+             enforced by mt_addr_safe).
     """
     if arch == "arm":
         return 2 if fn_bits == 16 else 4
@@ -313,15 +313,15 @@ def mt_addr_safe(arch, addr, width):
     ISA rule, so the address-mod check is a tautology there; we still
     enforce it as a defensive guard against malformed rizin output.
 
-    For x86 only: also require the write not span a 64-byte cache line.
-    Intel SDM does not guarantee atomicity for accesses that cross a
-    cache-line boundary; a peer CPU could observe a partial write."""
-    if addr % width != 0:
-        return False
+    x86 is the exception: unaligned 16-bit stores are single-copy atomic
+    as long as they stay inside one 64-byte cache line (SDM 8.1.1), and
+    libcov_mt's write_bytes() uses a plain `movw` for them. Only a write
+    that spans a line is unsafe. The module load base is page-aligned, so
+    checking the link-time address is equivalent to checking the runtime
+    one. Keep the 64 in sync with LIBCOV_X86_CACHE_LINE in patch_mt.c."""
     if arch == "x86":
-        if (addr & 63) + width > 64:
-            return False
-    return True
+        return (addr & 63) + width <= 64
+    return addr % width == 0
 
 
 # ----------------------------------------------------------------------
@@ -617,7 +617,7 @@ def collect_module_records(args, rz, module_idx, module_name):
     mt_skipped_alignment = 0
     for fn in fns:
         # Let the terminator walk-back skip candidates MT would reject, so
-        # an odd-address x86 terminator falls back to an earlier, aligned
+        # a line-straddling x86 terminator falls back to an earlier
         # instruction instead of losing the whole block.
         ok = None
         if args.threading == "mt":
