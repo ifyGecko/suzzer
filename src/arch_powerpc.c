@@ -14,6 +14,7 @@
 #include <string.h>
 #include <asm/ptrace.h>   /* PT_NIP */
 #include "arch.h"
+#include "arch_ppc_emulate.h"
 #include "tunables_powerpc.h"
 
 const char    *libcov_arch_name     = LIBCOV_ARCH_PPC_NAME;
@@ -37,10 +38,11 @@ uintptr_t libcov_arch_pc_from_uctx(const ucontext_t *uc) {
     return (uintptr_t)uc->uc_mcontext.uc_regs->gregs[PT_NIP];
 }
 
-/* Marker emulation not implemented for this backend: markers use the
- * disarm + deferred re-arm protocol (see arch.h). */
+/* See arch_ppc_emulate.h for the supported forms. */
 int libcov_arch_emulate(ucontext_t *uc, uintptr_t addr,
                         const uint8_t *orig, uint8_t len) {
-    (void)uc; (void)addr; (void)orig; (void)len;
-    return 0;
+    if (!uc) return ppc_emulate(NULL, addr, orig, len);
+    unsigned long *g = (unsigned long *)uc->uc_mcontext.uc_regs->gregs;
+    struct ppc_regs r = { &g[PT_NIP], &g[PT_LNK], &g[PT_CTR], &g[PT_CCR] };
+    return ppc_emulate(&r, addr, orig, len);
 }

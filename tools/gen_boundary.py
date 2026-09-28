@@ -56,36 +56,49 @@ def rizin_json(binary, cmds):
     return json.loads(raw)
 
 
-def get_image_base(binary):
-    info = rizin_json(binary, ["ij"])
-    return int(info["bin"]["baddr"])
+def get_image_info(binary):
+    info = rizin_json(binary, ["ij"])["bin"]
+    return int(info["baddr"]), info.get("arch"), int(info.get("bits", 0))
 
 
 def get_function_addrs(binary):
-    """Return dict of {function_name: absolute_entry_addr} covering both
-    symbol-table names and rizin's analysis names (sym.foo, dbg.foo, etc)."""
+    """Return ({name: entry}, {name: vaddr}): rizin's analysed functions
+    (sym.foo, dbg.foo, fcn.*), and symbol-table names as a fallback. The
+    two are kept apart because on ppc64 ELFv1 a bare symbol like `foo`
+    is the .opd function descriptor (data), not the code at dbg.foo."""
     fns = {}
     raw = rizin_json(binary, ["aaa", "aflj"]) or []
     for f in raw:
         name = f.get("name", "")
         if name:
             fns[name] = int(f["offset"])
-    syms = rizin_json(binary, ["isj"]) or []
-    for s in syms:
+    syms = {}
+    for s in rizin_json(binary, ["isj"]) or []:
         name = s.get("name", "")
         vaddr = s.get("vaddr")  # imports lack vaddr
         if name and vaddr:
-            fns.setdefault(name, int(vaddr))
-    return fns
+            syms[name] = int(vaddr)
+    return fns, syms
 
 
-def resolve(name, fns):
-    if name in fns:
-        return fns[name]
-    for prefix in ("dbg.", "sym.", "sym.imp.", "fcn."):
-        if (prefix + name) in fns:
-            return fns[prefix + name]
+def resolve(name, fns, syms):
+    for table in (fns, syms):
+        if name in table:
+            return table[name]
+        for prefix in ("dbg.", "sym.", "sym.imp.", "fcn."):
+            if (prefix + name) in table:
+                return table[prefix + name]
     raise KeyError(name)
+
+
+def local_entry(fn_addr, fns):
+    """PPC64 ELFv2: rizin splits a function with a TOC setup into an
+    8-byte global entry and a separate function at +8 (the local entry,
+    which direct calls use). A marker in the global-entry stub never fires
+    on a direct call, so use the local entry -- the same function
+    gen_patchlist.py adds as `<name>[local]`."""
+    starts = set(fns.values())
+    return fn_addr + 8 if (fn_addr + 8) in starts else fn_addr
 
 
 def first_bb_terminator(binary, fn_addr):
@@ -168,8 +181,8 @@ def main():
     args = ap.parse_args()
     patched = patchlist_offsets(args.patchlist) if args.patchlist else None
 
-    baddr = get_image_base(args.binary)
-    fns = get_function_addrs(args.binary)
+    baddr, arch, bits = get_image_info(args.binary)
+    fns, syms = get_function_addrs(args.binary)
     if args.verbose:
         print(f"image base: 0x{baddr:x}", file=sys.stderr)
         print(f"functions: {len(fns)}", file=sys.stderr)
@@ -177,7 +190,9 @@ def main():
     records = []
     for spec in args.specs:
         name, kind, depth = parse_spec(spec)
-        fn_addr = resolve(name, fns)
+        fn_addr = resolve(name, fns, syms)
+        if arch == "ppc" and bits == 64:
+            fn_addr = local_entry(fn_addr, fns)
         term = first_bb_terminator(args.binary, fn_addr)
         if term is None:
             sys.exit(f"could not find first-BB terminator for {name} @ 0x{fn_addr:x}")

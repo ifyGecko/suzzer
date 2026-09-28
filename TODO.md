@@ -167,6 +167,19 @@ the MT stress test fail against the pre-fix code.
   both ways (native and aarch64 under qemu); inverting either decoder's
   condition fails it. `run_validation_boundary_mt.sh` now demands >= 97%
   at 2/4/8 workers and still covers the fallback with emulation off.
+- **Marker emulators for arm/Thumb, riscv64, powerpc, powerpc64.**
+  Same contract as x86_64/aarch64 (branches plus NOPs; the PPC decoder is
+  shared in `arch_ppc_emulate.h`). `run_validation_marker_emulation.sh`
+  now runs under qemu for every one of them (ST; Thumb via
+  `target_markers_thumb`), and inverting each decoder's condition fails
+  it. Three bugs fixed on the way:
+  - LCVB1 sidecars were read without byte-swapping, so boundaries never
+    loaded on big-endian targets (`boundary: bad version 16777216`);
+  - on ppc64 ELFv1, `gen_boundary.py` resolved a bare name to its `.opd`
+    descriptor instead of the code;
+  - on ppc64 ELFv2, it put the marker in the 8-byte global-entry stub,
+    which direct calls skip. It now uses the local entry, as
+    gen_patchlist does.
 - **README drift.** Fixed: the 64 KB bitmap claims, the x86 patch
   length, the chaining claim, the missing coverage-model docs, the
   "threads scope iterations cleanly" claim, and the `LIBCOV_MODULE`
@@ -200,11 +213,14 @@ the MT stress test fail against the pre-fix code.
   has disarmed doesn't trap for thread B until it's re-armed, so B's
   coverage there is missed. Markers are solved on x86_64/aarch64 by
   emulation (see the fixed list). Remaining:
-  - Marker emulators for arm/Thumb, riscv64 (c.beqz/c.bnez/beq..),
-    powerpc/ppc64 (bc with CR/CTR), mips (delay slots make this hard;
-    MIPS markers use the entry strategy, so a non-branch is likely).
-    Without one, markers there miss ~5-30% of boundaries with 4-8
-    workers.
+  - MIPS markers still use disarm + re-arm (emulating a branch means
+    executing its delay slot). Worse, `gen_boundary.py` puts the marker on
+    the first block's terminator while MIPS patches at entry, so on MIPS
+    a marker usually isn't a patched site at all (`--patchlist` catches
+    it). Make gen_boundary use the entry strategy on MIPS.
+  - ppc64 ELFv1: rizin doesn't see -O2 functions that start with a
+    `nop` (it finds `fcn.<entry+4>`), so they get no sites and no
+    marker. Affects gen_patchlist too.
   - For coverage sites: consider a "re-arm after K traps process-wide"
     policy, or accept and keep documenting that MT is sampled coverage.
 - [ ] **x86: blocks made only of 1-byte instructions are unpatchable**
@@ -310,6 +326,9 @@ the MT stress test fail against the pre-fix code.
 ## P2: tests and docs
 
 - [ ] Add a raw `clone(2)` MT stress harness (carried over).
+- [ ] The top-level Makefile has no header dependencies: editing a
+  header (tunables, `arch_ppc_emulate.h`, ...) doesn't rebuild the
+  objects. Add `-MMD -MP`.
 
 ---
 

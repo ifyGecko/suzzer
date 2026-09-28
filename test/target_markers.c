@@ -9,12 +9,15 @@
  * disarming them, so a wrong emulation takes the wrong arm. Every arm
  * records a letter into a trace; main prints the trace, which must be
  * identical with and without libcov. The branches are shaped to cover
- * the forms the emulators decode:
+ * the forms the emulators decode (as built by test/Makefile, gcc 14):
  *
- *   m_short: x86 jcc rel8        / aarch64 b.cond
- *   m_near:  x86 jcc rel32 (the skipped arm is > 127 bytes)
- *   m_bit:   -O2: x86 test+jcc   / aarch64 tbz/tbnz
- *   m_zero:  -O2: x86 test+jcc   / aarch64 cbz/cbnz
+ *   m_short: x86 jcc rel8 / aarch64 b.cond / arm beq / Thumb beq (T1)
+ *   m_near:  x86 jcc rel32 (the skipped arm is > 127 bytes) / Thumb beq.w (T3)
+ *   m_bit:   -O2: x86 test+jcc / aarch64 tbz/tbnz / Thumb bpl
+ *   m_zero:  -O2: x86 test+jcc / aarch64 cbz/cbnz / Thumb cbz
+ *
+ * riscv64 compiles every marker to beqz (beq rs, x0) and powerpc/ppc64 to
+ * bc on a CR bit (bt/bf eq).
  *
  * Each of the n iterations calls every marker once: 4n boundary fires.
  */

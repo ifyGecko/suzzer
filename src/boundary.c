@@ -34,6 +34,7 @@
 #include "tunables.h"   /* LIBCOV_MARKER_REARM_TIMEOUT_NS */
 #include "arch.h"       /* libcov_arch_emulate */
 
+#include <endian.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -257,25 +258,27 @@ static int load_sidecar(const char *path, uintptr_t module_base) {
         libcov_logf("boundary: bad magic in %s", path);
         munmap(map, st.st_size); return -1;
     }
-    if (h->version != LIBCOV_BOUNDARY_VERSION) {
-        libcov_logf("boundary: bad version %u", h->version);
+    /* LCVB1 is little-endian on disk, like LCV3 (config.c). */
+    uint32_t version = le32toh(h->version), count = le32toh(h->count);
+    if (version != LIBCOV_BOUNDARY_VERSION) {
+        libcov_logf("boundary: bad version %u", version);
         munmap(map, st.st_size); return -1;
     }
-    size_t need = sizeof(*h) + (size_t)h->count * sizeof(struct lcvb_record);
+    size_t need = sizeof(*h) + (size_t)count * sizeof(struct lcvb_record);
     if ((size_t)st.st_size < need) {
-        libcov_logf("boundary: truncated (count=%u)", h->count);
+        libcov_logf("boundary: truncated (count=%u)", count);
         munmap(map, st.st_size); return -1;
     }
 
-    g_markers = calloc(h->count, sizeof(struct marker));
+    g_markers = calloc(count, sizeof(struct marker));
     if (!g_markers) { munmap(map, st.st_size); return -1; }
-    g_marker_count = h->count;
+    g_marker_count = count;
 
     const struct lcvb_record *rec =
         (const struct lcvb_record *)((const char *)map + sizeof(*h));
     int saw_end = 0, saw_filter = 0;
     for (size_t i = 0; i < g_marker_count; i++) {
-        g_markers[i].addr         = module_base + (uintptr_t)rec[i].offset;
+        g_markers[i].addr         = module_base + (uintptr_t)le64toh(rec[i].offset);
         g_markers[i].kind         = rec[i].kind;
         g_markers[i].depth_filter = rec[i].depth_filter;
         if (rec[i].kind == LIBCOV_BOUNDARY_KIND_END) saw_end = 1;

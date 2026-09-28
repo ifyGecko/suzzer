@@ -400,13 +400,22 @@ and the live bitmap itself.
   marker) keep emitting into the shared bitmap at `bitmap_offset`, which
   under MT boundary mode is a cumulative map of non-iteration coverage.
   (Under ST boundary mode that area is unused.)
-- **Markers are emulated (x86_64, aarch64).** The trap handler performs
-  the marker's original instruction itself -- a branch (x86 `jmp`/`jcc`
-  rel8/rel32; aarch64 `b`, `bl`, `b.cond`, `cbz`/`cbnz`, `tbz`/`tbnz`) or
-  a NOP-like hint (`endbr64`, `nop`, `bti`) -- and moves the PC past it,
-  so the marker is never disarmed and no worker can pass it untrapped.
-  Init logs `N of M marker(s) emulated`. `LIBCOV_BOUNDARY_EMULATE=0`
-  turns this off.
+- **Markers are emulated (every backend but MIPS).** The trap handler
+  performs the marker's original instruction itself and moves the PC
+  past it, so the marker is never disarmed and no worker can pass it
+  untrapped. Supported forms:
+  - x86_64: `jmp`/`jcc` rel8/rel32, `endbr64`, `nop`;
+  - aarch64: `b`, `bl`, `b.cond`, `cbz`/`cbnz`, `tbz`/`tbnz`, `nop`, `bti`;
+  - arm: `b`/`bl` (any condition), `nop`; Thumb: `b` (all four
+    encodings), `bl`, `cbz`/`cbnz`, `nop`/`nop.w`, IT blocks honoured;
+  - riscv64: `jal`, `jalr`, `beq`..`bgeu`, `nop`, and the compressed
+    `c.j`, `c.jr`, `c.jalr`, `c.beqz`/`c.bnez`, `c.nop`;
+  - powerpc, powerpc64: `b`/`bl`/`ba`, `bc` (CR and CTR forms), `bclr`
+    (`blr`), `bcctr` (`bctr`), `nop`.
+
+  MIPS branches have delay slots, so MIPS markers always use the fallback
+  below. Init logs `N of M marker(s) emulated`.
+  `LIBCOV_BOUNDARY_EMULATE=0` turns this off.
 - **Other markers are re-armed process-wide** (other backends, or an
   instruction the emulator doesn't decode): by any thread's trap, once
   every thread that trapped on the marker has trapped again somewhere
@@ -420,8 +429,8 @@ and the live bitmap itself.
   until no thread trapped and boundaries stopped.)
 - **MT coverage is sampled.** A site one thread has disarmed doesn't
   trap for another until it's re-armed. Emulated markers are exempt:
-  measured on `target_loop_mt`, every boundary is captured with 2, 4 and
-  8 workers. A non-emulated marker is missed while another worker holds
+  measured on `target_loop_mt` (x86_64), every boundary is captured with
+  2, 4 and 8 workers. A non-emulated marker is missed while another worker holds
   it disarmed, and two iterations merge into one snapshot: ~1-3% of
   boundaries with 2 workers, ~5-20% with 4, ~20-30% with 8. Snapshots
   never mix threads.
@@ -661,7 +670,8 @@ test/
                               branch-type classification
   run_validation_o2pie.sh     -O2 PIE builds of target_simple/target_dispatch under ST+MT
   run_validation_marker_emulation.sh  marker emulation: branch traces unchanged, one
-                              boundary per marker call (ARCH=aarch64 runs under qemu)
+                              boundary per marker call (ARCH=<arch> runs under qemu;
+                              ST only except x86_64/aarch64)
   run_all.sh                  suite runner behind `make test`
   shm_bitmap.py               reads the live bitmap using the shm header (size,
                               offset and byte order vary)
@@ -721,7 +731,8 @@ make THREADING=mt
 # -O2 PIE targets (tail calls, cold splits, jump tables, ASLR):
 ./test/run_validation_o2pie.sh
 
-# Boundary-marker emulation (also: ARCH=aarch64 under qemu):
+# Boundary-marker emulation (also ARCH=aarch64|arm|riscv64|powerpc|
+# powerpc64|powerpc64le under qemu):
 ./test/run_validation_marker_emulation.sh
 
 # All backends, ST, under qemu-user-static:

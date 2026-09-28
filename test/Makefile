@@ -76,12 +76,15 @@ $(BUILD)/target_dispatch_o2pie: target_dispatch.c
 $(BUILD)/target_markers: target_markers.c
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -o $@ $<
 
-# Thumb variant: only built when explicitly asked (make thumb).
+# Thumb variants: only built when explicitly asked (make thumb).
 $(BUILD)/target_simple_thumb: target_simple.c
 	$(CC) $(CFLAGS) -no-pie -fno-stack-protector -mthumb -o $@ $<
 
+$(BUILD)/target_markers_thumb: target_markers.c
+	$(CC) $(CFLAGS) -no-pie -fno-stack-protector -mthumb -o $@ $<
+
 .PHONY: thumb
-thumb: $(BUILD)/target_simple_thumb
+thumb: $(BUILD)/target_simple_thumb $(BUILD)/target_markers_thumb
 
 # Driver pulls struct definitions from ../src/{boundary,sink}.h for the
 # shm layout; no separate header install step needed.
@@ -125,7 +128,7 @@ $(BUILD)/target_multimod: target_multimod.c libmultimod_helper.h \
 
 clean:
 	rm -rf $(BUILD)/target_simple $(BUILD)/target_orderable $(BUILD)/target_dispatch \
-	       $(BUILD)/target_markers \
+	       $(BUILD)/target_markers $(BUILD)/target_markers_thumb \
 	       $(BUILD)/target_simple_o2pie $(BUILD)/target_dispatch_o2pie $(BUILD)/target_simple_thumb \
 	       $(BUILD)/target_simple_mt $(BUILD)/target_loop \
 	       $(BUILD)/target_loop_mt $(BUILD)/ring_dump \

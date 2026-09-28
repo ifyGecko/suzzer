@@ -3,6 +3,7 @@
 
     shm_bitmap.py extract <shm> <out>   write the live bitmap to <out>
     shm_bitmap.py stats   <shm>         print "<nonzero> <sum> <max>"
+    shm_bitmap.py gen     <shm>         print the header's gen_current
 
 The bitmap is not a fixed 64 KB at offset 72: the site-id model sizes it
 from the patch count, and the header's size and byte order follow the
@@ -21,14 +22,25 @@ import struct
 import sys
 
 
+def byte_order(data):
+    for order in ("<", ">"):
+        if struct.unpack_from(order + "H", data, 4)[0] == 1:
+            return order
+    sys.exit("shm_bitmap: unknown header version")
+
+
+def gen_current(data):
+    # u64 @ 24: the first 8-byte field, after 20 bytes of smaller ones.
+    # Every supported ABI (including arm EABI and ppc32) aligns it to 8.
+    if data[:4] != b"LCVS":
+        sys.exit("shm_bitmap: no LCVS header")
+    return struct.unpack_from(byte_order(data) + "Q", data, 24)[0]
+
+
 def live_bitmap(data):
     if data[:4] != b"LCVS":
         return data
-    for order in ("<", ">"):
-        if struct.unpack_from(order + "H", data, 4)[0] == 1:
-            break
-    else:
-        sys.exit("shm_bitmap: unknown header version")
+    order = byte_order(data)
     ring_size, map_size, slot_stride = struct.unpack_from(order + "HII", data, 6)
     hdr_size = len(data) - map_size - ring_size * slot_stride
     if hdr_size < 24 or hdr_size > 256:
@@ -37,10 +49,14 @@ def live_bitmap(data):
 
 
 def main():
-    if len(sys.argv) < 3 or sys.argv[1] not in ("extract", "stats"):
+    if len(sys.argv) < 3 or sys.argv[1] not in ("extract", "stats", "gen"):
         sys.exit(__doc__)
     with open(sys.argv[2], "rb") as f:
-        bm = live_bitmap(f.read())
+        data = f.read()
+    if sys.argv[1] == "gen":
+        print(gen_current(data))
+        return
+    bm = live_bitmap(data)
     if sys.argv[1] == "extract":
         with open(sys.argv[3], "wb") as f:
             f.write(bm)
