@@ -415,7 +415,8 @@ and the live bitmap itself.
     (`blr`), `bcctr` (`bctr`), `nop`.
 
   MIPS branches have delay slots, so MIPS markers always use the fallback
-  below. Init logs `N of M marker(s) emulated`.
+  below (they sit on the function's entry instruction, matching the
+  generator's MIPS entry strategy). Init logs `N of M marker(s) emulated`.
   `LIBCOV_BOUNDARY_EMULATE=0` turns this off.
 - **Other markers are re-armed process-wide** (other backends, or an
   instruction the emulator doesn't decode): by any thread's trap, once
@@ -515,8 +516,10 @@ uint8_t  reserved[6];
 ```
 
 All little-endian. `tools/gen_boundary.py` emits this. The generator
-resolves a function name to the last >= 2-byte instruction of its FIRST
-basic block (the same address `gen_patchlist.py` would pick for that BB).
+resolves a function name to the site `gen_patchlist.py` would pick for its
+FIRST basic block under the same `--strategy` (default: the arch's): the
+last >= 2-byte instruction under `terminator`, the first instruction
+under `entry` (the MIPS default, which skips branch delay slots).
 Pass `--patchlist <lcv>` to have it verify each marker really is a patched
 site (filters, slicing and MT alignment can all exclude it).
 
@@ -674,8 +677,8 @@ test/
                               branch-type classification
   run_validation_o2pie.sh     -O2 PIE builds of target_simple/target_dispatch under ST+MT
   run_validation_marker_emulation.sh  marker emulation: branch traces unchanged, one
-                              boundary per marker call (ARCH=<arch> runs under qemu;
-                              ST only except x86_64/aarch64)
+                              boundary per marker call (ARCH=<arch> runs under qemu,
+                              MIPS included; ST only except x86_64/aarch64)
   run_all.sh                  suite runner behind `make test`
   shm_bitmap.py               reads the live bitmap using the shm header (size,
                               offset and byte order vary)
@@ -692,7 +695,8 @@ tools/
                       ppc64 local-entry-aware); --threading st|mt;
                       --module name:path adds auxiliary modules
   gen_boundary.py     rizin-based LCVB1 sidecar generator; resolves symbol
-                      names to their first-BB terminator
+                      names to their first-BB site (terminator, or entry
+                      on MIPS)
   mutate.py           generic AFL++-style mutation engine (library + CLI):
                       stdlib-only, weighted havoc + splice, AFL-format
                       dictionaries, user-defined StructuredInsert
@@ -736,7 +740,8 @@ make THREADING=mt
 ./test/run_validation_o2pie.sh
 
 # Boundary-marker emulation (also ARCH=aarch64|arm|riscv64|powerpc|
-# powerpc64|powerpc64le under qemu):
+# powerpc64|powerpc64le under qemu; ARCH=mips|mipsel|mips64|mips64el
+# checks the non-emulated fallback):
 ./test/run_validation_marker_emulation.sh
 
 # All backends, ST, under qemu-user-static:

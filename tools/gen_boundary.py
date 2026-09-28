@@ -6,13 +6,15 @@ Boundary markers tell libcov "this address means a new iteration has
 started." The marker set is per-target and orthogonal to the patch list;
 this script lets you generate one from a small list of symbol names.
 
-Each named function is resolved to the last patchable (>= 2 byte)
-instruction of its FIRST basic block -- the same address gen_patchlist.py
-picks with its terminator strategy -- so the marker coincides with a
+Each named function is resolved to the site gen_patchlist.py would pick
+for its FIRST basic block, using the same strategy (--strategy, default
+the arch's): the last patchable (>= 2 byte) instruction under
+"terminator", the first instruction (second, if it is a delay slot) under
+"entry", which is the MIPS default. The marker then coincides with a
 patched site. Without that, the trap never fires and the boundary never
 publishes. Pass --patchlist to verify this against the actual patch list
-(recommended: include/exclude filters, --root slicing, MT alignment and
-MIPS entry strategy can all leave the chosen address unpatched).
+(recommended: include/exclude filters, --root slicing and MT alignment
+can all leave the chosen address unpatched).
 
 Output layout matches src/boundary.h:
   header: magic[4]='LCVB', version=1, count, flags
@@ -38,7 +40,8 @@ import sys
 
 sys.dont_write_bytecode = True  # no tools/__pycache__ from the import below
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gen_patchlist import pick_terminator  # noqa: E402
+from gen_patchlist import (default_strategy, op_class, pick_entry,  # noqa: E402
+                           pick_terminator)
 
 
 def rizin(binary, cmds):
@@ -101,17 +104,18 @@ def local_entry(fn_addr, fns):
     return fn_addr + 8 if (fn_addr + 8) in starts else fn_addr
 
 
-def first_bb_terminator(binary, fn_addr):
-    """Return the absolute address of the last instruction of the first
-    basic block of the function at fn_addr.
+def first_bb_site(binary, fn_addr, strategy, is_mips):
+    """Return the absolute address gen_patchlist.py would patch for the
+    first basic block of the function at fn_addr under `strategy`.
 
-    gen_patchlist.py patches each BB's last instruction. For a boundary
-    marker to actually fire (trap), it must point at a patched site -- so
-    we pick the same address gen_patchlist would pick for this function's
-    first BB. For a one-BB function shaped like the canonical `iter_begin`
-    shim that's the function's terminator; for multi-BB functions it's
-    the first branch terminator. Either way, "execution reached this
-    address" means "the function was entered." """
+    For a boundary marker to actually fire (trap), it must point at a
+    patched site -- so we pick the same address gen_patchlist would pick
+    for this function's first BB. Under "terminator", for a one-BB
+    function shaped like the canonical `iter_begin` shim that's the
+    function's terminator; for multi-BB functions it's the first branch
+    terminator. Under "entry" (MIPS) it's the function's first
+    instruction. Either way, "execution reached this address" means "the
+    function was entered." """
     blocks = rizin_json(binary, ["aaa", f"afbj @ {fn_addr}"]) or []
     if not blocks:
         return None
@@ -133,7 +137,13 @@ def first_bb_terminator(binary, fn_addr):
     insns = rizin_json(binary, ["aaa", f"pdj {n} @ {int(first['addr'])}"]) or []
     if not insns:
         return None
-    pick = pick_terminator(insns)
+    if strategy == "entry":
+        start = int(first["addr"])
+        prev = rizin_json(binary, ["aaa", f"pdj 1 @ {start - 4}"]) if is_mips else None
+        in_slot = bool(prev) and op_class(prev[0].get("type")) is not None
+        pick = pick_entry(insns, in_slot)
+    else:
+        pick = pick_terminator(insns)
     return int(pick["offset"]) if pick else None
 
 
@@ -177,14 +187,23 @@ def main():
     ap.add_argument("--patchlist", metavar="LCV",
                     help="verify every marker lands on a site in this LCV3 "
                          "patch list (module 0); exit non-zero if not")
+    ap.add_argument("--strategy", choices=["auto", "entry", "terminator"],
+                    default="auto",
+                    help="marker site selection; must match the patch list's "
+                         "gen_patchlist.py --strategy (auto = arch default: "
+                         "entry on MIPS, terminator elsewhere)")
     ap.add_argument("--verbose", "-v", action="store_true")
     args = ap.parse_args()
     patched = patchlist_offsets(args.patchlist) if args.patchlist else None
 
     baddr, arch, bits = get_image_info(args.binary)
+    strategy = (args.strategy if args.strategy != "auto"
+                else default_strategy(arch, bits))
+    if arch == "mips" and strategy == "terminator":
+        sys.exit("error: --strategy terminator is unsafe on MIPS (delay slots); use entry")
     fns, syms = get_function_addrs(args.binary)
     if args.verbose:
-        print(f"image base: 0x{baddr:x}", file=sys.stderr)
+        print(f"image base: 0x{baddr:x} strategy={strategy}", file=sys.stderr)
         print(f"functions: {len(fns)}", file=sys.stderr)
 
     records = []
@@ -193,16 +212,16 @@ def main():
         fn_addr = resolve(name, fns, syms)
         if arch == "ppc" and bits == 64:
             fn_addr = local_entry(fn_addr, fns)
-        term = first_bb_terminator(args.binary, fn_addr)
-        if term is None:
-            sys.exit(f"could not find first-BB terminator for {name} @ 0x{fn_addr:x}")
-        offset = term - baddr
+        site = first_bb_site(args.binary, fn_addr, strategy, arch == "mips")
+        if site is None:
+            sys.exit(f"could not find a first-BB {strategy} site for {name} @ 0x{fn_addr:x}")
+        offset = site - baddr
         if patched is not None and offset not in patched:
             sys.exit(f"error: marker {name} at off=0x{offset:x} is not a patched "
                      f"site in {args.patchlist}; the boundary would never fire")
         records.append((offset, kind, depth))
         if args.verbose:
-            print(f"  marker {name} entry=0x{fn_addr:x} term=0x{term:x} "
+            print(f"  marker {name} entry=0x{fn_addr:x} site=0x{site:x} "
                   f"off=0x{offset:x} kind={kind} depth={depth}",
                   file=sys.stderr)
 

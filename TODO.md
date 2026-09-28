@@ -188,6 +188,13 @@ the MT stress test fail against the pre-fix code.
   signal if it uses it. `run_validation_mt.sh`, `_boundary_mt.sh` and
   `_signals.sh` run with it forced (target handler, default action,
   `SIG_IGN` before exec, a peer blocking every signal).
+- **MIPS markers weren't patched sites.** `gen_boundary.py` put the
+  marker on the first block's terminator while MIPS patches block
+  entries, so on every MIPS backend the boundary never fired. It now
+  shares `pick_entry()` with gen_patchlist and follows the same
+  `--strategy` (entry on MIPS). `run_validation_marker_emulation.sh`
+  now runs for mips, mipsel, mips64 and mips64el under qemu (fallback,
+  0 emulated) and fails against the old generator.
 - **README drift.** Fixed: the 64 KB bitmap claims, the x86 patch
   length, the chaining claim, the missing coverage-model docs, the
   "threads scope iterations cleanly" claim, and the `LIBCOV_MODULE`
@@ -220,10 +227,7 @@ the MT stress test fail against the pre-fix code.
   coverage there is missed. Markers are solved on x86_64/aarch64 by
   emulation (see the fixed list). Remaining:
   - MIPS markers still use disarm + re-arm (emulating a branch means
-    executing its delay slot). Worse, `gen_boundary.py` puts the marker on
-    the first block's terminator while MIPS patches at entry, so on MIPS
-    a marker usually isn't a patched site at all (`--patchlist` catches
-    it). Make gen_boundary use the entry strategy on MIPS.
+    executing its delay slot).
   - ppc64 ELFv1: rizin doesn't see -O2 functions that start with a
     `nop` (it finds `fcn.<entry+4>`), so they get no sites and no
     marker. Affects gen_patchlist too.

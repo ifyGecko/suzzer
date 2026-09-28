@@ -13,6 +13,11 @@
 #     2. every marker call fired a boundary (gen_current == markers * n);
 #     3. the log reports every marker emulated (or 0 when disabled).
 #
+# MIPS (mips, mipsel, mips64, mips64el) doesn't emulate markers (delay
+# slots), so there both runs use the fallback and expect 0 emulated; the
+# check that matters is that every marker lands on a patched entry site
+# and fires.
+#
 # ARCH=<cross arch> runs that build under qemu-<arch>-static. MT runs only
 # natively and for aarch64: qemu-user's translation cache can't follow
 # MT's in-place patching on the other backends (README, Limitations).
@@ -28,11 +33,15 @@ declare -A QEMU=(
   [aarch64]=qemu-aarch64-static   [arm]=qemu-arm-static
   [powerpc]=qemu-ppc-static       [powerpc64]=qemu-ppc64-static
   [powerpc64le]=qemu-ppc64le-static [riscv64]=qemu-riscv64-static
+  [mips]=qemu-mips-static         [mipsel]=qemu-mipsel-static
+  [mips64]=qemu-mips64-static     [mips64el]=qemu-mips64el-static
 )
 declare -A SYSROOT=(
   [aarch64]=/usr/aarch64-linux-gnu   [arm]=/usr/arm-linux-gnueabihf
   [powerpc]=/usr/powerpc-linux-gnu   [powerpc64]=/usr/powerpc64-linux-gnu
   [powerpc64le]=/usr/powerpc64le-linux-gnu [riscv64]=/usr/riscv64-linux-gnu
+  [mips]=/usr/mips-linux-gnu         [mipsel]=/usr/mipsel-linux-gnu
+  [mips64]=/usr/mips64-linux-gnuabi64 [mips64el]=/usr/mips64el-linux-gnuabi64
 )
 if [[ "$ARCH" == "$(uname -m)" ]]; then
     RUN=()

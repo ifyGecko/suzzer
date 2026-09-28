@@ -293,6 +293,19 @@ def pick_terminator(insns, ok=None):
     return None
 
 
+def pick_entry(insns, in_delay_slot):
+    """Return the instruction to patch for a block under the entry
+    strategy, or None. Normally the block's first instruction; if the
+    block starts in a MIPS branch delay slot (the instruction before it is
+    a branch), the second one -- trapping in a delay slot reports the
+    branch's PC and resumes at the branch.
+
+    gen_boundary.py uses this same helper so MIPS boundary markers stay
+    co-located with patched sites."""
+    idx = 1 if in_delay_slot else 0
+    return insns[idx] if idx < len(insns) else None
+
+
 def pick_sites(rz, fn, strategy, arch, ok=None):
     is_mips = arch in ("mips", )
     blocks = rz.cmdj(f"afbj @ {fn['offset']}") or []
@@ -307,12 +320,9 @@ def pick_sites(rz, fn, strategy, arch, ok=None):
             continue
 
         if strategy == "entry":
-            idx = 0
-            if is_mips and _is_branch_at(rz, addr - 4):
-                idx = 1
-                if idx >= len(insns):
-                    continue
-            pick = insns[idx]
+            pick = pick_entry(insns, is_mips and _is_branch_at(rz, addr - 4))
+            if pick is None:
+                continue
         else:
             pick = pick_terminator(insns, ok)
             if pick is None:
