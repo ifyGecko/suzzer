@@ -35,6 +35,13 @@
  * The header is always present; the ring stays unused (zeroed, SHM_FLAG_ACTIVE
  * clear) when LIBCOV_BOUNDARY_LIST is unset, so drivers wanting a single
  * cumulative bitmap (legacy use) only read `bitmap_offset`-relative data.
+ *
+ * When boundaries ARE active the `bitmap_offset` region's meaning depends on
+ * the threading variant, so the header advertises it: in ST boundary mode
+ * emits rotate through ring slots and the `bitmap_offset` region stays zero
+ * (SHM_FLAG_LIVE_EMPTY set -- a legacy driver must read the ring); in MT
+ * boundary mode `bitmap_offset` still accumulates non-worker/pre-first-boundary
+ * coverage (LIVE_EMPTY clear). See boundary.h for the flag bits.
  */
 #ifndef LIBCOV_SINK_H
 #define LIBCOV_SINK_H

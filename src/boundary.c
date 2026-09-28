@@ -438,12 +438,19 @@ int boundary_init(void) {
     libcov_bitmap = slot_bitmap(first_slot);
 #endif
 
-    uint32_t mt_flag = 0;
+    uint32_t mode_flags = 0;
 #if defined(LIBCOV_THREADING_MT)
-    mt_flag = LIBCOV_SHM_FLAG_MT;
+    /* MT: hdr->bitmap_offset still accumulates non-worker / pre-first-boundary
+     * coverage, so it is meaningful -- do not set LIVE_EMPTY. */
+    mode_flags = LIBCOV_SHM_FLAG_MT;
+#else
+    /* ST: emits now rotate through ring slots (libcov_bitmap was repointed
+     * above); the hdr->bitmap_offset region stays zero. Tell legacy
+     * cumulative-bitmap drivers to read the ring instead. */
+    mode_flags = LIBCOV_SHM_FLAG_LIVE_EMPTY;
 #endif
     __atomic_or_fetch(&g_hdr->flags,
-                      LIBCOV_SHM_FLAG_ACTIVE | mt_flag,
+                      LIBCOV_SHM_FLAG_ACTIVE | mode_flags,
                       __ATOMIC_RELEASE);
     g_enabled = 1;
 

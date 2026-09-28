@@ -125,6 +125,8 @@ import sys
 
 import rzpipe
 
+from rz_resolve import resolve_to_offset
+
 
 # Functions excluded from instrumentation by default: PLT/import
 # thunks and CRT/init stubs, none of which are meaningful coverage
@@ -427,76 +429,8 @@ def mt_addr_safe(arch, addr, width):
 # Selective instrumentation: symbol resolution + call-graph BFS.
 # ----------------------------------------------------------------------
 
-def _parse_int_maybe(tok):
-    """Try to parse `tok` as an integer (hex with 0x prefix, plain hex of
-    >=4 chars, or decimal). Return int on success, None on failure.
-
-    The >=4-char heuristic for unprefixed hex avoids treating short
-    identifiers like 'fd' as addresses."""
-    s = tok.strip()
-    try:
-        if s.startswith(("0x", "0X")):
-            return int(s, 16)
-        if s.isdigit():
-            return int(s)
-        if len(s) >= 4 and all(c in "0123456789abcdefABCDEF" for c in s):
-            return int(s, 16)
-    except ValueError:
-        pass
-    return None
-
-
-def resolve_to_offset(token, all_fns):
-    """Resolve a user-supplied symbol-or-address token to a function entry
-    offset and its rizin function dict.
-
-    Accepts:
-      - hex address ('0x401234'), plain-hex address ('401234'), decimal.
-        Addresses inside a function (not at entry) resolve to the
-        enclosing function's entry, with a note printed to stderr.
-      - Exact rizin function name from aflj ('dbg.main', 'sym.classify').
-      - Bare name: tries 'dbg.', 'sym.', 'fcn.', 'sym.imp.' prefixes,
-        then a suffix match against the last dotted segment of every
-        function name.
-
-    Raises ValueError if unresolvable or if a suffix match is ambiguous.
-    """
-    addr = _parse_int_maybe(token)
-    if addr is not None:
-        for f in all_fns:
-            if int(f["offset"]) == addr:
-                return int(f["offset"]), f
-        # not a function entry -- find enclosing function by largest offset <= addr
-        best = None
-        for f in all_fns:
-            o = int(f["offset"])
-            if o <= addr and (best is None or o > int(best["offset"])):
-                best = f
-        if best is not None:
-            print(f"note: address 0x{addr:x} not a function entry; "
-                  f"using enclosing fn {best['name']} at 0x{int(best['offset']):x}",
-                  file=sys.stderr)
-            return int(best["offset"]), best
-        raise ValueError(f"address {token} not within any known function")
-
-    # exact name match
-    for f in all_fns:
-        if f["name"] == token:
-            return int(f["offset"]), f
-    # common-prefix tries
-    for prefix in ("dbg.", "sym.", "fcn.", "sym.imp."):
-        candidate = prefix + token
-        for f in all_fns:
-            if f["name"] == candidate:
-                return int(f["offset"]), f
-    # last-segment suffix match (e.g. user said 'main', match 'dbg.main')
-    matches = [f for f in all_fns if f["name"].rsplit(".", 1)[-1] == token]
-    if len(matches) == 1:
-        return int(matches[0]["offset"]), matches[0]
-    if len(matches) > 1:
-        names = ", ".join(m["name"] for m in matches)
-        raise ValueError(f"ambiguous symbol '{token}': matches {names}")
-    raise ValueError(f"could not resolve '{token}' to any function")
+# resolve_to_offset / parse_int_maybe live in rz_resolve.py so gen_boundary.py
+# resolves names identically (shared prefix + suffix matching).
 
 
 def count_indirect_transfers(rz, offsets):

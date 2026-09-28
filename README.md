@@ -137,6 +137,16 @@ The shm region (header + bitmap + snapshot ring) is written to `/tmp/cov`
 the same file/SHM and reads hit-counts. **Read `map_size` and
 `bitmap_offset` from the header** -- the bitmap is not a fixed 64 KB.
 
+**Boundary mode and the live bitmap.** When boundaries are active
+(`LIBCOV_SHM_FLAG_ACTIVE` set), whether the live bitmap at `bitmap_offset`
+is meaningful depends on the threading variant, and the header says which:
+in the **ST** build emits rotate through ring slots and `bitmap_offset`
+stays zero -- the header sets `LIBCOV_SHM_FLAG_LIVE_EMPTY`, and a legacy
+cumulative-bitmap driver must read the ring (below) instead. In the **MT**
+build `bitmap_offset` still accumulates non-worker / pre-first-boundary
+coverage (flag clear). With boundaries off, `bitmap_offset` is the single
+cumulative map as before.
+
 ## Selective instrumentation (call-graph slicing)
 
 Real-world fuzz targets rarely need every function in the binary

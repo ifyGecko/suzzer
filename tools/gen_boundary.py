@@ -42,6 +42,7 @@ sys.dont_write_bytecode = True  # no tools/__pycache__ from the import below
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gen_patchlist import (default_strategy, fix_elfv1_nop_entries,  # noqa: E402
                            op_class, pick_entry, pick_terminator)
+from rz_resolve import resolve_to_offset  # noqa: E402
 
 
 def rizin(binary, cmds):
@@ -65,34 +66,48 @@ def get_image_info(binary):
 
 
 def get_function_addrs(binary):
-    """Return ({name: entry}, {name: vaddr}): rizin's analysed functions
-    (sym.foo, dbg.foo, fcn.*), and symbol-table names as a fallback. The
-    two are kept apart because on ppc64 ELFv1 a bare symbol like `foo`
-    is the .opd function descriptor (data), not the code at dbg.foo."""
+    """Return ({name: entry}, {name: vaddr}, all_fns): rizin's analysed
+    functions (sym.foo, dbg.foo, fcn.*) as a name->entry dict, symbol-table
+    names as a fallback dict, and the analysed functions as an
+    [{"offset", "name"}] list in the shape resolve_to_offset() expects. The
+    dicts are kept apart because on ppc64 ELFv1 a bare symbol like `foo` is
+    the .opd function descriptor (data), not the code at dbg.foo."""
     fns = {}
+    all_fns = []
     raw = rizin_json(binary, ["aaa", "aflj"]) or []
     raw = fix_elfv1_nop_entries(lambda c: rizin_json(binary, [c]), raw)
     for f in raw:
         name = f.get("name", "")
         if name:
-            fns[name] = int(f["offset"])
+            off = int(f["offset"])
+            fns[name] = off
+            all_fns.append({"offset": off, "name": name})
     syms = {}
     for s in rizin_json(binary, ["isj"]) or []:
         name = s.get("name", "")
         vaddr = s.get("vaddr")  # imports lack vaddr
         if name and vaddr:
             syms[name] = int(vaddr)
-    return fns, syms
+    return fns, syms, all_fns
 
 
-def resolve(name, fns, syms):
-    for table in (fns, syms):
-        if name in table:
-            return table[name]
-        for prefix in ("dbg.", "sym.", "sym.imp.", "fcn."):
-            if (prefix + name) in table:
-                return table[prefix + name]
-    raise KeyError(name)
+def resolve(name, all_fns, syms):
+    """Resolve `name` to an entry address. Uses the shared resolve_to_offset
+    against the analysed functions first (so gen_boundary and gen_patchlist
+    resolve names identically, including prefix and suffix matching), then
+    falls back to the symbol table for names rizin didn't analyse as
+    functions. Raises ValueError if unresolvable."""
+    try:
+        off, _ = resolve_to_offset(name, all_fns)
+        return off
+    except ValueError:
+        pass
+    if name in syms:
+        return syms[name]
+    for prefix in ("dbg.", "sym.", "sym.imp.", "fcn."):
+        if (prefix + name) in syms:
+            return syms[prefix + name]
+    raise ValueError(f"could not resolve '{name}' to a function or symbol")
 
 
 def local_entry(fn_addr, fns):
@@ -168,14 +183,46 @@ DEPTH_MAP = {"any": 0, "zero": 1}
 
 
 def parse_spec(spec):
+    """Parse SYM[:kind[:depth_filter]] -- kind in {begin,end} (default begin),
+    depth_filter in {any,zero} (default any).
+
+    For the common case of a name without '::', the fields are positional
+    (SYM[:kind[:depth]]) with strict validation, so a typo like 'foo:beign'
+    gives a precise "bad kind" error. When the name contains '::' (C++), kind
+    and depth are matched from the RIGHT against their fixed vocab so the name
+    survives: 'ns::fn' -> name 'ns::fn'; 'ns::fn:begin:zero' -> name 'ns::fn',
+    kind begin, depth zero. The one ambiguous case -- a '::' name literally
+    ending in ':begin'/':end' -- must be written with an explicit trailing
+    kind (e.g. 'ns::weird:end:begin')."""
+    if "::" not in spec:
+        parts = spec.split(":")
+        if len(parts) > 3:
+            raise ValueError(f"too many ':' fields in spec {spec!r} "
+                             f"(want SYM[:kind[:depth_filter]])")
+        name = parts[0]
+        kind = parts[1] if len(parts) > 1 else "begin"
+        depth = parts[2] if len(parts) > 2 else "any"
+        if not name:
+            raise ValueError(f"empty symbol in spec {spec!r}")
+        if kind not in KIND_MAP:
+            raise ValueError(f"bad kind {kind!r} (want begin|end)")
+        if depth not in DEPTH_MAP:
+            raise ValueError(f"bad depth_filter {depth!r} (want any|zero)")
+        return name, KIND_MAP[kind], DEPTH_MAP[depth]
+
+    # C++ symbol: consume a trailing depth only when a kind precedes it, then a
+    # trailing kind, and rejoin the rest (which keeps the '::') as the name.
     parts = spec.split(":")
-    name = parts[0]
-    kind = parts[1] if len(parts) > 1 else "begin"
-    depth = parts[2] if len(parts) > 2 else "any"
-    if kind not in KIND_MAP:
-        raise ValueError(f"bad kind {kind!r} (want begin|end)")
-    if depth not in DEPTH_MAP:
-        raise ValueError(f"bad depth_filter {depth!r} (want any|zero)")
+    kind = "begin"
+    depth = "any"
+    if len(parts) >= 3 and parts[-1] in DEPTH_MAP and parts[-2] in KIND_MAP:
+        depth = parts.pop()
+        kind = parts.pop()
+    elif len(parts) >= 2 and parts[-1] in KIND_MAP:
+        kind = parts.pop()
+    name = ":".join(parts)
+    if not name:
+        raise ValueError(f"empty symbol in spec {spec!r}")
     return name, KIND_MAP[kind], DEPTH_MAP[depth]
 
 
@@ -202,15 +249,18 @@ def main():
                 else default_strategy(arch, bits))
     if arch == "mips" and strategy == "terminator":
         sys.exit("error: --strategy terminator is unsafe on MIPS (delay slots); use entry")
-    fns, syms = get_function_addrs(args.binary)
+    fns, syms, all_fns = get_function_addrs(args.binary)
     if args.verbose:
         print(f"image base: 0x{baddr:x} strategy={strategy}", file=sys.stderr)
         print(f"functions: {len(fns)}", file=sys.stderr)
 
     records = []
     for spec in args.specs:
-        name, kind, depth = parse_spec(spec)
-        fn_addr = resolve(name, fns, syms)
+        try:
+            name, kind, depth = parse_spec(spec)
+            fn_addr = resolve(name, all_fns, syms)
+        except ValueError as e:
+            sys.exit(f"error: {e}")
         if arch == "ppc" and bits == 64:
             fn_addr = local_entry(fn_addr, fns)
         site = first_bb_site(args.binary, fn_addr, strategy, arch == "mips")

@@ -70,6 +70,12 @@ struct lcvb_record {
 #define LIBCOV_SHM_VERSION      1u
 #define LIBCOV_SHM_FLAG_ACTIVE  (1u << 0)  /* boundaries active */
 #define LIBCOV_SHM_FLAG_MT      (1u << 1)  /* MT-variant libcov */
+/* Set when the live bitmap at bitmap_offset is NOT maintained and a driver
+ * must read the ring instead. Set in ST boundary mode (emits go straight into
+ * ring slots; the bitmap_offset region stays zero). Clear in MT boundary mode
+ * (bitmap_offset accumulates non-worker/pre-first-boundary coverage) and with
+ * boundaries off (bitmap_offset is the cumulative map). */
+#define LIBCOV_SHM_FLAG_LIVE_EMPTY (1u << 2)
 
 struct libcov_shm_header {
     char     magic[4];

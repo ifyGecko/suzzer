@@ -239,6 +239,10 @@ int main(int argc, char **argv) {
 
     volatile struct libcov_shm_header *hdr = shm_base;
     int waited_ms = 0;
+    /* This driver reads per-iteration snapshots from the ring, so it works in
+     * both ST and MT boundary mode. A legacy driver that reads only the live
+     * bitmap at bitmap_offset should first check LIBCOV_SHM_FLAG_LIVE_EMPTY:
+     * when set (ST boundary mode) that region is zero and it must read the ring. */
     while (!(__atomic_load_n((uint32_t *)&hdr->flags, __ATOMIC_ACQUIRE)
              & LIBCOV_SHM_FLAG_ACTIVE)) {
         if (waited_ms >= 500) {

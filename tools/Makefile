@@ -50,12 +50,15 @@ $(BUILD):
 
 # Single translation unit. No external deps -- not libpthread, not
 # libatomic, not librt, not libdl. Whatever embedded toolchain you have
-# should be able to build it.
+# should be able to build it. -MMD -MP emits a .d sidecar so editing a
+# header libdemalloc.c includes rebuilds it; -include'd below.
 $(LIB): libdemalloc.c | $(BUILD)
-	$(CC) $(CFLAGS) -fPIC -shared -Wl,-z,now -o $@ $<
+	$(CC) $(CFLAGS) -MMD -MP -fPIC -shared -Wl,-z,now -o $@ $<
+
+-include $(wildcard $(BUILD)/*.d)
 
 clean:
-	rm -f $(LIB)
+	rm -f $(LIB) $(BUILD)/*.d
 
 print-vars:
 	@echo "ARCH=$(ARCH) CROSS=$(CROSS) BUILD=$(BUILD)"

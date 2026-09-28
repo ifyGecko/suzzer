@@ -8,6 +8,11 @@ BUILD ?= ../build/$(ARCH)
 CC      := $(CROSS)gcc
 CFLAGS  ?= -O0 -g -Wall -Wextra
 
+# Emit a .d sidecar per output so editing a header (directly or transitively,
+# e.g. tunables.h via sink.h) rebuilds the dependent target. -include'd below.
+DEPFLAGS := -MMD -MP
+CFLAGS   += $(DEPFLAGS)
+
 .PHONY: all clean mt loop demalloc multimod o2pie
 
 all: $(BUILD)/target_simple $(BUILD)/target_loop $(BUILD)/target_orderable \
@@ -60,7 +65,7 @@ $(BUILD)/target_dispatch: target_dispatch.c
 # Every other target is -O0 -no-pie; real targets have tail calls, cold
 # splits, jump tables and shrink-wrapped prologues, and a load base that
 # moves under ASLR.
-O2PIE_CFLAGS := -O2 -g -Wall -fPIE -pie -fno-stack-protector
+O2PIE_CFLAGS := -O2 -g -Wall -fPIE -pie -fno-stack-protector $(DEPFLAGS)
 ifeq ($(ARCH),arm)
   O2PIE_CFLAGS += -marm
 endif
@@ -94,7 +99,7 @@ thumb: $(BUILD)/target_simple_thumb $(BUILD)/target_markers_thumb
 # powerpc). On 64-bit arches __atomic_load_8 is inline and the library
 # stays unlinked.
 $(BUILD)/fuzz_driver: fuzz_driver.c ../src/boundary.h ../src/sink.h
-	$(CC) -O2 -g -Wall -Wextra -I../src -o $@ fuzz_driver.c \
+	$(CC) -O2 -g -Wall -Wextra $(DEPFLAGS) -I../src -o $@ fuzz_driver.c \
 	    -Wl,--as-needed -latomic
 
 $(BUILD)/target_simple_mt: target_simple_mt.c
@@ -106,7 +111,7 @@ $(BUILD)/target_loop_mt: target_loop_mt.c
 # Passive ring reader for targets that iterate on their own
 # (run_validation_boundary_mt.sh). Same build shape as fuzz_driver.
 $(BUILD)/ring_dump: ring_dump.c ../src/boundary.h
-	$(CC) -O2 -g -Wall -Wextra -I../src -o $@ ring_dump.c \
+	$(CC) -O2 -g -Wall -Wextra $(DEPFLAGS) -I../src -o $@ ring_dump.c \
 	    -Wl,--as-needed -latomic
 
 # target_demalloc deliberately keeps the libc allocator behavior under
@@ -126,6 +131,10 @@ $(BUILD)/target_multimod: target_multimod.c libmultimod_helper.h \
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -I. -o $@ target_multimod.c \
 	    -L$(BUILD) -lmultimod_helper -Wl,-rpath,$(abspath $(BUILD))
 
+# Pull in the generated header dependencies (-MMD -MP above). Wildcard so a
+# missing/first build is fine; files live next to their targets in $(BUILD).
+-include $(wildcard $(BUILD)/*.d)
+
 clean:
 	rm -rf $(BUILD)/target_simple $(BUILD)/target_orderable $(BUILD)/target_dispatch \
 	       $(BUILD)/target_markers $(BUILD)/target_markers_thumb \
@@ -133,4 +142,5 @@ clean:
 	       $(BUILD)/target_simple_mt $(BUILD)/target_loop \
 	       $(BUILD)/target_loop_mt $(BUILD)/ring_dump \
 	       $(BUILD)/target_demalloc $(BUILD)/fuzz_driver \
-	       $(BUILD)/target_multimod $(BUILD)/libmultimod_helper.so
+	       $(BUILD)/target_multimod $(BUILD)/libmultimod_helper.so \
+	       $(BUILD)/*.d
