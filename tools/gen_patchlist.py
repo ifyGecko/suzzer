@@ -187,7 +187,41 @@ def get_bin_info(rz):
 
 def get_all_functions(rz):
     """Unfiltered function list from `aflj`. Caller filters via regex."""
-    return rz.cmdj("aflj") or []
+    return fix_elfv1_nop_entries(rz.cmdj, rz.cmdj("aflj") or [])
+
+
+def fix_elfv1_nop_entries(cmdj, fns):
+    """PPC64 ELFv1: rizin doesn't recognise a function whose body starts
+    with a `nop` (common at -O2). It finds the code from entry+4 as an
+    anonymous `fcn.<entry+4>`, so name filters, --root and gen_boundary
+    can't find it. Rename each such function after the symbol whose .opd
+    descriptor points at its entry -- `dbg.<name>` if rizin named other
+    functions from DWARF, else `sym.<name>`. The offset stays at entry+4:
+    the nop falls through, so the function's blocks and sites are those
+    rizin found. `cmdj` runs a rizin command and returns parsed JSON.
+    Returns `fns` (modified in place)."""
+    opd = next((s for s in cmdj("iSj") or [] if s.get("name") == ".opd"), None)
+    if opd is None:
+        return fns
+    lo, hi = int(opd["vaddr"]), int(opd["vaddr"]) + int(opd.get("vsize", 0))
+    by_off = {int(f["offset"]): f for f in fns}
+    prefix = "dbg." if any(f.get("name", "").startswith("dbg.") for f in fns) else "sym."
+    for s in cmdj("isj") or []:
+        desc = s.get("vaddr")
+        if s.get("type") != "FUNC" or not desc or not lo <= int(desc) < hi:
+            continue
+        raw = cmdj(f"pxj 8 @ {int(desc)}") or []
+        if len(raw) != 8:
+            continue
+        entry = int.from_bytes(bytes(raw), "big")  # ELFv1 is big-endian
+        f = by_off.get(entry + 4)
+        if entry in by_off or f is None or not f.get("name", "").startswith("fcn."):
+            continue
+        insn = cmdj(f"pdj 1 @ {entry}") or []
+        if not insn or insn[0].get("type") != "nop":
+            continue
+        f["name"] = prefix + s["name"]
+    return fns
 
 
 def filter_functions(all_fns, include_re, exclude_re):

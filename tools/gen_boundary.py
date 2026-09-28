@@ -40,8 +40,8 @@ import sys
 
 sys.dont_write_bytecode = True  # no tools/__pycache__ from the import below
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gen_patchlist import (default_strategy, op_class, pick_entry,  # noqa: E402
-                           pick_terminator)
+from gen_patchlist import (default_strategy, fix_elfv1_nop_entries,  # noqa: E402
+                           op_class, pick_entry, pick_terminator)
 
 
 def rizin(binary, cmds):
@@ -71,6 +71,7 @@ def get_function_addrs(binary):
     is the .opd function descriptor (data), not the code at dbg.foo."""
     fns = {}
     raw = rizin_json(binary, ["aaa", "aflj"]) or []
+    raw = fix_elfv1_nop_entries(lambda c: rizin_json(binary, [c]), raw)
     for f in raw:
         name = f.get("name", "")
         if name:

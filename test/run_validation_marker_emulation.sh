@@ -60,10 +60,9 @@ case "$ARCH" in
 esac
 TARGETS=(target_markers)
 [[ "$ARCH" == arm ]] && TARGETS+=(target_markers_thumb)
-# ppc64 ELFv1 (BE): rizin doesn't recognise m_zero, whose -O2 body starts
-# with a nop, as a function, so neither generator can place its marker.
+# On ppc64 ELFv1 (BE) m_zero's -O2 body starts with a nop, which rizin
+# misses; the generators recover its name from the .opd descriptor.
 MARKERS=(m_short m_near m_bit m_zero)
-[[ "$ARCH" == powerpc64 ]] && MARKERS=(m_short m_near m_bit)
 NM=${#MARKERS[@]}
 
 need=("$B/libcov_st.so")

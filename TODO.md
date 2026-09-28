@@ -195,6 +195,12 @@ the MT stress test fail against the pre-fix code.
   `--strategy` (entry on MIPS). `run_validation_marker_emulation.sh`
   now runs for mips, mipsel, mips64 and mips64el under qemu (fallback,
   0 emulated) and fails against the old generator.
+- **ppc64 ELFv1 functions starting with a `nop` were anonymous.** rizin
+  finds an -O2 body that opens with a `nop` as `fcn.<entry+4>`, so name
+  filters, `--root` and gen_boundary couldn't find it. Both generators
+  now rename it after the symbol whose `.opd` descriptor points at the
+  entry (`fix_elfv1_nop_entries()`). `run_validation_marker_emulation.sh`
+  now checks `m_zero` on powerpc64 too (4/4 markers emulated).
 - **README drift.** Fixed: the 64 KB bitmap claims, the x86 patch
   length, the chaining claim, the missing coverage-model docs, the
   "threads scope iterations cleanly" claim, and the `LIBCOV_MODULE`
@@ -228,9 +234,6 @@ the MT stress test fail against the pre-fix code.
   emulation (see the fixed list). Remaining:
   - MIPS markers still use disarm + re-arm (emulating a branch means
     executing its delay slot).
-  - ppc64 ELFv1: rizin doesn't see -O2 functions that start with a
-    `nop` (it finds `fcn.<entry+4>`), so they get no sites and no
-    marker. Affects gen_patchlist too.
   - For coverage sites: consider a "re-arm after K traps process-wide"
     policy, or accept and keep documenting that MT is sampled coverage.
 - [ ] **x86: blocks made only of 1-byte instructions are unpatchable**

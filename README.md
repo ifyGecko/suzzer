@@ -191,6 +191,11 @@ to be instrumented.
   another `--root` at the callee. Every `--root` run prints how many
   indirect calls and jumps the slice contains, and `--print-reachable`
   marks the functions that have them.
+- **ppc64 ELFv1 functions whose body starts with a `nop`** show up in
+  rizin as `fcn.<entry+4>`. Both generators rename them after their
+  `.opd` symbol (`dbg.NAME`, or `sym.NAME` without DWARF), so name
+  filters, `--root` and markers work; `--print-reachable` shows the
+  entry+4 address.
 - **Tail calls** lowered to `jmp` may or may not appear as `CALL`
   callrefs depending on rizin's classification. Verify a suspect slice
   with `--print-reachable`.
