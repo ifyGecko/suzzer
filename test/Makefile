@@ -11,7 +11,7 @@ CFLAGS  ?= -O0 -g -Wall -Wextra
 .PHONY: all clean mt loop demalloc multimod o2pie
 
 all: $(BUILD)/target_simple $(BUILD)/target_loop $(BUILD)/target_orderable \
-     $(BUILD)/target_dispatch $(BUILD)/fuzz_driver
+     $(BUILD)/target_dispatch $(BUILD)/target_markers $(BUILD)/fuzz_driver
 
 # pthread MT stress target + multi-worker boundary target and its ring
 # reader. Built on demand by the MT validation scripts.
@@ -72,6 +72,10 @@ $(BUILD)/target_simple_o2pie: target_simple.c
 $(BUILD)/target_dispatch_o2pie: target_dispatch.c
 	$(CC) $(O2PIE_CFLAGS) -o $@ $<
 
+# Boundary-marker emulation (run_validation_marker_emulation.sh).
+$(BUILD)/target_markers: target_markers.c
+	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -o $@ $<
+
 # Thumb variant: only built when explicitly asked (make thumb).
 $(BUILD)/target_simple_thumb: target_simple.c
 	$(CC) $(CFLAGS) -no-pie -fno-stack-protector -mthumb -o $@ $<
@@ -121,6 +125,7 @@ $(BUILD)/target_multimod: target_multimod.c libmultimod_helper.h \
 
 clean:
 	rm -rf $(BUILD)/target_simple $(BUILD)/target_orderable $(BUILD)/target_dispatch \
+	       $(BUILD)/target_markers \
 	       $(BUILD)/target_simple_o2pie $(BUILD)/target_dispatch_o2pie $(BUILD)/target_simple_thumb \
 	       $(BUILD)/target_simple_mt $(BUILD)/target_loop \
 	       $(BUILD)/target_loop_mt $(BUILD)/ring_dump \

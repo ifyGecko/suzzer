@@ -110,6 +110,10 @@ struct patchlist_record {
  * leapfrog and bulk re-arm paths skip them (re-arming a marker another
  * thread is still inside the handler for makes that thread re-trap).
  *
+ * `emulate` is set by boundary_init on markers whose original instruction
+ * the arch backend can execute in software (libcov_arch_emulate): the
+ * handler performs it and advances the PC, so the site is never disarmed.
+ *
  * `touched` is set while the entry sits in boundary.c's REARM=touched
  * queue, so each disarmed site is queued at most once.
  *
@@ -127,6 +131,7 @@ struct patch_entry {
     uint8_t   lock;
     uint8_t   marker;
     uint8_t   touched;
+    uint8_t   emulate;
     uint32_t  site_id;
 };
 

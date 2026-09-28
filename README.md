@@ -215,6 +215,7 @@ to be instrumented.
 | `LIBCOV_BOUNDARY_RING` | `4` | Number of snapshot slots (2..16). Driver lag tolerance = `RING - 1` iterations. |
 | `LIBCOV_BOUNDARY_INIT_GRACE` | `0` | Drop the first N boundary fires (process-wide, across all threads) before publishing (skip init noise). |
 | `LIBCOV_BOUNDARY_NOTIFY_FD` | unset | Inherited **eventfd**; libcov writes 8 bytes after each snapshot. Anything else (e.g. a pipe, which could block or SIGPIPE the target inside the trap handler) is ignored with a warning. Counter polling works without it. |
+| `LIBCOV_BOUNDARY_EMULATE` | `1` | `0`: never emulate boundary markers; always use disarm + deferred re-arm (see Threading). |
 | `LIBCOV_ALLOW_ONESHOT_NOREARM` | unset | `1`: allow `MODE=oneshot` with `BOUNDARY_REARM=none` (first-hit-only snapshots). Otherwise that combination is refused and boundaries stay off. |
 
 ## Coverage model
@@ -399,7 +400,15 @@ and the live bitmap itself.
   marker) keep emitting into the shared bitmap at `bitmap_offset`, which
   under MT boundary mode is a cumulative map of non-iteration coverage.
   (Under ST boundary mode that area is unused.)
-- **Markers are re-armed process-wide,** by any thread's trap, once
+- **Markers are emulated (x86_64, aarch64).** The trap handler performs
+  the marker's original instruction itself -- a branch (x86 `jmp`/`jcc`
+  rel8/rel32; aarch64 `b`, `bl`, `b.cond`, `cbz`/`cbnz`, `tbz`/`tbnz`) or
+  a NOP-like hint (`endbr64`, `nop`, `bti`) -- and moves the PC past it,
+  so the marker is never disarmed and no worker can pass it untrapped.
+  Init logs `N of M marker(s) emulated`. `LIBCOV_BOUNDARY_EMULATE=0`
+  turns this off.
+- **Other markers are re-armed process-wide** (other backends, or an
+  instruction the emulator doesn't decode): by any thread's trap, once
   every thread that trapped on the marker has trapped again somewhere
   else (proof it executed the marker's original instruction), or after
   `LIBCOV_MARKER_REARM_TIMEOUT_NS` (`src/tunables.h`, 1 ms) if one
@@ -410,11 +419,12 @@ and the live bitmap itself.
   under oneshot: workers kept disarming each other's re-armed sites
   until no thread trapped and boundaries stopped.)
 - **MT coverage is sampled.** A site one thread has disarmed doesn't
-  trap for another until it's re-armed. For markers this means that
-  while one worker holds the marker, other workers pass it untrapped
-  and two of their iterations merge into one snapshot. Measured on
-  `target_loop_mt`: ~1-3% of boundaries missed with 2 workers, ~5-20%
-  with 4, ~20-30% with 8. Snapshots never mix threads.
+  trap for another until it's re-armed. Emulated markers are exempt:
+  measured on `target_loop_mt`, every boundary is captured with 2, 4 and
+  8 workers. A non-emulated marker is missed while another worker holds
+  it disarmed, and two iterations merge into one snapshot: ~1-3% of
+  boundaries with 2 workers, ~5-20% with 4, ~20-30% with 8. Snapshots
+  never mix threads.
 
 Publish costs one `map_size` copy per iteration under MT; ST keeps the
 zero-copy pointer swap. Generations are assigned by `fetch_add` on
@@ -634,6 +644,7 @@ test/
   target_loop.c               stdin-driven loop target with iter_begin marker
   target_loop_mt.c            multi-worker boundary target (per-thread paths)
   target_dispatch.c           generator target (function-pointer dispatch, exiting callee)
+  target_markers.c            marker functions covering every emulated branch form
   target_multimod.c           multi-module target (links libmultimod_helper.so)
   libmultimod_helper.c/.h     helper shared library for multi-module test
   fuzz_driver.c               boundary-aware driver (seqlock reader)
@@ -649,6 +660,8 @@ test/
   run_validation_generator.sh generator: call-terminated blocks, indirect-call report,
                               branch-type classification
   run_validation_o2pie.sh     -O2 PIE builds of target_simple/target_dispatch under ST+MT
+  run_validation_marker_emulation.sh  marker emulation: branch traces unchanged, one
+                              boundary per marker call (ARCH=aarch64 runs under qemu)
   run_all.sh                  suite runner behind `make test`
   shm_bitmap.py               reads the live bitmap using the shm header (size,
                               offset and byte order vary)
@@ -707,6 +720,9 @@ make THREADING=mt
 
 # -O2 PIE targets (tail calls, cold splits, jump tables, ASLR):
 ./test/run_validation_o2pie.sh
+
+# Boundary-marker emulation (also: ARCH=aarch64 under qemu):
+./test/run_validation_marker_emulation.sh
 
 # All backends, ST, under qemu-user-static:
 ./test/run_cross.sh        # PASS=12  FAIL=0  SKIP=0

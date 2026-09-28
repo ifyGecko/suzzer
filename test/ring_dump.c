@@ -15,6 +15,7 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <sched.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
@@ -32,6 +33,12 @@
 static void sleep_us(long us) {
     struct timespec ts = { us / 1000000, (us % 1000000) * 1000 };
     nanosleep(&ts, NULL);
+}
+
+static uint64_t mono_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
 /* Seqlock read of one slot; same protocol as fuzz_driver.c::read_slot.
@@ -128,17 +135,21 @@ int main(int argc, char **argv) {
     for (;;) {
         if (!exited && waitpid(pid, &status, WNOHANG) == pid) exited = 1;
         uint64_t now = __atomic_load_n(&hdr->gen_current, __ATOMIC_ACQUIRE);
+        /* Spin (yielding) rather than sleep: with several workers the
+         * target publishes in bursts, and a 16-slot ring leaves no room
+         * for a reader that naps ~100us between polls. */
         if (next > now) {
             if (exited) break;
-            sleep_us(50);
+            sched_yield();
             continue;
         }
         uint64_t tid = 0;
         int rc = 1;
-        for (int a = 0; a < 2000 && rc == 1; a++) {
-            rc = read_slot(base, next, buf, &tid);
-            if (rc == 1) sleep_us(20);
-        }
+        /* A publisher may have taken gen `next` but not stamped its slot
+         * yet; give it up to 200 ms. */
+        uint64_t deadline = mono_ns() + 200000000ull;
+        while ((rc = read_slot(base, next, buf, &tid)) == 1 && mono_ns() < deadline)
+            sched_yield();
         if (rc == 0)       { dump(next, tid, buf, map_size); published++; }
         else if (rc == -1) { printf("OVERRUN gen=%lu\n", (unsigned long)next); overruns++; }
         else               { printf("MISSING gen=%lu\n", (unsigned long)next); missing++; }

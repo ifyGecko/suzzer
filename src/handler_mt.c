@@ -58,6 +58,23 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
      * coalesces the per-write membarrier IPIs (disarm + leapfrog arm +
      * any boundary rearms) into a single broadcast. */
     sink_emit(pc, e->module_idx, e->site_id);
+
+    if (e->emulate) {
+        /* Boundary marker the backend can execute itself: it stays armed
+         * (so no peer can pass it untrapped). Do the leapfrog re-arm of
+         * our previous site, the boundary work, then perform the marker's
+         * instruction on the context and return past it. */
+        struct patch_entry *last = g_last_restored;
+        if (g_mode == LIBCOV_MODE_LEAPFROG && last && !last->marker &&
+            !__atomic_load_n(&last->patched, __ATOMIC_RELAXED))
+            patch_arm_unsynced(last);
+        g_last_restored = NULL;
+        boundary_on_trap(pc, e);
+        libcov_arch_emulate(uc, pc, e->orig, e->len);
+        patch_sync_batch_end();
+        return;
+    }
+
     patch_disarm_unsynced(e);
 
     if (g_mode == LIBCOV_MODE_LEAPFROG) {

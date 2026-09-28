@@ -38,6 +38,19 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
      * the dense bucket base for the site-id model. The active model picks. */
     sink_emit(pc, e->module_idx, e->site_id);
 
+    if (e->emulate) {
+        /* Boundary marker the backend can execute itself: it stays armed.
+         * Leapfrog re-arm of the previous site, boundary work, then
+         * perform the marker's instruction and return past it. */
+        if (g_mode == LIBCOV_MODE_LEAPFROG && g_last_restored &&
+            !g_last_restored->marker && !g_last_restored->patched)
+            patch_arm(g_last_restored);
+        g_last_restored = NULL;
+        boundary_on_trap(pc, e);
+        libcov_arch_emulate(uc, pc, e->orig, e->len);
+        return;
+    }
+
     /* Restore the original instruction so execution can resume. */
     patch_disarm(e);
 

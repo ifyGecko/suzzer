@@ -32,6 +32,7 @@
 #include "sink.h"
 #include "util.h"
 #include "tunables.h"   /* LIBCOV_MARKER_REARM_TIMEOUT_NS */
+#include "arch.h"       /* libcov_arch_emulate */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -377,14 +378,35 @@ int boundary_init(void) {
 
     /* Resolve each marker's patch site for the deferred re-arm. A marker
      * that isn't a patched site never traps, so it can never fire. */
+    /* Markers whose instruction the backend can emulate stay armed
+     * forever: the handler performs the instruction and moves the PC past
+     * it. That is the only way no peer thread can ever pass a marker
+     * untrapped; the rest use disarm + deferred re-arm (g_pending_markers).
+     * LIBCOV_BOUNDARY_EMULATE=0 forces the fallback everywhere. */
+    const char *emu_env = getenv("LIBCOV_BOUNDARY_EMULATE");
+    int allow_emulate = !(emu_env && !strcmp(emu_env, "0"));
+    size_t n_emulated = 0;
     for (size_t i = 0; i < g_marker_count; i++) {
-        g_markers[i].pe = patch_lookup(g_markers[i].addr);
-        if (g_markers[i].pe) g_markers[i].pe->marker = 1;
-        if (!g_markers[i].pe)
+        struct patch_entry *pe = patch_lookup(g_markers[i].addr);
+        g_markers[i].pe = pe;
+        if (!pe) {
             libcov_logf("boundary: WARNING -- marker 0x%lx is not a patched site "
                         "and will never fire (check gen_boundary.py --patchlist)",
                         (unsigned long)g_markers[i].addr);
+            continue;
+        }
+        pe->marker = 1;
+        if (allow_emulate && libcov_arch_emulate(NULL, pe->addr, pe->orig, pe->len)) {
+            pe->emulate = 1;
+            n_emulated++;
+        } else {
+            libcov_logf("boundary: marker 0x%lx (%02x %02x ...) is not emulated; it is "
+                        "disarmed while hit, so concurrent workers can miss it",
+                        (unsigned long)pe->addr, pe->orig[0], pe->orig[1]);
+        }
     }
+    libcov_logf("boundary: %zu of %zu marker(s) emulated (never disarmed)",
+                n_emulated, g_marker_count);
 
 #if defined(LIBCOV_THREADING_MT)
     if (pthread_key_create(&g_bitmap_key, thread_bitmap_free) == 0)
@@ -690,9 +712,9 @@ void boundary_on_trap(uintptr_t pc, struct patch_entry *e) {
     struct marker *m = marker_lookup(pc);
     if (!m) return;
 
-    /* Every marker trap leaves the marker disarmed, whether or not it
-     * fires a boundary below (depth filter, init grace). */
-    hold_marker(m);
+    /* A non-emulated marker trap leaves the marker disarmed, whether or
+     * not it fires a boundary below (depth filter, init grace). */
+    if (!m->pe || !m->pe->emulate) hold_marker(m);
 
     /* Depth tracking:
      *   paired mode (sidecar contains END markers): BEGIN increments depth,

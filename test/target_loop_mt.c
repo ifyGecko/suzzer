@@ -1,11 +1,14 @@
 /*
  * target_loop_mt.c -- multi-worker boundary target (MT regression).
  *
- * Usage: target_loop_mt <workers> <iters>
+ * Usage: target_loop_mt <workers> <iters> [pause_us]
  *   workers: a string over {a, b}; one worker thread per character.
  *            "a" / "b" run a single worker (solo signature runs); "ab"
  *            runs both concurrently.
  *   iters:   iterations per worker.
+ *   pause_us: sleep after each iteration (default 200). Test readers
+ *            scale it with the worker count so the total snapshot rate
+ *            stays within what they can drain from the ring.
  *
  * Every iteration starts with iter_begin() (the boundary marker) and then
  * runs that worker's own path: worker 'a' only ever runs path_a_*, worker
@@ -60,6 +63,7 @@ __attribute__((noinline)) static void path_b(int i) {
 struct worker_arg {
     char     kind;
     unsigned iters;
+    long     pause_us;
 };
 
 static void pause_us(long us) {
@@ -75,7 +79,7 @@ static void *worker(void *p) {
         else                path_b((int)i);
         /* Keep workers overlapping while giving the ring reader time to
          * drain; the ring is only a handful of slots deep. */
-        pause_us(200);
+        pause_us(w->pause_us);
     }
     /* Publish the last iteration (begin-only markers publish the
      * previous one). */
@@ -85,17 +89,23 @@ static void *worker(void *p) {
 
 int main(int argc, char **argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <workers:[ab]+> <iters>\n", argv[0]);
+        fprintf(stderr, "usage: %s <workers:[ab]+> <iters> [pause_us]\n", argv[0]);
         return 2;
     }
     size_t n = strlen(argv[1]);
     unsigned iters = (unsigned)atoi(argv[2]);
+    long pause = argc > 3 ? atol(argv[3]) : 200;
+    /* Give an external ring reader time to attach before the first
+     * snapshots are published (it can only start once libcov's
+     * constructor has created the shm). */
+    pause_us(50000);
     pthread_t *th = calloc(n, sizeof *th);
     struct worker_arg *args = calloc(n, sizeof *args);
     if (!th || !args) return 1;
     for (size_t i = 0; i < n; i++) {
         args[i].kind  = argv[1][i];
         args[i].iters = iters;
+        args[i].pause_us = pause;
         if (pthread_create(&th[i], NULL, worker, &args[i]) != 0) return 1;
     }
     for (size_t i = 0; i < n; i++) pthread_join(th[i], NULL);

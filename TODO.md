@@ -158,6 +158,15 @@ the MT stress test fail against the pre-fix code.
   size, offset and byte order from the header instead of assuming 64 KB
   at offset 72. New `-O2` PIE targets and `run_validation_o2pie.sh`.
   test/Makefile no longer bakes a relative runpath into target_multimod.
+- **Missed boundaries with concurrent workers** (x86_64, aarch64). The
+  trap handler now emulates the marker's original instruction (branches
+  and NOP-like hints) and never disarms it, so no worker can pass a
+  marker untrapped. `target_loop_mt`, 2/4/8 workers, all modes: every
+  boundary captured (was 68-78% with 8). New
+  `run_validation_marker_emulation.sh` checks every emulated branch form
+  both ways (native and aarch64 under qemu); inverting either decoder's
+  condition fails it. `run_validation_boundary_mt.sh` now demands >= 97%
+  at 2/4/8 workers and still covers the fallback with emulation off.
 - **README drift.** Fixed: the 64 KB bitmap claims, the x86 patch
   length, the chaining claim, the missing coverage-model docs, the
   "threads scope iterations cleanly" claim, and the `LIBCOV_MODULE`
@@ -189,16 +198,15 @@ the MT stress test fail against the pre-fix code.
 
 - [ ] **MT leapfrog/oneshot is sampled coverage.** A site that thread A
   has disarmed doesn't trap for thread B until it's re-armed, so B's
-  coverage there is missed. For markers: while any worker holds the
-  marker (between its marker trap and its next trap elsewhere), other
-  workers pass it untrapped and two of their iterations merge. Measured
-  on `target_loop_mt`: ~1-3% of boundaries missed with 2 workers,
-  ~5-20% with 4, ~20-30% with 8. Ideas: per-worker marker copies (one
-  marker site per worker function), or a second "exit" site after the
-  marker that re-arms it (a two-site leapfrog), both target-dependent.
-  - For coverage: consider a "re-arm after K traps process-wide" policy,
-    or accept and keep documenting that MT is sampled coverage (README
-    now says so).
+  coverage there is missed. Markers are solved on x86_64/aarch64 by
+  emulation (see the fixed list). Remaining:
+  - Marker emulators for arm/Thumb, riscv64 (c.beqz/c.bnez/beq..),
+    powerpc/ppc64 (bc with CR/CTR), mips (delay slots make this hard;
+    MIPS markers use the entry strategy, so a non-branch is likely).
+    Without one, markers there miss ~5-30% of boundaries with 4-8
+    workers.
+  - For coverage sites: consider a "re-arm after K traps process-wide"
+    policy, or accept and keep documenting that MT is sampled coverage.
 - [ ] **x86: blocks made only of 1-byte instructions are unpatchable**
   (`leave; ret`, `pop; ret`, a lone `ret`). A limit of the 2-byte UD2
   encoding; now documented in README. A generator-side mitigation would

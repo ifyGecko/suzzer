@@ -33,3 +33,11 @@ const void *libcov_arch_illegal_bytes(uint8_t len) {
 uintptr_t libcov_arch_pc_from_uctx(const ucontext_t *uc) {
     return (uintptr_t)uc->uc_mcontext.pc;
 }
+
+/* Marker emulation not implemented for this backend: markers use the
+ * disarm + deferred re-arm protocol (see arch.h). */
+int libcov_arch_emulate(ucontext_t *uc, uintptr_t addr,
+                        const uint8_t *orig, uint8_t len) {
+    (void)uc; (void)addr; (void)orig; (void)len;
+    return 0;
+}
