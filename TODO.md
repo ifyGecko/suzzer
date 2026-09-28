@@ -120,6 +120,22 @@ the MT stress test fail against the pre-fix code.
 - **TLS model.** The library is built with `-ftls-model=initial-exec`, so
   handler TLS never goes through `__tls_get_addr` (`STATIC_TLS` is set in
   the dynamic section).
+- **Fail loud** (Review C2, M5, M6, L3, L4). All covered by
+  `test/run_validation_failloud.sh`:
+  - `MODE=oneshot` + `REARM=none` with a boundary list is refused (ERROR,
+    boundaries stay off) unless `LIBCOV_ALLOW_ONESHOT_NOREARM=1`.
+  - `LIBCOV_REQUIRE=1` aborts when libcov ends up inert or any init step
+    fails.
+  - `libcov_st.so` warns when the process has or creates a second thread.
+    This turned out to crash even in oneshot (ST's mprotect dance makes
+    pages briefly non-executable), so Review.md's "ST + oneshot + any:
+    safe" was wrong.
+  - Init-time trap self-test: each encoding is executed once from a
+    scratch page and must raise `LIBCOV_TRAP_SIGNO`, else libcov stays
+    inert. Skipped on ppc64 ELFv1 (function descriptors).
+  - `gen_patchlist.py` exits non-zero without writing when no sites are
+    selected (`--allow-empty` to override), lists `--include-pat` matches
+    under `-v`, and warns when one name matched under several prefixes.
 - **README drift.** Fixed: the 64 KB bitmap claims, the x86 patch
   length, the chaining claim, the missing coverage-model docs, the
   "threads scope iterations cleanly" claim, and the `LIBCOV_MODULE`
@@ -170,9 +186,6 @@ the MT stress test fail against the pre-fix code.
   generation, so a driver sees two generations per input. Decide whether
   a BEGIN in paired mode should only reset (not publish), and document
   what drivers should expect.
-- [ ] **`MODE=oneshot` + `REARM=none` with boundaries** only warns, and
-  per-iteration bitmaps are empty after warmup. Make it a hard error
-  unless `LIBCOV_ALLOW_ONESHOT_NOREARM=1` is set. (Review C2)
 - [ ] **Begin-only `depth_filter`.** It now warns. Consider rejecting it
   in `gen_boundary.py` unless `--force`. (Review C3)
 - [ ] **Leapfrog never records self-loops.** An A→A edge is never seen,
@@ -218,20 +231,6 @@ the MT stress test fail against the pre-fix code.
   `rt_sigprocmask` syscalls, and `bsd_signal`/`sigset`/`__sysv_signal`,
   aren't intercepted. Add the libc aliases; syscall-level coverage needs
   seccomp or libsyscall_intercept.
-- [ ] **ST library in a multi-threaded target** is undefined behaviour
-  under leapfrog, with no warning. Warn when `/proc/self/status`
-  `Threads:` > 1, or intercept `pthread_create` and warn once. (Review M6)
-- [ ] **Inert without `LIBCOV_PATCHLIST`.** The library does nothing and
-  only logs an informational line. Aborting would break children that
-  inherit `LD_PRELOAD`. Instead:
-  - drivers should check the shm header magic;
-  - add opt-in `LIBCOV_REQUIRE=1` that aborts when inert.
-
-  (Review M5, with a different fix)
-- [ ] **Trap signal vs encoding mismatch** (`-DLIBCOV_TRAP_SIGNO=SIGTRAP`
-  with a SIGILL encoding) only shows up as a crash. At init, execute the
-  trap encoding once in a private scratch page and verify it arrives as
-  `LIBCOV_TRAP_SIGNO`. (Review L3)
 - [ ] **Runtime logging.** The `sigaction` interposer logs to fd 2 after
   init, and a daemon may have reused fd 2 for a socket. `LIBCOV_LOG` is
   opened without `O_CLOEXEC`.
@@ -262,14 +261,8 @@ the MT stress test fail against the pre-fix code.
   upper bound: any address, including another module's or a typo,
   resolves to the module's last function with only a note on stderr.
   `--print-reachable` returns after module 0.
-- [ ] **Empty output.** A 0-record output exits 0 (e.g.
-  `--include-pat '^main$'` when rizin names it `dbg.main`). Warn loudly,
-  or exit non-zero unless `--allow-empty` is given.
 - [ ] **Passing `--exclude-pat` replaces the default exclusions**
   (`sym.imp.`, `_init`, …) instead of adding to them.
-- [ ] **Regex matches aren't reported.** Print the functions each
-  include pattern matched under `-v`, and warn when one pattern matches
-  both `sym.X` and `dbg.X`. (Review L4)
 - [ ] **Data in text and overlaps.** There is no overlap check between
   sites, and heuristic `fcn.*` functions are included. Blocks that run
   into literal pools or Thumb `tbb`/`tbh` tables could patch data. Data
@@ -314,9 +307,6 @@ the MT stress test fail against the pre-fix code.
   map is now auto-sized).
 - [ ] Tests write fixed `/tmp/...` paths, so parallel runs collide. Use
   `mktemp -d`.
-- [ ] Commit (or drop) `test/run_validation_coverage_options.sh` and
-  `test/target_orderable.c`, which are currently untracked. The Makefile
-  rule for `target_orderable` now exists; the suite passes 22/22.
 - [ ] Add a raw `clone(2)` MT stress harness (carried over).
 
 ---

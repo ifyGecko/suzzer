@@ -12,10 +12,39 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <setjmp.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#if defined(LIBCOV_THREADING_ST)
+#  include <pthread.h>
+#endif
 
 static int g_initialized = 0;
+
+static int trap_selftest(void);
+#if defined(LIBCOV_THREADING_ST)
+static void st_check_threads(void);
+#endif
+
+static int env_true(const char *name) {
+    const char *v = getenv(name);
+    return v && *v && strcmp(v, "0") != 0;
+}
+
+/* An init step failed and libcov will run inert (or without boundaries).
+ * Log it; with LIBCOV_REQUIRE=1, abort instead -- a fuzz run whose
+ * coverage is silently all-zero wastes the whole campaign. Opt-in because
+ * children that inherit LD_PRELOAD (a daemon's /bin/sh, helpers) are
+ * normally meant to run inert. */
+static void init_fail(const char *what) {
+    libcov_logf("init: %s", what);
+    if (env_true("LIBCOV_REQUIRE")) {
+        libcov_logf("init: LIBCOV_REQUIRE is set -- aborting");
+        abort();
+    }
+}
 
 /* Storage for what the target *thinks* its trap-signal handler is. */
 static struct sigaction g_target_trap_sa;
@@ -65,7 +94,7 @@ static void libcov_init(void) {
 
     const char *patchlist = getenv("LIBCOV_PATCHLIST");
     if (!patchlist || !*patchlist) {
-        libcov_logf("init: LIBCOV_PATCHLIST unset, library inert");
+        init_fail("LIBCOV_PATCHLIST unset, library inert");
         return;
     }
 
@@ -77,7 +106,7 @@ static void libcov_init(void) {
      * table (no shm/bitmap touch), and the site-id model needs the patch
      * count N to auto-size the bitmap before sink_init allocates it. */
     if (config_load(patchlist) != 0) {
-        libcov_logf("init: config_load failed");
+        init_fail("config_load failed, library inert");
         return;
     }
     size_t n_sites = 0;
@@ -86,7 +115,14 @@ static void libcov_init(void) {
     libcov_logf("init: coverage model=%s n_sites=%zu map_size=%zu",
                 LIBCOV_COVERAGE_MODEL_SITE ? "site" : "hash", n_sites, map_size);
     if (sink_init(getenv("LIBCOV_SHM_PATH"), parse_ring_size(), map_size) != 0) {
-        libcov_logf("init: sink_init failed");
+        init_fail("sink_init failed, library inert");
+        return;
+    }
+    /* A trap encoding that raises some other signal than the one our
+     * handler is installed for kills the target on its first trap (e.g.
+     * -DLIBCOV_TRAP_SIGNO=SIGTRAP with a SIGILL encoding). Check first. */
+    if (trap_selftest() != 0) {
+        init_fail("trap self-test failed, library inert (nothing armed)");
         return;
     }
     /* Install the handler BEFORE arming: if install fails we must not
@@ -94,30 +130,38 @@ static void libcov_init(void) {
     struct sigaction prev;
     memset(&prev, 0, sizeof prev);
     if (handler_install(mode, &prev) != 0) {
-        libcov_logf("init: handler_install failed");
+        init_fail("handler_install failed, library inert");
         return;
     }
     g_target_trap_sa = prev;
     g_target_trap_sa_valid = 1;
     if (patch_arm_all() == 0) {
-        libcov_logf("init: nothing armed, aborting");
+        init_fail("nothing armed, library inert");
         return;
     }
 
-    int boundary_state = boundary_init();
-    if (boundary_state < 0) {
-        libcov_logf("init: boundary_init failed; continuing without iteration scoping");
-    } else if (boundary_state == 1) {
-        /* Sanity check: oneshot + REARM=none + active boundaries makes per-
-         * iteration snapshots go empty after warmup. Warn loudly; not fatal. */
-        const char *rearm = getenv("LIBCOV_BOUNDARY_REARM");
-        if (mode == LIBCOV_MODE_ONESHOT && (!rearm || !*rearm || !strcmp(rearm, "none"))) {
-            libcov_logf("init: WARNING -- MODE=oneshot with BOUNDARY_REARM=none means "
-                        "per-iter bitmaps empty after warmup; use REARM=all or "
-                        "REARM=touched, or switch to MODE=leapfrog");
-        }
+    /* oneshot + REARM=none + boundaries: every site fires once and is
+     * never re-armed, so per-iteration snapshots are empty after warmup
+     * and the driver sees a plateaued corpus instead of an error. Refuse
+     * to enable boundaries unless explicitly allowed (a "first hit only"
+     * novelty stream is a legitimate, if unusual, choice). */
+    const char *blist = getenv("LIBCOV_BOUNDARY_LIST");
+    const char *rearm = getenv("LIBCOV_BOUNDARY_REARM");
+    int no_rearm = !rearm || !*rearm || !strcmp(rearm, "none");
+    if (blist && *blist && mode == LIBCOV_MODE_ONESHOT && no_rearm &&
+        !env_true("LIBCOV_ALLOW_ONESHOT_NOREARM")) {
+        init_fail("ERROR -- MODE=oneshot with BOUNDARY_REARM=none would leave "
+                  "per-iteration snapshots empty after warmup; boundaries NOT "
+                  "enabled. Use LIBCOV_BOUNDARY_REARM=touched or =all, or "
+                  "LIBCOV_MODE=leapfrog, or set LIBCOV_ALLOW_ONESHOT_NOREARM=1 "
+                  "to get first-hit-only snapshots on purpose.");
+    } else if (boundary_init() < 0) {
+        init_fail("boundary_init failed; continuing without iteration scoping");
     }
 
+#if defined(LIBCOV_THREADING_ST)
+    st_check_threads();
+#endif
     g_initialized = 1;
     libcov_logf("init: ready");
 }
@@ -256,3 +300,145 @@ int pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset) {
     if (filter_mask(how, set, &copy)) set = &copy;
     return real(how, set, oldset);
 }
+
+/* ---- trap-encoding self-test --------------------------------------- *
+ * Execute each trap encoding this backend can write, once, from a scratch
+ * page, with temporary handlers on every signal an illegal instruction
+ * can plausibly raise, and check it arrives as LIBCOV_TRAP_SIGNO. Runs
+ * before handler_install, single-threaded, from the constructor. */
+
+#if defined(__powerpc64__) && (!defined(_CALL_ELF) || _CALL_ELF != 2)
+/* ELFv1: a function pointer is a descriptor, not a code address. */
+#  define LIBCOV_SELFTEST_SUPPORTED 0
+#else
+#  define LIBCOV_SELFTEST_SUPPORTED 1
+#endif
+
+#if LIBCOV_SELFTEST_SUPPORTED
+static sigjmp_buf            g_probe_jmp;
+static volatile sig_atomic_t g_probe_signo;
+
+static void probe_handler(int signo) {
+    g_probe_signo = signo;
+    siglongjmp(g_probe_jmp, 1);
+}
+
+static const int k_probe_signals[] = {
+    SIGILL, SIGTRAP, SIGSEGV, SIGBUS, SIGFPE, SIGSYS, LIBCOV_TRAP_SIGNO,
+};
+#define N_PROBE_SIGNALS (sizeof k_probe_signals / sizeof k_probe_signals[0])
+
+/* Returns the signal raised by the `len`-byte encoding, or -1 if the
+ * probe could not run (e.g. the kernel refuses an executable page). */
+static int probe_encoding(uint8_t len) {
+    long ps = sysconf(_SC_PAGESIZE);
+    uint8_t *page = mmap(NULL, (size_t)ps, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) return -1;
+    memcpy(page, libcov_arch_illegal_bytes(len), len);
+    __builtin___clear_cache((char *)page, (char *)page + len);
+    if (mprotect(page, (size_t)ps, PROT_READ | PROT_EXEC) != 0) {
+        munmap(page, (size_t)ps);
+        return -1;
+    }
+    uintptr_t entry = (uintptr_t)page;
+#if defined(__arm__)
+    if (len == 2) entry |= 1;   /* the 2-byte encoding is Thumb */
+#endif
+
+    sigaction_fn real = real_sigaction_fn();
+    struct sigaction sa, old[N_PROBE_SIGNALS];
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = probe_handler;
+    sa.sa_flags   = SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    sigset_t unblock, saved_mask;
+    sigemptyset(&unblock);
+    for (size_t i = 0; i < N_PROBE_SIGNALS; i++) {
+        real(k_probe_signals[i], &sa, &old[i]);
+        sigaddset(&unblock, k_probe_signals[i]);
+    }
+    sigprocmask(SIG_UNBLOCK, &unblock, &saved_mask);
+
+    g_probe_signo = 0;
+    if (sigsetjmp(g_probe_jmp, 1) == 0)
+        ((void (*)(void))entry)();
+
+    sigprocmask(SIG_SETMASK, &saved_mask, NULL);
+    for (size_t i = N_PROBE_SIGNALS; i-- > 0; )
+        real(k_probe_signals[i], &old[i], NULL);
+    munmap(page, (size_t)ps);
+    return g_probe_signo;
+}
+#endif
+
+static int trap_selftest(void) {
+#if !LIBCOV_SELFTEST_SUPPORTED
+    libcov_logf("init: trap self-test not supported on this ABI; skipped");
+    return 0;
+#else
+    uint8_t lens[2] = { libcov_min_patch_len, libcov_max_patch_len };
+    size_t  nlens   = (lens[0] == lens[1]) ? 1 : 2;
+    for (size_t i = 0; i < nlens; i++) {
+        int got = probe_encoding(lens[i]);
+        if (got < 0) {
+            libcov_logf("init: trap self-test could not run (no executable "
+                        "scratch page); skipped");
+            return 0;
+        }
+        if (got != LIBCOV_TRAP_SIGNO) {
+            libcov_logf("init: ERROR -- the %u-byte %s trap encoding raises "
+                        "signal %d, but LIBCOV_TRAP_SIGNO is %d. Change "
+                        "LIBCOV_TRAP_SIGNO or the encoding in "
+                        "src/tunables_*.h so they agree.",
+                        (unsigned)lens[i], libcov_arch_name, got,
+                        LIBCOV_TRAP_SIGNO);
+            return -1;
+        }
+    }
+    libcov_logf("init: trap self-test ok (signal %d)", LIBCOV_TRAP_SIGNO);
+    return 0;
+#endif
+}
+
+/* ---- ST library in a multi-threaded process ------------------------- *
+ * libcov_st.so is unsafe with more than one thread in ANY mode: each
+ * arm/disarm mprotects the code page RW (no X) for a moment, so a peer
+ * thread executing on that page faults, and leapfrog state is a plain
+ * global. Warn once, at init if threads already exist, or when the target
+ * creates its first one. */
+#if defined(LIBCOV_THREADING_ST)
+static void st_warn_threads(const char *why) {
+    static int warned;
+    if (warned) return;
+    warned = 1;
+    libcov_logf("WARNING -- libcov_st.so is running in a multi-threaded "
+                "process (%s). ST patching makes code pages briefly "
+                "non-executable and its leapfrog state is not thread-safe, "
+                "so peer threads can crash: use libcov_mt.so with a "
+                "--threading mt patch list.", why);
+}
+
+static void st_check_threads(void) {
+    FILE *f = fopen("/proc/self/status", "re");
+    if (!f) return;
+    char line[128];
+    int threads = 0;
+    while (fgets(line, sizeof line, f))
+        if (sscanf(line, "Threads: %d", &threads) == 1) break;
+    fclose(f);
+    if (threads > 1) st_warn_threads("Threads > 1 at init");
+}
+
+typedef int (*pthread_create_fn)(pthread_t *, const pthread_attr_t *,
+                                 void *(*)(void *), void *);
+
+int pthread_create(pthread_t *t, const pthread_attr_t *attr,
+                   void *(*fn)(void *), void *arg) {
+    static pthread_create_fn real;
+    if (!real) real = (pthread_create_fn)dlsym(RTLD_NEXT, "pthread_create");
+    if (!real) return EAGAIN;
+    if (g_initialized) st_warn_threads("pthread_create called");
+    return real(t, attr, fn, arg);
+}
+#endif

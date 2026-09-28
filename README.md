@@ -202,6 +202,7 @@ to be instrumented.
 | Var | Default | Meaning |
 |---|---|---|
 | `LIBCOV_PATCHLIST` | *(required)* | Path to LCV3 patch list. If unset, the library is inert. |
+| `LIBCOV_REQUIRE` | unset | `1`: abort the process if libcov ends up inert or any init step fails (unset patch list, unresolvable module, trap self-test failure, refused boundary config). Off by default because children that inherit `LD_PRELOAD` are usually meant to run inert. |
 | `LIBCOV_SHM_PATH` | `/libcov_<pid>` | Bitmap path. Leading `/` and no other slashes → `shm_open`; otherwise a filesystem path. Falls back to `$TMPDIR/<name>` if `shm_open` fails. |
 | `LIBCOV_MODE` | `leapfrog` | `oneshot` (each site fires once, fastest) or `leapfrog` (re-arm previous site each trap; gives hit counts). |
 | `LIBCOV_MODULE` | basename of `/proc/self/exe` | Module name for boundary-mode sidecar resolution only. The patch list itself carries its own module name table (LCV3) so this only affects `LIBCOV_BOUNDARY_LIST` lookups. |
@@ -210,7 +211,8 @@ to be instrumented.
 | `LIBCOV_BOUNDARY_REARM` | `none` | `none` / `all` / `touched`. What to re-arm at each boundary fire. |
 | `LIBCOV_BOUNDARY_RING` | `4` | Number of snapshot slots (2..16). Driver lag tolerance = `RING - 1` iterations. |
 | `LIBCOV_BOUNDARY_INIT_GRACE` | `0` | Drop the first N boundary fires (process-wide, across all threads) before publishing (skip init noise). |
-| `LIBCOV_BOUNDARY_NOTIFY_FD` | unset | Inherited fd; libcov writes 8 bytes after each snapshot (eventfd-style wakeup). Counter polling works without it. |
+| `LIBCOV_BOUNDARY_NOTIFY_FD` | unset | Inherited **eventfd**; libcov writes 8 bytes after each snapshot. Anything else (e.g. a pipe, which could block or SIGPIPE the target inside the trap handler) is ignored with a warning. Counter polling works without it. |
+| `LIBCOV_ALLOW_ONESHOT_NOREARM` | unset | `1`: allow `MODE=oneshot` with `BOUNDARY_REARM=none` (first-hit-only snapshots). Otherwise that combination is refused and boundaries stay off. |
 
 ## Coverage model
 
@@ -272,7 +274,8 @@ Two orthogonal axes:
 - `oneshot` -- On the first trap at site X, restore the original
   instruction and leave it alone. Fastest; gives "edge-was-reached"
   coverage with no hit-count. Recommended for the corpus-explore phase
-  of fuzzing. Safe under both ST and MT.
+  of fuzzing. Safe under `libcov_mt.so`, and under `libcov_st.so` for
+  single-threaded targets only (see Leapfrog below).
 - `leapfrog` -- On trap at X, restore X *and* re-arm the previously
   restored site. Lets the bitmap accumulate hit counts on hot edges
   and gives full per-iter edge sets when used with the boundary
@@ -305,7 +308,7 @@ Recommended pairings:
 |---|---|---|
 | `leapfrog` | `none` | Default for boundary mode. Per-iter bitmaps with full edge sets. |
 | `oneshot` | `all` or `touched` | Many traps per iteration, cheaper than leapfrog's per-trap cost. |
-| `oneshot` | `none` | **Anti-pattern** when boundaries are active -- per-iter bitmaps go empty after warmup. libcov logs a warning at init. |
+| `oneshot` | `none` | **Anti-pattern** when boundaries are active -- per-iter bitmaps go empty after warmup. libcov refuses it (logs an ERROR, boundaries stay off) unless `LIBCOV_ALLOW_ONESHOT_NOREARM=1`. |
 | `leapfrog` | `all` / `touched` | Redundant; leapfrog already re-arms. Allowed but no benefit. |
 
 ## Iteration boundaries
@@ -541,6 +544,12 @@ across runs are easier with ASLR off.
   signal is fatal.
 - The trap handler runs with every asynchronous signal blocked, so a
   target signal handler can never run instrumented code mid-patch.
+- Init-time trap self-test: each trap encoding is executed once from a
+  scratch page and must arrive as `LIBCOV_TRAP_SIGNO`; otherwise libcov
+  stays inert (a mismatch would kill the target on its first trap).
+- `libcov_st.so` warns when the process has, or creates, a second thread:
+  its patching makes code pages briefly non-executable, so peer threads
+  can crash in any mode.
 - Init-time byte validation: every patch record's `orig[]` is compared
   against the actual bytes at the target address; mismatches abort with a
   clear log line so stale patch lists are caught immediately.
@@ -633,6 +642,8 @@ test/
   run_validation_multimod.sh  native multi-module LCV3 test (exe + helper.so)
   target_signals.c            signal-mask / SIGILL-handler regression target
   run_validation_signals.sh   native ST+MT signal-handling regression test
+  run_validation_failloud.sh  misconfigurations fail loudly (REQUIRE, oneshot+none,
+                              ST in MT target, trap self-test, empty patch list)
   run_cross.sh                all-arch ST validation under qemu-user-static
   run_cross_mt.sh             all-arch MT validation (full run for x86_64+aarch64;
                               build-only for the other 9 due to qemu-user TCG limits)
@@ -667,6 +678,12 @@ make THREADING=mt
 
 # Native signal handling (blocked masks, target SIGILL handlers), ST + MT:
 ./test/run_validation_signals.sh
+
+# Native MT boundary mode with concurrent workers (snapshots must not mix):
+./test/run_validation_boundary_mt.sh
+
+# Misconfigurations fail loudly (REQUIRE, oneshot+none, trap self-test, ...):
+./test/run_validation_failloud.sh
 
 # All backends, ST, under qemu-user-static:
 ./test/run_cross.sh        # PASS=12  FAIL=0  SKIP=0

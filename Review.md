@@ -346,8 +346,8 @@ returns -1 with `EPIPE`/`EBADF`.
 | Combination | Status | Notes |
 |---|---|---|
 | ST + leapfrog + single-thread target | safe | original PoC path |
-| ST + leapfrog + multi-thread target | unsafe | undefined behavior; warn at init |
-| ST + oneshot + any | safe (one-shot coverage only) | no per-iter snapshots |
+| ST + oneshot + single-thread target | safe (one-shot coverage only) | |
+| ST + any mode + multi-thread target | unsafe | ST's mprotect dance makes pages briefly non-executable; peer threads crash. libcov now warns (M6) |
 | MT + leapfrog + multi-thread target | sampled on kernel >= 4.16 | a site disarmed by one thread doesn't trap for others until re-armed (TODO P1); C6 on older kernels |
 | MT + boundaries + 1 worker thread | safe | |
 | MT + boundaries + >1 worker thread | sampled | fixed: per-thread live bitmaps, snapshots no longer mix; a few % of boundaries missed / extra (TODO P1) |

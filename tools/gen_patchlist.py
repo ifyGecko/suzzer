@@ -206,6 +206,27 @@ def filter_functions(all_fns, include_re, exclude_re):
     return out
 
 
+def report_include_matches(fns, pattern, module_name, verbose):
+    """Make --include-pat's effect visible: list what it matched under -v,
+    and warn when one function name matched under two rizin prefixes
+    (sym.X and dbg.X), which usually means the pattern is looser than
+    intended."""
+    if verbose:
+        print(f"--include-pat {pattern!r} matched {len(fns)} function(s) in "
+              f"'{module_name}':", file=sys.stderr)
+        for f in fns:
+            print(f"  0x{f['offset']:x} {f['name']}", file=sys.stderr)
+    by_base = {}
+    for f in fns:
+        base = re.sub(r"^(sym|dbg|fcn|loc)\.", "", f["name"])
+        by_base.setdefault(base, []).append(f["name"])
+    for base, names in sorted(by_base.items()):
+        if len(names) > 1:
+            print(f"warning: --include-pat {pattern!r} matched {base!r} under "
+                  f"several names ({', '.join(names)}); sites at the same "
+                  f"address are deduplicated", file=sys.stderr)
+
+
 def get_block_insns(rz, addr, ninstr):
     return rz.cmdj(f"pdj {ninstr} @ {addr}") or []
 
@@ -529,6 +550,8 @@ def collect_module_records(args, rz, module_idx, module_name):
     # resolution, and PPC64 dual-entry lookup.
     all_fns_raw = get_all_functions(rz)
     fns = filter_functions(all_fns_raw, inc, exc)
+    if inc:
+        report_include_matches(fns, args.include_pat, module_name, args.verbose)
 
     # Selective instrumentation: resolve --root / --cutoff and intersect the
     # regex-filtered fns with the call-graph slice reachable from the roots.
@@ -752,6 +775,16 @@ def run(args):
         all_records.extend(records)
         total_skipped += skipped
 
+    if not all_records and not args.allow_empty:
+        hint = ""
+        if args.include_pat:
+            hint = (" Check --include-pat: rizin names functions with debug "
+                    "info 'dbg.NAME' and others 'sym.NAME' (run with -v to "
+                    "see what matched).")
+        sys.exit(f"error: no patch sites selected; not writing {args.output}."
+                 f"{hint} Pass --allow-empty to write an empty patch list "
+                 f"anyway.")
+
     write_lcv3(args.output, [n for n, _ in module_specs], all_records,
                threading_hint)
 
@@ -809,6 +842,10 @@ def main():
                     help="resolve --root/--cutoff, print the reachable "
                          "function set to stderr, and exit without writing "
                          "the patchlist. Useful for iterating on a slice.")
+    ap.add_argument("--allow-empty", action="store_true",
+                    help="write the patch list even when no sites were "
+                         "selected (by default that is an error: an empty "
+                         "list makes libcov silently record nothing)")
     ap.add_argument("--verbose", "-v", action="store_true")
     args = ap.parse_args()
 
