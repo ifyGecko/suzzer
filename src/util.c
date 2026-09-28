@@ -16,7 +16,7 @@ static int log_fd = 2;  /* stderr by default */
 void libcov_log_init(void) {
     const char *p = getenv("LIBCOV_LOG");
     if (!p || !*p) return;
-    int fd = open(p, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    int fd = open(p, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
     if (fd >= 0) log_fd = fd;
 }
 

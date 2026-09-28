@@ -417,7 +417,16 @@ static inline unsigned pc_cache_idx(uintptr_t pc) {
 }
 
 /* Signal-safe binary search with a per-thread PC cache in front. The
- * returned pointer aliases the global table. */
+ * returned pointer aliases the global table.
+ *
+ * Invariant for trap-path callers: the returned entry's `patched` flag
+ * may be observed mid-transition (another thread can be arming or
+ * disarming the same site concurrently). Callers on the trap path MUST
+ * NOT branch on `patched` for the trapping entry to decide correctness;
+ * they rely on the compare-exchange in patch_arm()/patch_disarm() to
+ * resolve the race atomically. Reading `patched` here (e.g. for a
+ * re-arm decision on OTHER entries) is fine; using it as the source of
+ * truth for the entry that just trapped is not. */
 struct patch_entry *patch_lookup(uintptr_t addr) {
     unsigned idx = pc_cache_idx(addr);
     if (g_pc_cache[idx].pc == addr) {

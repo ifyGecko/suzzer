@@ -146,6 +146,12 @@ SRC := $(COMMON_SRC) $(PATCH_SRC) $(HANDLER_SRC) $(EXTRA_SRC) $(ARCH_SRC)
 OBJDIR := $(BUILD)/obj_$(THREADING)
 OBJ    := $(patsubst src/%.c,$(OBJDIR)/%.o,$(SRC))
 
+# Auto-generated header dependencies (-MMD -MP above). Editing a header
+# now rebuilds every object that includes it. .d files live in OBJDIR
+# (per arch+threading) and are removed by `clean` (rm -rf build).
+DEP := $(OBJ:.o=.d)
+-include $(DEP)
+
 LIB := $(BUILD)/libcov_$(THREADING).so
 
 .PHONY: all clean test test-targets all-arch all-variants native print-vars tools tools-clean
@@ -158,7 +164,7 @@ $(BUILD) $(OBJDIR):
 	mkdir -p $@
 
 $(OBJDIR)/%.o: src/%.c | $(OBJDIR)
-	$(CC) $(CFLAGS) -fPIC -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -fPIC -c $< -o $@
 
 $(LIB): $(OBJ) | $(BUILD)
 	$(CC) $(CFLAGS) -shared -fPIC -Wl,-z,now -o $@ $^ \

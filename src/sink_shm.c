@@ -71,8 +71,8 @@ static int try_shm_open(const char *name, int *fd_out) {
     return 0;
 }
 
-static int try_file_open(const char *path, int *fd_out) {
-    int fd = open(path, O_RDWR | O_CREAT, 0600);
+static int try_file_open(const char *path, int extra_flags, int *fd_out) {
+    int fd = open(path, O_RDWR | O_CREAT | extra_flags, 0600);
     if (fd < 0) return -1;
     *fd_out = fd;
     return 0;
@@ -136,7 +136,7 @@ int sink_init(const char *path, unsigned ring_size, size_t map_size) {
     }
 
     if (looks_like_fs) {
-        if (try_file_open(path, &fd) < 0) {
+        if (try_file_open(path, 0, &fd) < 0) {
             libcov_logf("sink: open(%s): %s", path, strerror(errno));
             return -1;
         }
@@ -147,7 +147,7 @@ int sink_init(const char *path, unsigned ring_size, size_t map_size) {
             char fallback[256];
             const char *bare = (path[0] == '/') ? path + 1 : path;
             snprintf(fallback, sizeof fallback, "%s/%s", tmpdir, bare);
-            if (try_file_open(fallback, &fd) < 0) {
+            if (try_file_open(fallback, O_NOFOLLOW | O_CLOEXEC, &fd) < 0) {
                 libcov_logf("sink: shm_open + fallback failed for %s", path);
                 return -1;
             }

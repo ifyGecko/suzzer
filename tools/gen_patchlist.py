@@ -126,6 +126,12 @@ import sys
 import rzpipe
 
 
+# Functions excluded from instrumentation by default: PLT/import
+# thunks and CRT/init stubs, none of which are meaningful coverage
+# sites. --exclude-pat is ORed with this; --no-default-exclude drops it.
+DEFAULT_EXCLUDE = r"^(sym\.imp\.|sym\._init|sym\._fini|sym\.deregister|sym\.register|sym\.frame_dummy|sym\.__libc_csu)"
+
+
 # Threading-hint values written into the LCV3 header.
 TH_ANY = 0
 TH_ST  = 1
@@ -638,7 +644,12 @@ def collect_module_records(args, rz, module_idx, module_name):
     across modules and writing the final file.
     """
     inc = re.compile(args.include_pat) if args.include_pat else None
-    exc = re.compile(args.exclude_pat) if args.exclude_pat else None
+    exc_pats = []
+    if not args.no_default_exclude:
+        exc_pats.append(DEFAULT_EXCLUDE)
+    if args.exclude_pat:
+        exc_pats.append(args.exclude_pat)
+    exc = re.compile("|".join(f"(?:{pat})" for pat in exc_pats)) if exc_pats else None
 
     info = get_bin_info(rz)
     baddr = info["baddr"]
@@ -928,9 +939,14 @@ def main():
                          "each --module gets the next module_idx starting at 1.")
     ap.add_argument("--include-pat", default=None,
                     help="only include functions whose name matches this regex")
-    ap.add_argument("--exclude-pat",
-                    default=r"^(sym\.imp\.|sym\._init|sym\._fini|sym\.deregister|sym\.register|sym\.frame_dummy|sym\.__libc_csu)",
-                    help="exclude functions whose name matches this regex")
+    ap.add_argument("--exclude-pat", default=None,
+                    help="also exclude functions whose name matches this "
+                         "regex; added to (not replacing) the built-in "
+                         "exclusions. Use --no-default-exclude to drop those.")
+    ap.add_argument("--no-default-exclude", action="store_true",
+                    help="do not apply the built-in exclusions "
+                         "(sym.imp.*, CRT/init stubs); only --exclude-pat, "
+                         "if given, is used")
     ap.add_argument("--strategy", choices=["auto", "entry", "terminator"],
                     default="auto",
                     help="per-block patch site selection (auto = arch default)")
