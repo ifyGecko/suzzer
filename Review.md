@@ -349,9 +349,9 @@ returns -1 with `EPIPE`/`EBADF`.
 | ST + leapfrog + multi-thread target | unsafe | undefined behavior; warn at init |
 | ST + oneshot + any | safe (one-shot coverage only) | no per-iter snapshots |
 | MT + leapfrog + multi-thread target | sampled on kernel >= 4.16 | a site disarmed by one thread doesn't trap for others until re-armed (TODO P1); C6 on older kernels |
-| MT + boundaries + 1 worker thread | safe | recommended for per-iteration attribution |
-| MT + boundaries + >1 worker thread | distorted | shared live bitmap: snapshots mix threads, concurrent publishers can reorder (TODO P1) |
-| MT + oneshot + boundary REARM=all/touched | safe with 1 worker | same thread caveat as above |
+| MT + boundaries + 1 worker thread | safe | |
+| MT + boundaries + >1 worker thread | sampled | fixed: per-thread live bitmaps, snapshots no longer mix; a few % of boundaries missed / extra (TODO P1) |
+| MT + oneshot + boundary REARM=all/touched | sampled | same caveat as above |
 | MT + oneshot + boundary REARM=none | broken | empties bitmap after warmup (C2) |
 | Multi-module + site-id model | safe | unique site_ids across modules |
 | Multi-module + hashed-PC model | safe | fixed: `module_idx` mixed into the hash (C1) |

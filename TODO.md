@@ -82,6 +82,18 @@ the MT stress test fail against the pre-fix code.
   same sites as ST (`target_simple_mt`: 45 → 57).
 - **Design.md §17.2** described `/proc/self/mem` as the primary MT
   write path. Rewritten for RWX-once + atomic store.
+- **MT boundary snapshots mixed threads** (`boundary.c`). One shared
+  live bitmap meant every snapshot held peers' in-flight coverage, and
+  concurrent publishers could move the live pointer backwards. Under MT
+  each worker thread now gets a private live bitmap at its first boundary
+  and publishes a copy of it; non-worker threads keep the shared map.
+  New `test/run_validation_boundary_mt.sh` (two concurrent workers on
+  disjoint paths): before the fix 69/300 snapshots mixed both workers,
+  now 0.
+- **Markers were re-armed per thread.** A marker one worker hit stayed
+  disarmed for the others until that worker trapped again. Markers now
+  carry a HELD/RELEASED state: the next trap on any thread re-arms a
+  marker once its thread has left the handler.
 - **README drift.** Fixed: the 64 KB bitmap claims, the x86 patch
   length, the chaining claim, the missing coverage-model docs, the
   "threads scope iterations cleanly" claim, and the `LIBCOV_MODULE`
@@ -111,31 +123,15 @@ the MT stress test fail against the pre-fix code.
 
 ## P1: coverage correctness
 
-- [ ] **MT boundary snapshots mix threads.** `libcov_bitmap` is one
-  process-global pointer, and `publish_snapshot` (`boundary.c`) moves it
-  for every thread. Another thread's in-flight coverage ends up in the
-  publisher's snapshot or the next one. Two concurrent publishers can
-  also move the pointer backwards: B stamps N+1 before A stamps N, then A
-  moves the live pointer to slot N+1 and zeroes it. `memset(libcov_prev_loc)`
-  only clears the publisher's own TLS window. Options:
-  - a TLS live pointer with per-thread live slots, where a publish only
-    rotates the publishing thread's slot;
-  - per-thread bitmaps that are merged at publish;
-  - failing that, documenting (and at init, warning about) "one worker
-    thread per process" for boundary mode.
-
-  README now documents the limitation.
-- [ ] **MT leapfrog/oneshot loses coverage from other threads.** A site
-  that thread A has disarmed doesn't trap for thread B, so B's coverage
-  (and B's boundary markers) are missed until A re-arms it.
-  - For markers: keep marker sites armed globally. Any thread that
-    traps on a different site re-arms a globally pending marker; today
-    `g_pending_marker_rearm` is TLS.
+- [ ] **MT leapfrog/oneshot is sampled coverage.** A site that thread A
+  has disarmed doesn't trap for thread B until it's re-armed, so B's
+  coverage there is missed. Markers are now re-armed process-wide (see
+  the fixed list), which narrows the window to A's handler duration; a
+  few percent of B's boundaries can still be missed, and a peer's re-arm
+  can make A re-trap a marker (an extra near-empty snapshot).
   - For coverage: consider a "re-arm after K traps process-wide" policy,
-    or accept it and document that MT is sampled coverage.
-
-  The Review.md safety table now reflects this (it used to rate MT +
-  boundaries as "safe").
+    or accept and keep documenting that MT is sampled coverage (README
+    now says so).
 - [ ] **x86: blocks made only of 1-byte instructions are unpatchable**
   (`leave; ret`, `pop; ret`, a lone `ret`). A limit of the 2-byte UD2
   encoding; now documented in README. A generator-side mitigation would
@@ -239,9 +235,10 @@ the MT stress test fail against the pre-fix code.
   generator, so a symlinked or renamed binary won't resolve.
 - [ ] **shm file fallback** opens `$TMPDIR/<name>` with `O_CREAT` and no
   `O_NOFOLLOW`, which allows a symlink attack on shared hosts.
-- [ ] **Boundary mode leaves the `bitmap_offset` area unused.** A
-  legacy driver reads zeros. Set a header flag or field that points
-  drivers at the ring, or document it prominently. (Review L1)
+- [ ] **ST boundary mode leaves the `bitmap_offset` area unused.** A
+  legacy driver reads zeros. (Under MT it now holds non-worker threads'
+  cumulative coverage.) Set a header flag or field that points drivers
+  at the ring, or document it prominently. (Review L1)
 - [ ] **MT `patch_lookup` returns an entry whose `patched` may be
   mid-transition.** It's correct today because the handler never reads
   `patched` for the trapping entry and relies on the cmpxchg. Write that
@@ -313,8 +310,6 @@ the MT stress test fail against the pre-fix code.
 - [ ] Commit (or drop) `test/run_validation_coverage_options.sh` and
   `test/target_orderable.c`, which are currently untracked. The Makefile
   rule for `target_orderable` now exists; the suite passes 22/22.
-- [ ] Add an MT boundary test with more than one concurrent worker. It
-  would expose the snapshot mixing (P1).
 - [ ] Add a raw `clone(2)` MT stress harness (carried over).
 
 ---

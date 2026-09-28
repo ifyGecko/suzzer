@@ -12,8 +12,9 @@ CFLAGS  ?= -O0 -g -Wall -Wextra
 
 all: $(BUILD)/target_simple $(BUILD)/target_loop $(BUILD)/target_orderable $(BUILD)/fuzz_driver
 
-# pthread MT stress target. Built on demand by the MT validation scripts.
-mt: $(BUILD)/target_simple_mt
+# pthread MT stress target + multi-worker boundary target and its ring
+# reader. Built on demand by the MT validation scripts.
+mt: $(BUILD)/target_simple_mt $(BUILD)/target_loop_mt $(BUILD)/ring_dump
 
 # Multi-module target + helper .so. Built on demand by
 # run_validation_multimod.sh which exercises LCV3's multi-module path.
@@ -70,6 +71,15 @@ $(BUILD)/fuzz_driver: fuzz_driver.c ../src/boundary.h ../src/sink.h
 $(BUILD)/target_simple_mt: target_simple_mt.c
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -pthread -o $@ $<
 
+$(BUILD)/target_loop_mt: target_loop_mt.c
+	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -pthread -o $@ $<
+
+# Passive ring reader for targets that iterate on their own
+# (run_validation_boundary_mt.sh). Same build shape as fuzz_driver.
+$(BUILD)/ring_dump: ring_dump.c ../src/boundary.h
+	$(CC) -O2 -g -Wall -Wextra -I../src -o $@ ring_dump.c \
+	    -Wl,--as-needed -latomic
+
 # target_demalloc deliberately keeps the libc allocator behavior under
 # LD_PRELOAD interception, so it is a normal -no-pie -O0 build.
 $(BUILD)/target_demalloc: target_demalloc.c
@@ -90,5 +100,6 @@ $(BUILD)/target_multimod: target_multimod.c libmultimod_helper.h \
 clean:
 	rm -rf $(BUILD)/target_simple $(BUILD)/target_orderable $(BUILD)/target_simple_thumb \
 	       $(BUILD)/target_simple_mt $(BUILD)/target_loop \
+	       $(BUILD)/target_loop_mt $(BUILD)/ring_dump \
 	       $(BUILD)/target_demalloc $(BUILD)/fuzz_driver \
 	       $(BUILD)/target_multimod $(BUILD)/libmultimod_helper.so

@@ -84,6 +84,10 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
 
     /* A1: single trailing IPI for every write this handler did. */
     patch_sync_batch_end();
+
+    /* Last step: a marker this trap disarmed may now be re-armed by any
+     * thread (boundary.c, g_pending_markers). */
+    boundary_trap_exit();
 }
 
 int handler_install(enum libcov_mode mode, struct sigaction *prev_out) {

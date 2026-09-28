@@ -86,6 +86,15 @@ extern size_t libcov_shm_size;
 
 extern uint8_t *libcov_bitmap;
 
+#if defined(LIBCOV_THREADING_MT)
+/* MT boundary mode: a worker thread's private live bitmap. NULL until the
+ * thread fires its first iteration boundary; until then (and always, for
+ * threads that never fire one) emits go to the shared libcov_bitmap.
+ * Owned by boundary.c, which publishes it into the ring and clears it at
+ * each boundary so a snapshot holds exactly one thread's iteration. */
+extern __thread uint8_t *libcov_thread_bitmap;
+#endif
+
 /* Per-module runtime load bases, indexed by the module_idx field on each
  * patch_entry. Populated by config_load from /proc/self/maps for each
  * named module in the LCV3 header's name table.
@@ -201,11 +210,14 @@ static inline void sink_emit(uintptr_t pc, uint8_t module_idx, uint32_t site_id)
     idx &= libcov_map_mask;
 
 #if defined(LIBCOV_THREADING_MT)
-    /* Saturating atomic increment: load + CAS loop, never decrement past 255. */
-    uint8_t old = __atomic_load_n(&libcov_bitmap[idx], __ATOMIC_RELAXED);
+    /* Saturating atomic increment: load + CAS loop, never decrement past 255.
+     * The private per-thread bitmap is only written by its owner, but the
+     * shared one isn't, so both take the same atomic path. */
+    uint8_t *bm = libcov_thread_bitmap ? libcov_thread_bitmap : libcov_bitmap;
+    uint8_t old = __atomic_load_n(&bm[idx], __ATOMIC_RELAXED);
     while (old < 255) {
         uint8_t want = (uint8_t)(old + 1);
-        if (__atomic_compare_exchange_n(&libcov_bitmap[idx], &old, want,
+        if (__atomic_compare_exchange_n(&bm[idx], &old, want,
                                         0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
             break;
         /* old now holds the value we observed; loop and retry. */

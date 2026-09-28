@@ -378,14 +378,32 @@ it from per-input attribution.
 ### Threading
 
 Per-thread state is `__thread` under `libcov_mt.so`: depth counter,
-touched-set scratch, deferred-marker-rearm pointer. **The live bitmap is
-shared**, however: when one thread publishes, every other thread's
-in-flight coverage lands in that snapshot or the next. With more than one
-thread running iterations concurrently, per-iteration snapshots mix
-threads -- use one worker thread per process for clean attribution (see
-TODO.md). Snapshot publish is last-writer-wins on `gen_current`; the
-seqlock check on the reader side handles the brief window where
-`gen_current` has advanced but the target slot hasn't yet been stamped.
+touched-set scratch, and the live bitmap itself.
+
+- **Worker threads get private live bitmaps.** A thread's first boundary
+  fire switches it from the shared bitmap to its own; every later fire
+  copies that into a ring slot (stamped with the thread's `tid`) and
+  clears it. A snapshot therefore holds exactly one thread's iteration,
+  however many workers run concurrently. That thread's first fire
+  publishes nothing (its earlier coverage isn't attributable to an
+  iteration), except for the first fire in the process, which publishes
+  the init snapshot.
+- **Other threads** (acceptors, timers, anything that never hits a
+  marker) keep emitting into the shared bitmap at `bitmap_offset`, which
+  under MT boundary mode is a cumulative map of non-iteration coverage.
+  (Under ST boundary mode that area is unused.)
+- **Markers are re-armed process-wide.** Any thread's next trap re-arms
+  a marker another thread hit, once that thread has left its handler.
+- **MT coverage is sampled.** A site one thread has disarmed doesn't
+  trap for another until it's re-armed, so with concurrent workers a few
+  percent of boundaries are missed (two iterations of that worker merge
+  into one snapshot) and a few extra, near-empty snapshots appear (a
+  worker re-traps a marker a peer re-armed early).
+
+Publish costs one `map_size` copy per iteration under MT; ST keeps the
+zero-copy pointer swap. Generations are assigned by `fetch_add` on
+`gen_current`, so concurrent publishers may stamp their slots out of
+order; the reader's seqlock check handles a slot that isn't stamped yet.
 
 ## Patch list format (LCV3)
 
@@ -592,12 +610,16 @@ test/
   target_simple.c             single-shot ground-truth target (10+ branches)
   target_simple_mt.c          pthread stress target for MT validation
   target_loop.c               stdin-driven loop target with iter_begin marker
+  target_loop_mt.c            multi-worker boundary target (per-thread paths)
   target_multimod.c           multi-module target (links libmultimod_helper.so)
   libmultimod_helper.c/.h     helper shared library for multi-module test
   fuzz_driver.c               boundary-aware driver (seqlock reader)
+  ring_dump.c                 passive ring reader for self-iterating targets
   run_validation.sh           native ST regression test (single-shot)
   run_validation_mt.sh        native MT regression test + stress
   run_validation_boundary.sh  native boundary-mode test + (MODE, REARM) matrix
+  run_validation_boundary_mt.sh  MT boundary test: concurrent workers' snapshots
+                              must not mix threads
   run_validation_multimod.sh  native multi-module LCV3 test (exe + helper.so)
   target_signals.c            signal-mask / SIGILL-handler regression target
   run_validation_signals.sh   native ST+MT signal-handling regression test

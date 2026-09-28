@@ -55,6 +55,7 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
      * pc is a marker, and if so publishes a snapshot + clears the live
      * bitmap + applies the configured boundary re-arm policy. */
     boundary_on_trap(pc, e);
+    boundary_trap_exit();
 
     /* Returning resumes execution at pc; kernel re-fetches the now-valid insn. */
 }

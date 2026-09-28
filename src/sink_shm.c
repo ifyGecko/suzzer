@@ -15,6 +15,9 @@
 void   *libcov_shm_base = NULL;
 size_t  libcov_shm_size = 0;
 uint8_t *libcov_bitmap  = NULL;
+#if defined(LIBCOV_THREADING_MT)
+__thread uint8_t *libcov_thread_bitmap = NULL;
+#endif
 
 /* Runtime bitmap dimensions, set in sink_init. Power-of-two byte length and
  * its mask; read in the trap-handler hot path. Initialised to the legacy

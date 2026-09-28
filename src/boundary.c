@@ -9,11 +9,20 @@
  * (gettid via SYS_gettid), write. All of these are documented as safe.
  *
  * Threading: marker table + sidecar metadata are shared and read-only
- * after init. Depth, touched set, and deferred-marker-rearm are __thread
- * under LIBCOV_THREADING_MT so concurrent worker threads scope their own
- * iterations cleanly. Snapshot publish to the ring is "last writer wins"
- * on gen_current; a small jitter where two threads boundary-fire in close
- * succession is acceptable for AFL-style fuzzing.
+ * after init (apart from each marker's atomic `pending` flag). Depth and
+ * the touched set are __thread under LIBCOV_THREADING_MT.
+ *
+ * Live bitmaps. ST keeps one live bitmap that IS the next ring slot
+ * (pointer-swap publish, no copy). MT can't: with one shared live bitmap,
+ * every snapshot mixed in whatever peer threads emitted, and two
+ * concurrent publishers could move the shared pointer backwards. Under
+ * MT, a thread's first boundary fire gives it a private live bitmap
+ * (libcov_thread_bitmap); each later fire copies that into its own ring
+ * slot and clears it, so a snapshot holds exactly one thread's
+ * iteration. Threads that never fire a boundary (acceptors, timers) keep
+ * emitting into the shared bitmap at hdr->bitmap_offset, which becomes a
+ * cumulative "background" map. The first boundary in the process
+ * publishes a copy of that shared map as the init snapshot (gen_init).
  */
 #define _GNU_SOURCE
 #include "boundary.h"
@@ -32,6 +41,9 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#if defined(LIBCOV_THREADING_MT)
+#  include <pthread.h>
+#endif
 
 #if defined(LIBCOV_THREADING_MT)
 #  define TLS __thread
@@ -47,9 +59,11 @@ static enum libcov_rearm_policy  g_rearm   = LIBCOV_REARM_NONE;
 /* Marker table -- sorted by addr, lookup is binary-searched in the
  * signal handler hot path. */
 struct marker {
-    uintptr_t addr;
-    uint8_t   kind;          /* LIBCOV_BOUNDARY_KIND_BEGIN / END */
-    uint8_t   depth_filter;  /* 1 = depth-zero only */
+    uintptr_t           addr;
+    struct patch_entry *pe;           /* the patch site at addr (NULL: unpatched) */
+    uint8_t             kind;         /* LIBCOV_BOUNDARY_KIND_BEGIN / END */
+    uint8_t             depth_filter; /* 1 = depth-zero only */
+    uint8_t             pending;      /* atomic: MARKER_{IDLE,HELD,RELEASED} */
 };
 static struct marker *g_markers = NULL;
 static size_t         g_marker_count = 0;
@@ -93,13 +107,45 @@ static TLS uint32_t g_depth = 0;
 static TLS struct patch_entry **g_touched     = NULL;
 static TLS size_t               g_touched_len = 0;
 
-/* Deferred marker re-arm. When REARM=all/touched fires we deliberately
- * leave the just-trapped marker site disarmed; re-arming it before the
- * handler returns would cause the kernel to re-fetch the trap encoding
- * and instantly re-trap (infinite loop). Instead we stash the site here
- * and arm it on the next trap whose pc differs (mirrors leapfrog's
- * "previous site" logic, applied specifically to the boundary marker). */
-static TLS struct patch_entry *g_pending_marker_rearm = NULL;
+/* Deferred marker re-arm, process-wide. A marker that just trapped must
+ * stay disarmed until the thread that hit it has executed the original
+ * instruction -- re-arming it earlier makes that thread trap at the
+ * marker again (a spurious boundary fire). (This used to be a per-thread
+ * slot: a marker one worker had hit stayed disarmed for every other
+ * worker until that worker trapped again, so their boundaries were
+ * silently missed.)
+ *
+ * States of marker.pending:
+ *   HELD     -- the marker trapped and its thread is still in the handler
+ *               (publishing, re-arming, membarrier). Nobody re-arms it.
+ *   RELEASED -- boundary_trap_exit() ran: the thread is about to return
+ *               and execute the original instruction. The next trap at a
+ *               different site, on ANY thread, re-arms it.
+ *
+ * Releasing only at handler exit matters: the handler body takes tens of
+ * microseconds, during which a busy peer traps many times. The residual
+ * window is the owner's sigreturn itself; a peer re-arming inside it
+ * causes one extra, near-empty boundary fire for the owner. */
+enum { MARKER_IDLE = 0, MARKER_HELD = 1, MARKER_RELEASED = 2 };
+static uint32_t g_pending_markers = 0;   /* atomic: markers not IDLE */
+
+/* The marker this thread's current trap is holding, if any. */
+static TLS struct marker *g_held_marker = NULL;
+
+#if defined(LIBCOV_THREADING_MT)
+/* Serializes writers of one ring slot. Two publishers only share a slot
+ * when their gens are RING apart (the reader has lost one of them
+ * anyway), but their copies must not interleave. */
+static uint8_t g_slot_lock[16];
+
+/* Set by the first boundary fire in the process, which publishes the
+ * shared bitmap as the init snapshot. */
+static uint8_t g_init_published = 0;
+
+/* Frees a worker's private live bitmap at thread exit. */
+static pthread_key_t g_bitmap_key;
+static int           g_bitmap_key_ok = 0;
+#endif
 
 /* ---- helpers ------------------------------------------------------ */
 
@@ -145,6 +191,32 @@ static struct libcov_ring_slot_hdr *slot_at(uint64_t gen) {
 static uint8_t *slot_bitmap(struct libcov_ring_slot_hdr *s) {
     return (uint8_t *)(s + 1);
 }
+
+#if defined(LIBCOV_THREADING_MT)
+/* pthread_key destructor, run on the exiting thread. Drop the TLS pointer
+ * before unmapping so any later emit on this thread (another key's
+ * destructor running instrumented code) goes to the shared bitmap. */
+static void thread_bitmap_free(void *p) {
+    if (libcov_thread_bitmap == p) {
+        libcov_thread_bitmap = NULL;
+        __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    }
+    munmap(p, libcov_map_size);
+}
+
+/* Allocate this thread's private live bitmap. Called from the trap
+ * handler, so no malloc: anonymous mmap is a plain syscall. The
+ * pthread_setspecific only registers the destructor; for the low key
+ * numbers libcov gets at init, glibc stores it in the thread descriptor
+ * without allocating. */
+static uint8_t *thread_bitmap_alloc(void) {
+    void *p = mmap(NULL, libcov_map_size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return NULL;
+    if (g_bitmap_key_ok) pthread_setspecific(g_bitmap_key, p);
+    return p;
+}
+#endif
 
 /* ---- sidecar parsing -------------------------------------------------- */
 
@@ -267,6 +339,26 @@ int boundary_init(void) {
     g_slot_stride = g_hdr->slot_stride;
     g_ring_base   = (uint8_t *)libcov_shm_base + g_hdr->ring_offset;
 
+    /* Resolve each marker's patch site for the deferred re-arm. A marker
+     * that isn't a patched site never traps, so it can never fire. */
+    for (size_t i = 0; i < g_marker_count; i++) {
+        g_markers[i].pe = patch_lookup(g_markers[i].addr);
+        if (!g_markers[i].pe)
+            libcov_logf("boundary: WARNING -- marker 0x%lx is not a patched site "
+                        "and will never fire (check gen_boundary.py --patchlist)",
+                        (unsigned long)g_markers[i].addr);
+    }
+
+#if defined(LIBCOV_THREADING_MT)
+    if (pthread_key_create(&g_bitmap_key, thread_bitmap_free) == 0)
+        g_bitmap_key_ok = 1;
+    else
+        libcov_logf("boundary: pthread_key_create failed; per-thread live "
+                    "bitmaps will not be freed at thread exit");
+    /* The live bitmap stays the shared one at hdr->bitmap_offset until a
+     * thread fires its first boundary (see the file header). */
+#else
+
     /* A5: under boundary mode the live bitmap rotates through ring slots.
      * Switch libcov_bitmap to slot[1].bitmap now -- gen=1 is the first
      * gen that publish_snapshot() will stamp, so writes accumulated
@@ -281,6 +373,7 @@ int boundary_init(void) {
     struct libcov_ring_slot_hdr *first_slot = slot_at(1);
     __atomic_store_n(&first_slot->slot_gen, (uint64_t)0, __ATOMIC_RELEASE);
     libcov_bitmap = slot_bitmap(first_slot);
+#endif
 
     uint32_t mt_flag = 0;
 #if defined(LIBCOV_THREADING_MT)
@@ -316,7 +409,10 @@ static inline void touched_append(struct patch_entry *e) {
     }
 }
 
-/* Publish the live bitmap to ring[gen % RING] and rotate the live
+#if !defined(LIBCOV_THREADING_MT)
+/* ST publish (MT uses publish_copy below).
+ *
+ * Publish the live bitmap to ring[gen % RING] and rotate the live
  * pointer to the next slot's bitmap area. Per-slot generation stamps
  * let the driver detect torn reads via the seqlock pattern. The caller
  * has already incremented hdr->gen_current (via fetch_add); we don't
@@ -382,6 +478,55 @@ static void publish_snapshot(uint64_t gen) {
      * clear) and acceptable for AFL-style fuzzing. */
     memset(libcov_prev_loc, 0, sizeof libcov_prev_loc);
 }
+#endif
+
+#if defined(LIBCOV_THREADING_MT)
+static inline void slot_lock(uint8_t *l) {
+    uint8_t expected = 0;
+    while (!__atomic_compare_exchange_n(l, &expected, 1, 0,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+        expected = 0;
+        __asm__ volatile ("" ::: "memory");
+    }
+}
+
+static inline void slot_unlock(uint8_t *l) {
+    __atomic_store_n(l, 0, __ATOMIC_RELEASE);
+}
+
+/* MT publish: copy `src` into ring[gen % RING] under the seqlock protocol.
+ * `src` is the publishing thread's private live bitmap (only it writes
+ * there, and it's inside its own trap handler, so the copy is exact), or
+ * the shared bitmap for the init snapshot (a best-effort copy while peers
+ * may still be emitting). Costs one map_size memcpy per iteration -- the
+ * price of per-thread attribution; ST keeps the zero-copy pointer swap. */
+static void publish_copy(uint64_t gen, const uint8_t *src) {
+    struct libcov_ring_slot_hdr *s = slot_at(gen);
+    uint8_t *lock = &g_slot_lock[gen % g_ring_size];
+
+    slot_lock(lock);
+    /* A publisher RING gens ahead already took this slot: our snapshot
+     * is outside every reader's window, so drop it rather than overwrite
+     * newer data with older. */
+    if (__atomic_load_n(&s->slot_gen, __ATOMIC_RELAXED) > gen) {
+        slot_unlock(lock);
+        return;
+    }
+    __atomic_store_n(&s->slot_gen, (uint64_t)0, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);   /* see publish_snapshot */
+    s->tid   = cur_tid();
+    s->ns    = now_ns();
+    s->flags = 0;
+    memcpy(slot_bitmap(s), src, libcov_map_size);
+    __atomic_store_n(&s->slot_gen, gen, __ATOMIC_RELEASE);
+    slot_unlock(lock);
+
+    if (g_eventfd >= 0) {
+        uint64_t one = 1;
+        (void)write(g_eventfd, &one, sizeof one);
+    }
+}
+#endif
 
 static void apply_rearm_policy(struct patch_entry *exclude) {
     /* A1: every rearm uses _unsynced; the handler issues one
@@ -420,10 +565,49 @@ static void apply_rearm_policy(struct patch_entry *exclude) {
     }
     }
     g_touched_len = 0;
-    /* Defer the excluded (current) site's re-arm to the next trap so the
-     * kernel doesn't immediately re-trap on the instruction we're about
-     * to return to. */
-    if (g_rearm != LIBCOV_REARM_NONE) g_pending_marker_rearm = exclude;
+    /* The excluded (current) site is the marker; its re-arm is deferred
+     * through the marker's pending flag (see g_pending_markers). */
+}
+
+/* Re-arm every RELEASED marker, whichever thread hit it, except the site
+ * trapping right now. Fast path: one load when nothing is pending. */
+static void flush_pending_markers(struct patch_entry *cur) {
+    if (!__atomic_load_n(&g_pending_markers, __ATOMIC_ACQUIRE)) return;
+    for (size_t i = 0; i < g_marker_count; i++) {
+        struct marker *m = &g_markers[i];
+        if (m->pe == cur) continue;
+        uint8_t released = MARKER_RELEASED;
+        if (!__atomic_compare_exchange_n(&m->pending, &released, MARKER_IDLE, 0,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            continue;
+        __atomic_sub_fetch(&g_pending_markers, 1, __ATOMIC_RELEASE);
+        /* A1: unsynced; the handler tail's patch_sync_batch_end() covers it. */
+        if (!__atomic_load_n(&m->pe->patched, __ATOMIC_RELAXED))
+            patch_arm_unsynced(m->pe);
+    }
+}
+
+/* Hold a marker that this thread just trapped on. A marker already HELD
+ * by a peer that trapped on it at the same moment (MT: both traps
+ * converged) keeps the peer as holder; we then have nothing to release. */
+static void hold_marker(struct marker *m) {
+    uint8_t cur = __atomic_load_n(&m->pending, __ATOMIC_RELAXED);
+    for (;;) {
+        if (!m->pe || cur == MARKER_HELD) return;
+        if (__atomic_compare_exchange_n(&m->pending, &cur, MARKER_HELD, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            break;
+    }
+    if (cur == MARKER_IDLE)
+        __atomic_add_fetch(&g_pending_markers, 1, __ATOMIC_RELEASE);
+    g_held_marker = m;
+}
+
+void boundary_trap_exit(void) {
+    struct marker *m = g_held_marker;
+    if (!m) return;
+    g_held_marker = NULL;
+    __atomic_store_n(&m->pending, MARKER_RELEASED, __ATOMIC_RELEASE);
 }
 
 static void maybe_record_init(uint64_t gen) {
@@ -437,20 +621,10 @@ static void maybe_record_init(uint64_t gen) {
 void boundary_on_trap(uintptr_t pc, struct patch_entry *e) {
     if (!g_enabled) return;
 
-    /* Flush any deferred marker re-arm from a previous boundary fire on
-     * this thread -- but only if this trap is at a different pc
-     * (otherwise we'd re-trap on the same site we're trying to leave).
-     * A1: unsynced; the handler tail's patch_sync_batch_end() covers it. */
-    if (g_pending_marker_rearm && g_pending_marker_rearm != e) {
-#if defined(LIBCOV_THREADING_MT)
-        if (!__atomic_load_n(&g_pending_marker_rearm->patched,
-                             __ATOMIC_RELAXED))
-            patch_arm_unsynced(g_pending_marker_rearm);
-#else
-        if (!g_pending_marker_rearm->patched) patch_arm_unsynced(g_pending_marker_rearm);
-#endif
-        g_pending_marker_rearm = NULL;
-    }
+    /* Re-arm markers left disarmed by earlier marker traps (any thread),
+     * but never the site trapping right now -- we'd re-trap on the
+     * instruction we're about to return to. */
+    flush_pending_markers(e);
 
     /* Track this disarm so 'touched' re-arm can find it later. Only needed
      * (and only allocates) under REARM=touched. */
@@ -458,6 +632,10 @@ void boundary_on_trap(uintptr_t pc, struct patch_entry *e) {
 
     struct marker *m = marker_lookup(pc);
     if (!m) return;
+
+    /* Every marker trap leaves the marker disarmed, whether or not it
+     * fires a boundary below (depth filter, init grace). */
+    hold_marker(m);
 
     /* Depth tracking:
      *   paired mode (sidecar contains END markers): BEGIN increments depth,
@@ -492,9 +670,33 @@ void boundary_on_trap(uintptr_t pc, struct patch_entry *e) {
      * the reader's seqlock check handles the brief window where
      * gen_current has advanced but the corresponding slot's stamp has
      * not yet been written. */
+#if defined(LIBCOV_THREADING_MT)
+    if (!libcov_thread_bitmap) {
+        /* This thread's first boundary: from now on it emits into its own
+         * live bitmap. What it emitted before went to the shared bitmap
+         * and isn't attributable to one iteration, so it publishes
+         * nothing -- except the first boundary in the process, which
+         * publishes the shared bitmap as the init snapshot. */
+        uint8_t *mine = thread_bitmap_alloc();
+        if (!mine) return;   /* stay on the shared bitmap; can't publish */
+        libcov_thread_bitmap = mine;
+        if (!__atomic_exchange_n(&g_init_published, 1, __ATOMIC_ACQ_REL)) {
+            uint64_t gen = __atomic_add_fetch(&g_hdr->gen_current, 1,
+                                              __ATOMIC_ACQ_REL);
+            maybe_record_init(gen);
+            publish_copy(gen, libcov_bitmap);
+        }
+    } else {
+        uint64_t gen = __atomic_add_fetch(&g_hdr->gen_current, 1, __ATOMIC_ACQ_REL);
+        publish_copy(gen, libcov_thread_bitmap);
+        memset(libcov_thread_bitmap, 0, libcov_map_size);
+    }
+    memset(libcov_prev_loc, 0, sizeof libcov_prev_loc);
+#else
     uint64_t gen = __atomic_add_fetch(&g_hdr->gen_current, 1, __ATOMIC_ACQ_REL);
     maybe_record_init(gen);
     publish_snapshot(gen);
+#endif
     apply_rearm_policy(e);
 
     /* In begin-only mode, depth tracking has no end-of-iter signal -- we

@@ -16,10 +16,11 @@
  *     against desync.
  *
  * Threading: most state is shared across threads; depth tracking, the
- * touched-this-iter stack, and the deferred-rearm slot are per-thread
- * (__thread) under LIBCOV_THREADING_MT so two concurrent request handlers
- * don't corrupt each other's iteration scoping. The same source compiles
- * with plain globals under LIBCOV_THREADING_ST.
+ * touched-this-iter stack, and (once a thread fires its first boundary)
+ * the live bitmap are per-thread (__thread) under LIBCOV_THREADING_MT so
+ * two concurrent request handlers don't corrupt each other's iteration
+ * scoping or snapshots. The same source compiles with plain globals under
+ * LIBCOV_THREADING_ST. See boundary.c's header for the details.
  *
  * Boundaries are inert unless LIBCOV_BOUNDARY_LIST is set; existing
  * coverage runs are unaffected.
@@ -120,5 +121,11 @@ int boundary_enabled(void);
  * the boundary re-arm policy. Signal-safe. No-op when boundaries are
  * disabled. */
 void boundary_on_trap(uintptr_t pc, struct patch_entry *e);
+
+/* Called by the trap handler as its very last step, after
+ * patch_sync_batch_end(). Releases a marker this trap disarmed so that
+ * the next trap on any thread can re-arm it (see boundary.c). Signal-safe.
+ * No-op when boundaries are disabled or this trap wasn't at a marker. */
+void boundary_trap_exit(void);
 
 #endif
