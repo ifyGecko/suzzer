@@ -51,6 +51,15 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Per-run scratch dir (fixed /tmp paths made parallel runs collide). Kept
+# when anything fails, since the per-arch logs in it are how you debug.
+WORK=$(mktemp -d -t libcov_cross.XXXXXX)
+keep_work_on_failure() {
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then rm -rf "$WORK"; else echo "logs kept in $WORK" >&2; fi
+    return $rc
+}
+trap keep_work_on_failure EXIT
 cd "$ROOT"
 
 ARCHES=( x86_64 aarch64 arm mips mipsel mips64 mips64el powerpc powerpc64 powerpc64le riscv64 )
@@ -118,12 +127,8 @@ run_target_clean() {
     fi
 }
 
-bitmap_stats() {
-    python3 -c "
-with open('$1','rb') as f: d=f.read()
-if d[:4] == b'LCVS': d = d[72:72+65536]
-n=sum(1 for b in d if b); t=sum(d); m=max(d) if d else 0
-print(n, t, m)"
+bitmap_stats() {  # "<nonzero> <sum> <max>" of the live bitmap
+    python3 "$ROOT/test/shm_bitmap.py" stats "$1"
 }
 
 is_full_run_arch() {
@@ -166,15 +171,15 @@ for arch in "${ARCHES[@]}"; do
     target_bin="build/$arch/target_simple_mt"
     libcov_so="$ROOT/build/$arch/libcov_mt.so"
 
-    LCV=/tmp/$arch.mt.lcv
-    SHM=/tmp/$arch.mt.shm
-    LOG=/tmp/$arch.mt.log
+    LCV=$WORK/$arch.mt.lcv
+    SHM=$WORK/$arch.mt.shm
+    LOG=$WORK/$arch.mt.log
 
     if ! ./tools/gen_patchlist.py "$target_bin" "$LCV" --threading mt \
             --include-pat '^dbg\.(main|classify|loop_sum|cmdline|worker)$' \
-            >/dev/null 2>/tmp/$arch.mt.gen.log; then
+            >/dev/null 2>$WORK/$arch.mt.gen.log; then
         echo "FAIL gen_patchlist"
-        tail -5 /tmp/$arch.mt.gen.log
+        tail -5 $WORK/$arch.mt.gen.log
         FAIL=$((FAIL+1)); FAILED+=("$arch:gen"); continue
     fi
 
@@ -204,8 +209,8 @@ print(c, th)")
 
     # Full-run path (x86_64 native + aarch64 under qemu).
     run_target_clean "$arch" "$target_bin" "$THREADS" "$ITERS" "${INPUTS[@]}" \
-        > /tmp/$arch.mt.bare 2>&1
-    if [[ $? -ne 0 ]] || ! grep -q '^TOTAL=' /tmp/$arch.mt.bare; then
+        > $WORK/$arch.mt.bare 2>&1
+    if [[ $? -ne 0 ]] || ! grep -q '^TOTAL=' $WORK/$arch.mt.bare; then
         echo "  SKIP (baseline run failed)"
         SKIP=$((SKIP+1)); continue
     fi
@@ -214,11 +219,11 @@ print(c, th)")
     LIBCOV_PATCHLIST="$LCV" LIBCOV_SHM_PATH="$SHM" LIBCOV_MODE=oneshot \
         LIBCOV_LOG="$LOG" \
         run_target "$arch" "$libcov_so" "$target_bin" \
-        "$THREADS" "$ITERS" "${INPUTS[@]}" > /tmp/$arch.mt.os 2>&1
+        "$THREADS" "$ITERS" "${INPUTS[@]}" > $WORK/$arch.mt.os 2>&1
     rc=$?
     if [[ $rc -ne 0 ]]; then
         echo "FAIL oneshot run rc=$rc"
-        tail -10 /tmp/$arch.mt.os; tail -10 "$LOG"
+        tail -10 $WORK/$arch.mt.os; tail -10 "$LOG"
         FAIL=$((FAIL+1)); FAILED+=("$arch:oneshot_rc"); continue
     fi
     read edges total maxh < <(bitmap_stats "$SHM")
@@ -228,11 +233,11 @@ print(c, th)")
         FAIL=$((FAIL+1)); FAILED+=("$arch:oneshot_edges"); continue
     fi
 
-    sort /tmp/$arch.mt.bare > /tmp/$arch.mt.bare.s
-    sort /tmp/$arch.mt.os   > /tmp/$arch.mt.os.s
-    if ! diff -q /tmp/$arch.mt.bare.s /tmp/$arch.mt.os.s >/dev/null; then
+    sort $WORK/$arch.mt.bare > $WORK/$arch.mt.bare.s
+    sort $WORK/$arch.mt.os   > $WORK/$arch.mt.os.s
+    if ! diff -q $WORK/$arch.mt.bare.s $WORK/$arch.mt.os.s >/dev/null; then
         echo "FAIL oneshot target output differs from baseline"
-        diff /tmp/$arch.mt.bare.s /tmp/$arch.mt.os.s | head -10
+        diff $WORK/$arch.mt.bare.s $WORK/$arch.mt.os.s | head -10
         FAIL=$((FAIL+1)); FAILED+=("$arch:oneshot_out"); continue
     fi
 
@@ -240,11 +245,11 @@ print(c, th)")
     LIBCOV_PATCHLIST="$LCV" LIBCOV_SHM_PATH="$SHM" LIBCOV_MODE=leapfrog \
         LIBCOV_LOG="$LOG" \
         run_target "$arch" "$libcov_so" "$target_bin" \
-        "$THREADS" "$ITERS" "${INPUTS[@]}" > /tmp/$arch.mt.lf 2>&1
+        "$THREADS" "$ITERS" "${INPUTS[@]}" > $WORK/$arch.mt.lf 2>&1
     rc=$?
     if [[ $rc -ne 0 ]]; then
         echo "FAIL leapfrog run rc=$rc"
-        tail -10 /tmp/$arch.mt.lf; tail -10 "$LOG"
+        tail -10 $WORK/$arch.mt.lf; tail -10 "$LOG"
         FAIL=$((FAIL+1)); FAILED+=("$arch:lf_rc"); continue
     fi
     read edges_lf total_lf maxh_lf < <(bitmap_stats "$SHM")
@@ -257,10 +262,10 @@ print(c, th)")
         FAIL=$((FAIL+1)); FAILED+=("$arch:lf_multi"); continue
     fi
 
-    sort /tmp/$arch.mt.lf > /tmp/$arch.mt.lf.s
-    if ! diff -q /tmp/$arch.mt.bare.s /tmp/$arch.mt.lf.s >/dev/null; then
+    sort $WORK/$arch.mt.lf > $WORK/$arch.mt.lf.s
+    if ! diff -q $WORK/$arch.mt.bare.s $WORK/$arch.mt.lf.s >/dev/null; then
         echo "FAIL leapfrog target output differs from baseline"
-        diff /tmp/$arch.mt.bare.s /tmp/$arch.mt.lf.s | head -10
+        diff $WORK/$arch.mt.bare.s $WORK/$arch.mt.lf.s | head -10
         FAIL=$((FAIL+1)); FAILED+=("$arch:lf_out"); continue
     fi
 

@@ -7,10 +7,13 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Per-run scratch dir: fixed /tmp paths made parallel runs collide.
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
 ARCH="${ARCH:-$(uname -m)}"
 BUILD="$ROOT/build/$ARCH"
 TARGET="$BUILD/target_signals"
-SHM="/tmp/libcov_validate_signals"
+SHM="$WORK/libcov_validate_signals"
 
 ${CC:-gcc} -O0 -g -no-pie -pthread -o "$TARGET" "$ROOT/test/target_signals.c" \
     || { echo "FAIL: build target_signals"; exit 1; }
@@ -29,7 +32,7 @@ for th in st mt; do
     if [[ ! -f "$LIB" ]]; then
         echo "SKIP: $LIB missing (make THREADING=$th)"; continue
     fi
-    LCV="/tmp/target_signals_$th.lcv"
+    LCV="$WORK/target_signals_$th.lcv"
     "$ROOT/tools/gen_patchlist.py" "$TARGET" "$LCV" --threading "$th" \
         --include-pat 'work$' >/dev/null 2>&1 \
         || { echo "FAIL: gen_patchlist ($th)"; fail=1; continue; }

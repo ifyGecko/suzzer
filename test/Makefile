@@ -8,7 +8,7 @@ BUILD ?= ../build/$(ARCH)
 CC      := $(CROSS)gcc
 CFLAGS  ?= -O0 -g -Wall -Wextra
 
-.PHONY: all clean mt loop demalloc multimod
+.PHONY: all clean mt loop demalloc multimod o2pie
 
 all: $(BUILD)/target_simple $(BUILD)/target_loop $(BUILD)/target_orderable \
      $(BUILD)/target_dispatch $(BUILD)/fuzz_driver
@@ -56,6 +56,22 @@ $(BUILD)/target_orderable: target_orderable.c
 $(BUILD)/target_dispatch: target_dispatch.c
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -o $@ $<
 
+# -O2 PIE builds of the ground-truth targets (run_validation_o2pie.sh).
+# Every other target is -O0 -no-pie; real targets have tail calls, cold
+# splits, jump tables and shrink-wrapped prologues, and a load base that
+# moves under ASLR.
+O2PIE_CFLAGS := -O2 -g -Wall -fPIE -pie -fno-stack-protector
+ifeq ($(ARCH),arm)
+  O2PIE_CFLAGS += -marm
+endif
+o2pie: $(BUILD)/target_simple_o2pie $(BUILD)/target_dispatch_o2pie
+
+$(BUILD)/target_simple_o2pie: target_simple.c
+	$(CC) $(O2PIE_CFLAGS) -o $@ $<
+
+$(BUILD)/target_dispatch_o2pie: target_dispatch.c
+	$(CC) $(O2PIE_CFLAGS) -o $@ $<
+
 # Thumb variant: only built when explicitly asked (make thumb).
 $(BUILD)/target_simple_thumb: target_simple.c
 	$(CC) $(CFLAGS) -no-pie -fno-stack-protector -mthumb -o $@ $<
@@ -101,10 +117,11 @@ $(BUILD)/libmultimod_helper.so: libmultimod_helper.c libmultimod_helper.h
 $(BUILD)/target_multimod: target_multimod.c libmultimod_helper.h \
                           $(BUILD)/libmultimod_helper.so
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -I. -o $@ target_multimod.c \
-	    -L$(BUILD) -lmultimod_helper -Wl,-rpath,$(BUILD)
+	    -L$(BUILD) -lmultimod_helper -Wl,-rpath,$(abspath $(BUILD))
 
 clean:
-	rm -rf $(BUILD)/target_simple $(BUILD)/target_orderable $(BUILD)/target_dispatch $(BUILD)/target_simple_thumb \
+	rm -rf $(BUILD)/target_simple $(BUILD)/target_orderable $(BUILD)/target_dispatch \
+	       $(BUILD)/target_simple_o2pie $(BUILD)/target_dispatch_o2pie $(BUILD)/target_simple_thumb \
 	       $(BUILD)/target_simple_mt $(BUILD)/target_loop \
 	       $(BUILD)/target_loop_mt $(BUILD)/ring_dump \
 	       $(BUILD)/target_demalloc $(BUILD)/fuzz_driver \

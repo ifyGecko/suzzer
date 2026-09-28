@@ -14,12 +14,15 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Per-run scratch dir: fixed /tmp paths made parallel runs collide.
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
 ARCH="${ARCH:-$(uname -m)}"
 LIB="$ROOT/build/$ARCH/libcov_st.so"
 TARGET="$ROOT/build/$ARCH/target_loop"
 DRIVER="$ROOT/build/$ARCH/fuzz_driver"
-LCV="/tmp/target_loop.lcv"
-LCVB="/tmp/target_loop.lcvb"
+LCV="$WORK/target_loop.lcv"
+LCVB="$WORK/target_loop.lcvb"
 
 if [[ "$(cat /proc/sys/kernel/randomize_va_space)" != "0" ]]; then
     echo "WARN: ASLR is on; PoC assumes ASLR off for deterministic addresses" >&2
@@ -32,14 +35,13 @@ fi
 echo ">> regenerate patch list for target_loop"
 "$ROOT/tools/gen_patchlist.py" "$TARGET" "$LCV" \
     --include-pat '^dbg\.(main|classify|loop_sum|cmdline|process_one|iter_begin)$' \
-    >/dev/null 2>/tmp/v_b.gen.log
+    >/dev/null 2>$WORK/v_b.gen.log
 
 echo ">> generate boundary sidecar (iter_begin = depth-zero begin marker)"
 "$ROOT/tools/gen_boundary.py" "$TARGET" "$LCVB" iter_begin:begin:zero \
-    >/dev/null 2>/tmp/v_b.bnd.log
+    >/dev/null 2>$WORK/v_b.bnd.log
 
-OUT=$(mktemp)
-trap "rm -f $OUT" EXIT
+OUT="$WORK/driver.out"
 
 INPUTS=$'42\n99\n-3\nabc\nhello\n'
 
@@ -95,7 +97,7 @@ echo ">> sanity-check the (MODE, REARM) matrix"
 check_combo() {
     local mode="$1" rearm="$2" want_min="$3"
     local out
-    out=$(mktemp)
+    out="$WORK/combo.out"
     LIBCOV_MODE="$mode" LIBCOV_BOUNDARY_REARM="$rearm" \
         "$DRIVER" "$LIB" "$LCV" "$LCVB" "$TARGET" \
         < <(printf '42\n99\n-3\n') > "$out" 2>&1
@@ -104,17 +106,14 @@ check_combo() {
     if [[ "$g" -lt "$want_min" ]]; then
         echo "FAIL: MODE=$mode REARM=$rearm produced $g gens (want >= $want_min)" >&2
         cat "$out" >&2
-        rm -f "$out"
         exit 1
     fi
     if grep -q 'OVERRUN\|torn\|read_slot.*failed' "$out"; then
         echo "FAIL: MODE=$mode REARM=$rearm reported desync" >&2
         cat "$out" >&2
-        rm -f "$out"
         exit 1
     fi
     echo "   OK: MODE=$mode REARM=$rearm produced $g gens"
-    rm -f "$out"
 }
 # 3 inputs -> 4 gens published (init + 3 coverage slots).
 check_combo leapfrog none    4
@@ -126,14 +125,14 @@ echo ">> LIBCOV_BOUNDARY_NOTIFY_FD: eventfd accepted and signalled, pipe refused
 # The notify write runs inside the trap handler; a pipe could block it
 # forever (full) or SIGPIPE the target (reader gone), so libcov must only
 # accept an eventfd.
-python3 - "$LIB" "$LCV" "$LCVB" "$TARGET" <<'PYEOF'
+python3 - "$LIB" "$LCV" "$LCVB" "$TARGET" "$WORK" <<'PYEOF'
 import os, subprocess, sys
-lib, lcv, lcvb, target = sys.argv[1:]
+lib, lcv, lcvb, target, work = sys.argv[1:]
 
 def run(fd):
     env = dict(os.environ, LD_PRELOAD=lib, LIBCOV_PATCHLIST=lcv,
                LIBCOV_BOUNDARY_LIST=lcvb, LIBCOV_MODE="leapfrog",
-               LIBCOV_SHM_PATH=f"/tmp/libcov_notify_{os.getpid()}",
+               LIBCOV_SHM_PATH=f"{work}/notify_{fd}.shm",
                LIBCOV_BOUNDARY_NOTIFY_FD=str(fd))
     p = subprocess.run([target], input=b"42\n99\n", env=env, pass_fds=(fd,),
                        capture_output=True, timeout=30)

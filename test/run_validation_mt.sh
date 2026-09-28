@@ -14,11 +14,14 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Per-run scratch dir: fixed /tmp paths made parallel runs collide.
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
 ARCH="${ARCH:-$(uname -m)}"
 LIB="$ROOT/build/$ARCH/libcov_mt.so"
 TARGET="$ROOT/build/$ARCH/target_simple_mt"
-LCV="/tmp/target_simple_mt.lcv"
-SHM="/tmp/libcov_validate_mt"
+LCV="$WORK/target_simple_mt.lcv"
+SHM="$WORK/libcov_validate_mt"
 
 THREADS="${THREADS:-8}"
 ITERS="${ITERS:-200}"
@@ -34,7 +37,7 @@ fi
 echo ">> generate MT patch list"
 "$ROOT/tools/gen_patchlist.py" "$TARGET" "$LCV" --threading mt \
     --include-pat '^dbg\.(main|classify|loop_sum|cmdline|worker)$' \
-    >/dev/null 2>/tmp/v_mt.gen.log
+    >/dev/null 2>$WORK/v_mt.gen.log
 records=$(python3 -c "
 import struct
 with open('$LCV','rb') as f: h=f.read(16)
@@ -44,8 +47,8 @@ print(f'magic={m.decode()} version={v} records={c} threading={th}')")
 echo "   $records"
 
 echo ">> baseline run without libcov"
-"$TARGET" "$THREADS" "$ITERS" "${INPUTS[@]}" > /tmp/v_mt.bare 2>&1
-bare_total=$(grep '^TOTAL=' /tmp/v_mt.bare)
+"$TARGET" "$THREADS" "$ITERS" "${INPUTS[@]}" > $WORK/v_mt.bare 2>&1
+bare_total=$(grep '^TOTAL=' $WORK/v_mt.bare)
 echo "   $bare_total"
 
 # The shm file starts with a 72-byte libcov_shm_header followed by the
@@ -53,62 +56,51 @@ echo "   $bare_total"
 # live bitmap only. python avoids the SIGPIPE-vs-pipefail interaction
 # of a tail|head pipeline.
 extract_bitmap() {
-    python3 -c "
-import sys
-with open(sys.argv[1],'rb') as f:
-    f.seek(72); d = f.read(65536)
-with open(sys.argv[2],'wb') as f:
-    f.write(d)" "$1" "$2"
+    python3 "$ROOT/test/shm_bitmap.py" extract "$1" "$2"
 }
 
 run_under_libcov() {
     local mode=$1 out=$2
     rm -f "$SHM"
     LIBCOV_PATCHLIST="$LCV" LIBCOV_SHM_PATH="$SHM" LIBCOV_MODE="$mode" \
-        LIBCOV_LOG=/tmp/v_mt.${mode}.log LD_PRELOAD="$LIB" \
+        LIBCOV_LOG=$WORK/v_mt.${mode}.log LD_PRELOAD="$LIB" \
         "$TARGET" "$THREADS" "$ITERS" "${INPUTS[@]}" > "$out" 2>&1
     extract_bitmap "$SHM" "$out.bitmap"
 }
 
-# Accepts either a pre-extracted bitmap file or a raw shm. It auto-detects
-# by checking the first 4 bytes for the "LCVS" magic; if present, skips
-# the 72-byte header.
+# Accepts either a pre-extracted bitmap file or a raw shm (detected by
+# the "LCVS" magic; see test/shm_bitmap.py).
 bitmap_stats() {
-    python3 -c "
-import sys
-with open(sys.argv[1],'rb') as f: d=f.read()
-if d[:4] == b'LCVS': d = d[72:72+65536]
-n=sum(1 for b in d if b); t=sum(d); m=max(d) if d else 0
-print(n, t, m)" "$1"
+    python3 "$ROOT/test/shm_bitmap.py" stats "$1"
 }
 
 echo ">> oneshot MT run (threads=$THREADS iters=$ITERS)"
-run_under_libcov oneshot /tmp/v_mt.os
-read edges total maxh < <(bitmap_stats /tmp/v_mt.os.bitmap)
+run_under_libcov oneshot $WORK/v_mt.os
+read edges total maxh < <(bitmap_stats $WORK/v_mt.os.bitmap)
 echo "   edges=$edges total=$total max_hits=$maxh"
 [[ "$edges" -gt 0 ]] || { echo "FAIL: oneshot recorded zero edges"; exit 1; }
 
 # Output equivalence: with libcov_mt loaded, the per-thread checksums must
 # match the bare run. Thread completion order is not deterministic, so we
 # compare sorted line sets.
-sort /tmp/v_mt.bare > /tmp/v_mt.bare.s
-sort /tmp/v_mt.os   > /tmp/v_mt.os.s
-diff -q /tmp/v_mt.bare.s /tmp/v_mt.os.s >/dev/null \
+sort $WORK/v_mt.bare > $WORK/v_mt.bare.s
+sort $WORK/v_mt.os   > $WORK/v_mt.os.s
+diff -q $WORK/v_mt.bare.s $WORK/v_mt.os.s >/dev/null \
     || { echo "FAIL: oneshot MT target output differs from baseline"; \
-         diff /tmp/v_mt.bare.s /tmp/v_mt.os.s | head -20; exit 1; }
+         diff $WORK/v_mt.bare.s $WORK/v_mt.os.s | head -20; exit 1; }
 echo "   OK: target output unchanged under libcov_mt"
 
 echo ">> leapfrog MT run"
-run_under_libcov leapfrog /tmp/v_mt.lf
-read edges total maxh < <(bitmap_stats /tmp/v_mt.lf.bitmap)
+run_under_libcov leapfrog $WORK/v_mt.lf
+read edges total maxh < <(bitmap_stats $WORK/v_mt.lf.bitmap)
 echo "   edges=$edges total=$total max_hits=$maxh"
 [[ "$edges" -gt 0 ]] || { echo "FAIL: leapfrog recorded zero edges"; exit 1; }
 [[ "$maxh"  -ge 2 ]] || { echo "FAIL: leapfrog never accumulated multi-hit (max=$maxh)"; exit 1; }
 
-sort /tmp/v_mt.lf  > /tmp/v_mt.lf.s
-diff -q /tmp/v_mt.bare.s /tmp/v_mt.lf.s >/dev/null \
+sort $WORK/v_mt.lf  > $WORK/v_mt.lf.s
+diff -q $WORK/v_mt.bare.s $WORK/v_mt.lf.s >/dev/null \
     || { echo "FAIL: leapfrog MT target output differs from baseline"; \
-         diff /tmp/v_mt.bare.s /tmp/v_mt.lf.s | head -20; exit 1; }
+         diff $WORK/v_mt.bare.s $WORK/v_mt.lf.s | head -20; exit 1; }
 echo "   OK: target output unchanged under leapfrog MT"
 
 echo ">> stress: many threads, many iters, leapfrog"
@@ -116,18 +108,18 @@ THREADS_STRESS="${THREADS_STRESS:-16}"
 ITERS_STRESS="${ITERS_STRESS:-2000}"
 rm -f "$SHM"
 LIBCOV_PATCHLIST="$LCV" LIBCOV_SHM_PATH="$SHM" LIBCOV_MODE=leapfrog \
-    LIBCOV_LOG=/tmp/v_mt.stress.log LD_PRELOAD="$LIB" \
-    "$TARGET" "$THREADS_STRESS" "$ITERS_STRESS" "${INPUTS[@]}" > /tmp/v_mt.stress 2>&1
+    LIBCOV_LOG=$WORK/v_mt.stress.log LD_PRELOAD="$LIB" \
+    "$TARGET" "$THREADS_STRESS" "$ITERS_STRESS" "${INPUTS[@]}" > $WORK/v_mt.stress 2>&1
 read edges total maxh < <(bitmap_stats "$SHM")
 echo "   threads=$THREADS_STRESS iters=$ITERS_STRESS edges=$edges total=$total max_hits=$maxh"
 
 # Stress baseline equivalence too.
-"$TARGET" "$THREADS_STRESS" "$ITERS_STRESS" "${INPUTS[@]}" > /tmp/v_mt.stress.bare 2>&1
-sort /tmp/v_mt.stress       > /tmp/v_mt.stress.s
-sort /tmp/v_mt.stress.bare  > /tmp/v_mt.stress.bare.s
-diff -q /tmp/v_mt.stress.bare.s /tmp/v_mt.stress.s >/dev/null \
+"$TARGET" "$THREADS_STRESS" "$ITERS_STRESS" "${INPUTS[@]}" > $WORK/v_mt.stress.bare 2>&1
+sort $WORK/v_mt.stress       > $WORK/v_mt.stress.s
+sort $WORK/v_mt.stress.bare  > $WORK/v_mt.stress.bare.s
+diff -q $WORK/v_mt.stress.bare.s $WORK/v_mt.stress.s >/dev/null \
     || { echo "FAIL: stress run output differs from baseline"; \
-         diff /tmp/v_mt.stress.bare.s /tmp/v_mt.stress.s | head -20; exit 1; }
+         diff $WORK/v_mt.stress.bare.s $WORK/v_mt.stress.s | head -20; exit 1; }
 echo "   OK: stress output matches baseline"
 
 echo

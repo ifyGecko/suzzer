@@ -148,9 +148,9 @@ OBJ    := $(patsubst src/%.c,$(OBJDIR)/%.o,$(SRC))
 
 LIB := $(BUILD)/libcov_$(THREADING).so
 
-.PHONY: all clean test all-arch all-variants native print-vars tools tools-clean
+.PHONY: all clean test test-targets all-arch all-variants native print-vars tools tools-clean
 
-all: $(LIB) test
+all: $(LIB) test-targets
 
 native: $(LIB)
 
@@ -168,8 +168,27 @@ $(LIB): $(OBJ) | $(BUILD)
 # boundary.c's gen_current/gen_init use 64-bit atomics; on 64-bit
 # arches __atomic_*_8 is inline and libatomic stays unlinked.
 
-test: $(LIB)
+test-targets: $(LIB)
 	$(MAKE) -C test ARCH=$(ARCH) CROSS=$(CROSS) BUILD=$(abspath $(BUILD))
+
+# `make test`: build both library variants and every test target, then
+# run every native validation suite (test/run_all.sh prints a summary and
+# keeps the logs of failing suites). Native only -- the cross suites are
+# test/run_cross.sh and test/run_cross_mt.sh.
+NATIVE_SUITES := run_validation run_validation_mt run_validation_boundary \
+                 run_validation_boundary_mt run_validation_multimod \
+                 run_validation_signals run_validation_coverage_options \
+                 run_validation_failloud run_validation_generator \
+                 run_validation_o2pie
+
+test:
+ifneq ($(ARCH),$(shell uname -m))
+	$(error make test runs the native suites; for ARCH=$(ARCH) use test/run_cross.sh / test/run_cross_mt.sh)
+endif
+	$(MAKE) --no-print-directory THREADING=st native
+	$(MAKE) --no-print-directory THREADING=mt native
+	$(MAKE) --no-print-directory -C test ARCH=$(ARCH) BUILD=$(abspath $(BUILD)) all mt multimod o2pie
+	./test/run_all.sh $(NATIVE_SUITES)
 
 # Opt-in build of the auxiliary tooling LD_PRELOADs (currently
 # libdemalloc.so). Independent of THREADING and intentionally NOT

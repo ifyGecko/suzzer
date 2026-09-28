@@ -60,6 +60,7 @@ make ARCH=aarch64 THREADING=mt          # cross-build MT for aarch64
 make all-arch                           # ST for every supported backend
 make all-arch THREADING=mt              # MT for every supported backend
 make all-variants                       # ST and MT for every backend
+make test                               # build everything, run every native suite
 ```
 
 Outputs land in `build/<arch>/libcov_<threading>.so` (and
@@ -647,6 +648,10 @@ test/
   run_validation_signals.sh   native ST+MT signal-handling regression test
   run_validation_generator.sh generator: call-terminated blocks, indirect-call report,
                               branch-type classification
+  run_validation_o2pie.sh     -O2 PIE builds of target_simple/target_dispatch under ST+MT
+  run_all.sh                  suite runner behind `make test`
+  shm_bitmap.py               reads the live bitmap using the shm header (size,
+                              offset and byte order vary)
   run_validation_failloud.sh  misconfigurations fail loudly (REQUIRE, oneshot+none,
                               ST in MT target, trap self-test, empty patch list)
   run_cross.sh                all-arch ST validation under qemu-user-static
@@ -671,6 +676,11 @@ TODO.md               deferred design work (daemons, transport, etc.)
 
 ## Validation
 
+`make test` builds both library variants and every test target, then runs
+every native suite below and prints a PASS/FAIL summary (logs of failing
+suites are kept). Suites use a fresh `mktemp -d` each, so they can run in
+parallel. To run one by hand:
+
 ```
 # Native (x86_64) ST regression:
 make
@@ -694,6 +704,9 @@ make THREADING=mt
 
 # Patch-list generator regressions (call-terminated blocks, indirect calls):
 ./test/run_validation_generator.sh
+
+# -O2 PIE targets (tail calls, cold splits, jump tables, ASLR):
+./test/run_validation_o2pie.sh
 
 # All backends, ST, under qemu-user-static:
 ./test/run_cross.sh        # PASS=12  FAIL=0  SKIP=0

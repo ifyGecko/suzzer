@@ -151,6 +151,13 @@ the MT stress test fail against the pre-fix code.
     `--print-reachable` marks the functions that have them.
   - An unparseable `afij @@F` chunk now warns instead of silently
     truncating the call graph.
+- **Test infrastructure.** `make test` builds both variants and every
+  test target and runs all native suites (`test/run_all.sh`). Suites use
+  `mktemp -d` instead of fixed `/tmp` paths (the cross suites keep theirs
+  on failure). Bitmaps are read via `test/shm_bitmap.py`, which takes
+  size, offset and byte order from the header instead of assuming 64 KB
+  at offset 72. New `-O2` PIE targets and `run_validation_o2pie.sh`.
+  test/Makefile no longer bakes a relative runpath into target_multimod.
 - **README drift.** Fixed: the 64 KB bitmap claims, the x86 patch
   length, the chaining claim, the missing coverage-model docs, the
   "threads scope iterations cleanly" claim, and the `LIBCOV_MODULE`
@@ -294,18 +301,6 @@ the MT stress test fail against the pre-fix code.
 
 ## P2: tests and docs
 
-- [ ] Add a top-level `make test` that builds every target (`mt`,
-  `multimod`, `orderable`, signals) and runs every native suite. Today
-  the MT and multimod scripts fail with "missing target" until you run
-  `make -C test …` by hand.
-- [ ] All test targets are `-O0 -no-pie`. Add `-O2` PIE variants: real
-  targets have tail calls, cold splits, jump tables and shrink-wrapped
-  prologues, and the generator heuristics are untested against them.
-- [ ] `run_validation.sh extract_bitmap` hard-codes 64 KB at offset 72.
-  Read `map_size`/`bitmap_offset` from the header instead (the default
-  map is now auto-sized).
-- [ ] Tests write fixed `/tmp/...` paths, so parallel runs collide. Use
-  `mktemp -d`.
 - [ ] Add a raw `clone(2)` MT stress harness (carried over).
 
 ---

@@ -11,6 +11,7 @@
 #   3. op_class / is_indirect_transfer recognise every rizin branch type
 #      variant, including the ones the old exact-match list missed.
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1   # we import tools/gen_patchlist.py
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ARCH="${ARCH:-$(uname -m)}"

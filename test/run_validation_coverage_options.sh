@@ -31,7 +31,7 @@
 # run_validation_multimod.sh and run_validation_boundary.sh and are not
 # duplicated here -- this script focuses on the orthogonal axes.
 #
-# All variant libcov builds land under $SCRATCH (default /tmp/libcov_covopts)
+# All variant libcov builds land under $SCRATCH (default: a fresh mktemp -d, removed on exit)
 # so the user's build/ directory is not touched. Re-running uses cached
 # variant builds; set REBUILD=1 to force a fresh rebuild.
 
@@ -39,7 +39,10 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ARCH="${ARCH:-$(uname -m)}"
-SCRATCH="${SCRATCH:-/tmp/libcov_covopts}"
+if [[ -z "${SCRATCH:-}" ]]; then
+    SCRATCH=$(mktemp -d)
+    trap 'rm -rf "$SCRATCH"' EXIT
+fi
 THREADING="${THREADING:-st}"
 mkdir -p "$SCRATCH"
 
