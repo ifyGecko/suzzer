@@ -231,37 +231,65 @@ def get_block_insns(rz, addr, ninstr):
     return rz.cmdj(f"pdj {ninstr} @ {addr}") or []
 
 
-BRANCH_TYPES = {
-    "jmp", "ujmp", "cjmp", "ucjmp", "rjmp",
-    "call", "ucall", "ccall", "rcall", "icall",
-    "ret",
-}
+def op_class(insn_type):
+    """Classify a rizin op type as "call", "jmp", "ret" or None.
+
+    Matches by suffix rather than an exact list: rizin has many variants
+    (ucall/rcall/icall/ircall/ccall/uccall, ujmp/rjmp/ijmp/irjmp/mjmp/
+    rcjmp/mcjmp/cjmp/ucjmp, cret, ...), which differ across arches and
+    versions. MIPS branch-likely forms (beql, bnezl, bgezall, bc1tl) come
+    back as cjmp/ccall like their non-likely versions. An exact list that
+    missed one made the MIPS delay-slot check below fail, and the entry
+    strategy then patched a delay slot, which crashes the target."""
+    t = insn_type or ""
+    for cls in ("call", "jmp", "ret"):
+        if t.endswith(cls):
+            return cls
+    return None
+
+
+def is_indirect_transfer(insn_type):
+    """Call or jump whose target comes from a register or memory (function
+    pointers, vtables, jump tables, PLT-free tail calls through a
+    pointer). Static call-graph slicing can't see past these."""
+    t = insn_type or ""
+    return op_class(t) in ("call", "jmp") and t[:1] in ("u", "r", "i", "m")
 
 
 def _is_branch_at(rz, addr):
     insns = get_block_insns(rz, addr, 1)
     if not insns:
         return False
-    t = insns[0].get("type", "")
-    return t in BRANCH_TYPES
+    return op_class(insns[0].get("type")) is not None
 
 
 def pick_terminator(insns, ok=None):
     """Return the instruction to patch for a block under the terminator
-    strategy: the LAST instruction that is at least 2 bytes long (the
-    smallest trap encoding) and satisfies `ok`, or None.
+    strategy, or None. Candidates must be at least 2 bytes long (the
+    smallest trap encoding) and satisfy `ok`.
 
-    Walking back matters on x86: blocks ending in a 1-byte `ret` (every
-    function exit) used to be dropped entirely. Any earlier instruction of
-    a straight-line block executes whenever the block completes, so it is
-    an equally valid probe. gen_boundary.py uses this same helper so
-    boundary markers stay co-located with patched sites."""
+    - If the block makes a call before its last instruction, the first
+      such call. rizin doesn't split blocks at calls, so a block whose
+      callee never returns (abort, exit, longjmp, a throw -- or the
+      callee crashing, which is the interesting case when fuzzing) never
+      reaches its terminator and would never report. The call instruction
+      itself executes before the callee runs.
+    - Otherwise the LAST candidate. Walking back matters on x86: blocks
+      ending in a 1-byte `ret` (every function exit) used to be dropped
+      entirely. Any earlier instruction of a straight-line block executes
+      whenever the block completes, so it is an equally valid probe.
+
+    gen_boundary.py uses this same helper so boundary markers stay
+    co-located with patched sites."""
+    def eligible(insn):
+        return int(insn.get("size", 0)) >= 2 and (ok is None or ok(insn))
+
+    for insn in insns[:-1]:
+        if op_class(insn.get("type")) == "call" and eligible(insn):
+            return insn
     for insn in reversed(insns):
-        if int(insn.get("size", 0)) < 2:
-            continue
-        if ok is not None and not ok(insn):
-            continue
-        return insn
+        if eligible(insn):
+            return insn
     return None
 
 
@@ -421,6 +449,41 @@ def resolve_to_offset(token, all_fns):
     raise ValueError(f"could not resolve '{token}' to any function")
 
 
+def count_indirect_transfers(rz, offsets):
+    """offset -> (indirect calls, indirect jumps) for each function in
+    `offsets` that has any."""
+    out = {}
+    for off in offsets:
+        ops = rz.cmdj(f"pdfj @ {off}") or {}
+        calls = jumps = 0
+        for op in ops.get("ops", []) if isinstance(ops, dict) else []:
+            t = op.get("type")
+            if is_indirect_transfer(t):
+                if op_class(t) == "call":
+                    calls += 1
+                else:
+                    jumps += 1
+        if calls or jumps:
+            out[off] = (calls, jumps)
+    return out
+
+
+def report_indirect_transfers(indirect):
+    """The static call graph stops at indirect transfers, so code reached
+    only through function pointers, vtables or dispatch tables is silently
+    left out of a --root slice. Say how many there are. (Review C5)"""
+    calls = sum(c for c, _ in indirect.values())
+    jumps = sum(j for _, j in indirect.values())
+    if not calls and not jumps:
+        return
+    print(f"note: the slice has {calls} indirect call(s) and {jumps} indirect "
+          f"jump(s) in {len(indirect)} function(s). Their targets are not "
+          f"followed: code reached only through function pointers, vtables "
+          f"or dispatch tables is NOT instrumented unless you add it with "
+          f"--root (see --print-reachable for which functions).",
+          file=sys.stderr)
+
+
 def build_call_graph(rz, all_fns):
     """Build outgoing-call adjacency: offset -> set(offset).
 
@@ -456,7 +519,10 @@ def build_call_graph(rz, all_fns):
             break
         try:
             obj, end = decoder.raw_decode(raw, pos)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            print(f"warning: could not parse rizin 'afij @@F' output at "
+                  f"offset {pos} ({e.msg}); the call graph is truncated and "
+                  f"the slice may be missing functions", file=sys.stderr)
             break
         pos = end
         # obj is a list with (typically) one entry per afij invocation.
@@ -595,11 +661,17 @@ def collect_module_records(args, rz, module_idx, module_name):
               f"{len(roots)} root(s), {len(cutoffs)} cutoff(s){depth_note}",
               file=sys.stderr)
 
+        indirect = count_indirect_transfers(rz, reachable_offsets)
+        report_indirect_transfers(indirect)
+
         if args.print_reachable:
             by_off = {int(f["offset"]): f for f in all_fns}
             for off in sorted(reachable_offsets):
                 f = by_off.get(off, {"name": "?", "bits": 0})
-                print(f"  0x{off:x} {f['name']} bits={f.get('bits', 0)}",
+                calls, jumps = indirect.get(off, (0, 0))
+                note = (f" indirect: {calls} call(s), {jumps} jump(s)"
+                        if calls or jumps else "")
+                print(f"  0x{off:x} {f['name']} bits={f.get('bits', 0)}{note}",
                       file=sys.stderr)
             print("(--print-reachable: exiting before writing patchlist)",
                   file=sys.stderr)

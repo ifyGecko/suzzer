@@ -136,6 +136,21 @@ the MT stress test fail against the pre-fix code.
   - `gen_patchlist.py` exits non-zero without writing when no sites are
     selected (`--allow-empty` to override), lists `--include-pat` matches
     under `-v`, and warns when one name matched under several prefixes.
+- **Generator coverage holes** (Review C5, M7; `run_validation_generator.sh`):
+  - Branch types are classified by suffix (`*call`/`*jmp`/`*ret`), so
+    `ijmp`, `irjmp`, `ircall`, `mjmp`, `cret`, ... are recognised; an
+    unrecognised one before a MIPS delay slot used to get the slot
+    patched. Checked with rizin 0.9 on assembled MIPS: branch-likely
+    forms come back as `cjmp`/`ccall`, and the entry strategy's
+    delay-slot skip is correct for them (the next instruction is exactly
+    the not-taken path).
+  - The terminator strategy probes a block at its first call if it has
+    one before its last instruction: a callee that never returns (exit,
+    abort, longjmp, a crash) used to hide the block entirely.
+  - `--root` runs report indirect calls/jumps in the slice, and
+    `--print-reachable` marks the functions that have them.
+  - An unparseable `afij @@F` chunk now warns instead of silently
+    truncating the call graph.
 - **README drift.** Fixed: the 64 KB bitmap claims, the x86 patch
   length, the chaining claim, the missing coverage-model docs, the
   "threads scope iterations cleanly" claim, and the `LIBCOV_MODULE`
@@ -193,19 +208,6 @@ the MT stress test fail against the pre-fix code.
   single-site hot loop counts once until some other site traps. Document
   it, or add a per-thread "re-arm self after N instructions"
   (single-step is too costly; accept it).
-- [ ] **MIPS branch-likely delay slots.** With the entry strategy, a
-  block that starts in the delay slot of a `*L` branch only runs when
-  the branch is taken. Extend `_is_branch_at` to recognise likely
-  branches, and add rizin's missing types `ijmp`, `irjmp`, `ircall`,
-  `mjmp`, `cret` to `BRANCH_TYPES` (`tools/gen_patchlist.py`). A block
-  that starts in a delay slot after one of those is currently patched at
-  idx 0 and crashes. (Review M7 + generator audit)
-- [ ] **The terminator strategy under-reports blocks that don't
-  complete.** rizin doesn't split blocks at calls, so a block containing
-  a call that never returns (abort, exit, longjmp, throw, or the
-  crashing call itself) never reports. That is the most interesting
-  block on a crash path. Consider patching a call-free instruction
-  before the call, or an `--strategy entry` hybrid for blocks with calls.
 - [ ] **Site-id collisions at N>=2.** The zero-collision guarantee holds
   only at N=1. Consider auto-scaling `LIBCOV_MAP_FUDGE` with N, and log
   the expected collision rate at init. (Review M2)
@@ -270,8 +272,6 @@ the MT stress test fail against the pre-fix code.
   don't overlap, and skip functions with `fcn.` names unless opted in.
 - [ ] **Thumb detection is per function** (`fn["bits"]`). A UDF inside
   an IT block has unpredictable behaviour. Skip IT-block terminators.
-- [ ] **A `JSONDecodeError` from `afij @@F`** silently truncates the call
-  graph. Warn about it.
 - [ ] **Name parsing.** Names of 4+ hex characters (`cafe`, `beef`) are
   parsed as addresses. gen_boundary's `split(":")` breaks on C++
   `ns::fn`. gen_boundary raises raw tracebacks on bad specs. It lacks
@@ -279,10 +279,9 @@ the MT stress test fail against the pre-fix code.
   differently in the two tools; share `resolve_to_offset`.
 - [ ] **LCVB1 has no `module_idx`,** so markers can only live in the
   primary module. Add an LCVB2 with a module index.
-- [ ] **Indirect-call visibility.** `--print-reachable` should count the
-  indirect call sites (`icall`/`ucall`) found during the BFS, so users
-  know where to add roots. (Review C5) Follow-ups carried from the old
-  TODO:
+- [ ] **Indirect-call follow-ups.** `--root` runs now report the
+  indirect calls/jumps in the slice (see the fixed list). Carried over
+  from the old TODO:
   - an `--include-addr-taken` heuristic (functions with DATA xrefs);
   - runtime augmentation (a broad oneshot run, then re-slice);
   - tail-call edges (`--follow-tail`);

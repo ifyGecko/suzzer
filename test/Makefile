@@ -10,7 +10,8 @@ CFLAGS  ?= -O0 -g -Wall -Wextra
 
 .PHONY: all clean mt loop demalloc multimod
 
-all: $(BUILD)/target_simple $(BUILD)/target_loop $(BUILD)/target_orderable $(BUILD)/fuzz_driver
+all: $(BUILD)/target_simple $(BUILD)/target_loop $(BUILD)/target_orderable \
+     $(BUILD)/target_dispatch $(BUILD)/fuzz_driver
 
 # pthread MT stress target + multi-worker boundary target and its ring
 # reader. Built on demand by the MT validation scripts.
@@ -48,6 +49,11 @@ $(BUILD)/target_loop: target_loop.c
 # Ordering-sensitive target for the N-gram checks in
 # run_validation_coverage_options.sh.
 $(BUILD)/target_orderable: target_orderable.c
+	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -o $@ $<
+
+# Generator regressions (run_validation_generator.sh): function-pointer
+# dispatch + a block whose callee may exit.
+$(BUILD)/target_dispatch: target_dispatch.c
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -o $@ $<
 
 # Thumb variant: only built when explicitly asked (make thumb).
@@ -98,7 +104,7 @@ $(BUILD)/target_multimod: target_multimod.c libmultimod_helper.h \
 	    -L$(BUILD) -lmultimod_helper -Wl,-rpath,$(BUILD)
 
 clean:
-	rm -rf $(BUILD)/target_simple $(BUILD)/target_orderable $(BUILD)/target_simple_thumb \
+	rm -rf $(BUILD)/target_simple $(BUILD)/target_orderable $(BUILD)/target_dispatch $(BUILD)/target_simple_thumb \
 	       $(BUILD)/target_simple_mt $(BUILD)/target_loop \
 	       $(BUILD)/target_loop_mt $(BUILD)/ring_dump \
 	       $(BUILD)/target_demalloc $(BUILD)/fuzz_driver \

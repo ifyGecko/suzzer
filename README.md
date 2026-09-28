@@ -187,7 +187,9 @@ to be instrumented.
 
 - **Indirect calls** (function pointers, vtables, dispatch tables) are
   invisible to rizin's static analysis. Slices through them require
-  another `--root` at the callee.
+  another `--root` at the callee. Every `--root` run prints how many
+  indirect calls and jumps the slice contains, and `--print-reachable`
+  marks the functions that have them.
 - **Tail calls** lowered to `jmp` may or may not appear as `CALL`
   callrefs depending on rizin's classification. Verify a suspect slice
   with `--print-reachable`.
@@ -630,6 +632,7 @@ test/
   target_simple_mt.c          pthread stress target for MT validation
   target_loop.c               stdin-driven loop target with iter_begin marker
   target_loop_mt.c            multi-worker boundary target (per-thread paths)
+  target_dispatch.c           generator target (function-pointer dispatch, exiting callee)
   target_multimod.c           multi-module target (links libmultimod_helper.so)
   libmultimod_helper.c/.h     helper shared library for multi-module test
   fuzz_driver.c               boundary-aware driver (seqlock reader)
@@ -642,6 +645,8 @@ test/
   run_validation_multimod.sh  native multi-module LCV3 test (exe + helper.so)
   target_signals.c            signal-mask / SIGILL-handler regression target
   run_validation_signals.sh   native ST+MT signal-handling regression test
+  run_validation_generator.sh generator: call-terminated blocks, indirect-call report,
+                              branch-type classification
   run_validation_failloud.sh  misconfigurations fail loudly (REQUIRE, oneshot+none,
                               ST in MT target, trap self-test, empty patch list)
   run_cross.sh                all-arch ST validation under qemu-user-static
@@ -649,7 +654,9 @@ test/
                               build-only for the other 9 due to qemu-user TCG limits)
 tools/
   gen_patchlist.py    rizin-based LCV3 generator; per-arch strategy
-                      (terminator vs entry, Thumb-aware, delay-slot-aware,
+                      (terminator -- or the block's first call, so blocks
+                      whose callee never returns still report -- vs entry,
+                      Thumb-aware, delay-slot-aware,
                       ppc64 local-entry-aware); --threading st|mt;
                       --module name:path adds auxiliary modules
   gen_boundary.py     rizin-based LCVB1 sidecar generator; resolves symbol
@@ -684,6 +691,9 @@ make THREADING=mt
 
 # Misconfigurations fail loudly (REQUIRE, oneshot+none, trap self-test, ...):
 ./test/run_validation_failloud.sh
+
+# Patch-list generator regressions (call-terminated blocks, indirect calls):
+./test/run_validation_generator.sh
 
 # All backends, ST, under qemu-user-static:
 ./test/run_cross.sh        # PASS=12  FAIL=0  SKIP=0

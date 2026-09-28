@@ -117,7 +117,12 @@ def check(path, workers, floor):
         na, nb = len(idx & ua), len(idx & ub)
         if na > tol and nb > tol:
             mixed.append((gen, na, nb))
-        kind = "a" if na > nb else "b" if nb > na else None
+        # Same tolerance as above: a snapshot with at most `tol` exclusive
+        # buckets (e.g. a sparse, sampled iteration plus one colliding
+        # edge) doesn't identify its worker.
+        kind = None
+        if max(na, nb) > tol:
+            kind = "a" if na > nb else "b" if nb > na else None
         if kind:
             kinds.setdefault(tid, set()).add(kind)
     if mixed:
