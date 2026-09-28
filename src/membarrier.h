@@ -21,33 +21,47 @@
  *     much later). On x86_64 the IPI's return path (iret) is the
  *     serializing instruction SDM 8.1.3 requires before running
  *     cross-modified code.
- *   - Without SYNC_CORE we rely on the per-write clear_cache only and log
- *     a warning at init. The residual
- *     race on weakly-ordered ISAs (aarch64/arm/mips/ppc/riscv) is small but
- *     non-zero: a peer thread that fetched ahead may execute the old bytes
- *     once before its I-cache picks up the change. For correctness it's
- *     identical to the ST-mode race window from a different cause; we
- *     accept it and document it.
- *
- * Alternative we did NOT implement (notes for the future):
- *   - Broadcast a no-op signal (e.g. tgkill SIGURG) to every peer thread.
- *     The signal-return path performs an instruction-serializing barrier
- *     on most arches. Heavier than membarrier but works on much older
- *     kernels (back to the 2.6 series). Worth adding if a real target
- *     can't be upgraded past 4.15.
+ *   - Without it (or with LIBCOV_SYNC_FALLBACK=tgkill) we fall back to a
+ *     signal broadcast: LIBCOV_SYNC_SIGNO goes to every other thread
+ *     (rt_tgsigqueueinfo, Linux 2.6.31+, listed from /proc/self/task) and
+ *     membarrier_sync_core() waits, up to LIBCOV_SYNC_TIMEOUT_NS, for each
+ *     to acknowledge from its handler. Taking the signal and returning is
+ *     an exception return on that thread, which context-synchronizes it.
+ *     Much heavier than the IPI (every peer is woken on every patch
+ *     batch), and target-visible: syscalls that don't restart return
+ *     EINTR. LIBCOV_SYNC_FALLBACK=off disables it; so does the target
+ *     owning the signal (see membarrier_release_signal). Needs /proc; a
+ *     broadcast from a chroot without it does nothing.
+ *   - With neither, we rely on the per-write clear_cache only and log a
+ *     warning at init. The residual race on weakly-ordered ISAs
+ *     (aarch64/arm/mips/ppc/riscv) is small but non-zero: a peer thread
+ *     that fetched ahead may execute the old bytes once before its
+ *     I-cache picks up the change.
  */
 #ifndef LIBCOV_MEMBARRIER_H
 #define LIBCOV_MEMBARRIER_H
 
+/* Idempotent. libcov_init calls it before installing the trap handler,
+ * whose signal mask depends on membarrier_sync_signo(). */
 void membarrier_init(void);
 void membarrier_sync_core(void);
 
-/* Whether PRIVATE_EXPEDITED_SYNC_CORE was successfully registered. When
- * true, membarrier_sync_core() broadcasts a context-synchronizing IPI.
- * When false, it is a no-op. Either way the caller must already have
- * issued __builtin___clear_cache() for every modified range. patch_mt.c
- * uses this to elide the trailing membarrier when it isn't available
- * and to decide whether to log the weak-ISA init WARNING. */
+/* Whether a cross-core sync is active: membarrier(SYNC_CORE) or the
+ * signal broadcast. When false, membarrier_sync_core() is a no-op. Either
+ * way the caller must already have issued __builtin___clear_cache() for
+ * every modified range. patch_mt.c uses this to elide the trailing call
+ * when there is nothing to do and to decide whether to log the weak-ISA
+ * init WARNING. */
 int  membarrier_has_sync_core(void);
+
+/* LIBCOV_SYNC_SIGNO while the signal broadcast is active, else -1. The
+ * signal interposers in libcov.c keep it deliverable (unblocked) and
+ * never let the trap handler's mask block it. */
+int  membarrier_sync_signo(void);
+
+/* The target wants the sync signal (it installed a handler for it):
+ * restore SIG_DFL, stop broadcasting, and log `why`. Not for use in a
+ * signal handler. */
+void membarrier_release_signal(const char *why);
 
 #endif

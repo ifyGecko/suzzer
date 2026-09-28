@@ -10,6 +10,10 @@
 #   4. Oneshot mode under MT: bitmap has edges.
 #   5. Leapfrog mode under MT: bitmap has at least one site with > 1 hits
 #      from concurrent thread re-entries.
+#   6. All of the above again with LIBCOV_SYNC_FALLBACK=tgkill: the signal
+#      broadcast that replaces membarrier(SYNC_CORE) on older kernels
+#      (the script re-runs itself; a shorter stress, since every patch
+#      batch then wakes every peer).
 
 set -euo pipefail
 
@@ -121,6 +125,16 @@ diff -q $WORK/v_mt.stress.bare.s $WORK/v_mt.stress.s >/dev/null \
     || { echo "FAIL: stress run output differs from baseline"; \
          diff $WORK/v_mt.stress.bare.s $WORK/v_mt.stress.s | head -20; exit 1; }
 echo "   OK: stress output matches baseline"
+
+if [[ "${LIBCOV_SYNC_FALLBACK:-}" == tgkill ]]; then
+    grep -q 'tgkill broadcast fallback active' $WORK/v_mt.stress.log \
+        || { echo "FAIL: forced fallback not active: $(grep membarrier $WORK/v_mt.stress.log)"; exit 1; }
+    echo "   OK: ran with the tgkill broadcast fallback"
+elif [[ -z "${LIBCOV_SYNC_FALLBACK:-}" ]]; then
+    echo
+    echo ">> again with LIBCOV_SYNC_FALLBACK=tgkill"
+    LIBCOV_SYNC_FALLBACK=tgkill ITERS_STRESS="${ITERS_STRESS_TGKILL:-500}" "$0"
+fi
 
 echo
 echo "ALL MT VALIDATIONS PASSED ($ARCH)"

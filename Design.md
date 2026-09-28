@@ -1194,12 +1194,41 @@ peers -- and the writer -- fetching stale bytes on non-coherent
 I-caches.)
 
 Without SYNC_CORE (Linux < 4.16, or arches that gained it later),
-`patch_mt.c` logs a WARNING at init on weakly-ordered ISAs and relies
-on step 1 alone; peers pick up the change at their next
-context-synchronizing event. A future enhancement (noted in TODO.md) is
-to broadcast a no-op signal (`tgkill`) to every peer thread; the
-signal-return path is context-synchronizing and works on much older
-kernels.
+step 2 becomes a **signal broadcast** (`membarrier.c`,
+`LIBCOV_SYNC_FALLBACK=auto`, the default):
+
+- `LIBCOV_SYNC_SIGNO` (default `SIGRTMAX-2`) goes to every other thread
+  listed in `/proc/self/task`, via `rt_tgsigqueueinfo`, tagged with a
+  cookie and a broadcast generation. The broadcaster waits, up to
+  `LIBCOV_SYNC_TIMEOUT_NS` (1 ms), for each thread's handler to
+  acknowledge. Taking a signal and returning from it is an exception
+  return on that thread (iret / ERET / rfid / sret), which
+  context-synchronizes it.
+- Broadcasts are serialized, so acknowledgements are counted exactly.
+  They are also coalesced: a trapper whose writes precede the start of a
+  later broadcast skips its own, so a queue of waiting trappers costs
+  one or two broadcasts.
+- The trap handler's mask leaves the sync signal deliverable (its
+  handler only bumps a counter), and the `sigprocmask`/`pthread_sigmask`
+  interposers strip it, so peers inside the trap handler or with
+  everything blocked still acknowledge.
+- The signal belongs to the target if it wants it. A handler or
+  `SIG_IGN` present at init, or a handler installed later, turns the
+  fallback off (WARNING). A foreign instance of the signal arriving while
+  libcov owns it restores `SIG_DFL` and is re-raised, so the default
+  action happens as it would have.
+- Costs: every patch batch wakes every peer. `run_validation_mt.sh`'s
+  16-thread stress takes about 19 s against 1.8 s with SYNC_CORE on x86_64.
+  Syscalls that don't restart after a handler (`epoll_wait`, `poll` with
+  a timeout, `nanosleep`) can return `EINTR` in the target. A thread that
+  never acknowledges (uninterruptible sleep, stopped, blocked through a
+  raw syscall) costs the full timeout per broadcast. After a chroot
+  without `/proc`, broadcasts do nothing.
+
+`LIBCOV_SYNC_FALLBACK=off` keeps the old behaviour: rely on step 1 alone
+(WARNING on weakly-ordered ISAs), and peers pick up the change at their
+next context-synchronizing event. `=tgkill` forces the broadcast even
+when SYNC_CORE works; the test suites use it.
 
 **Residual architectural gap.** The trap design is fixed: sites raise
 SIGILL from an illegal encoding. Neither UD2 nor UDF is in the

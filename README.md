@@ -216,6 +216,7 @@ to be instrumented.
 | `LIBCOV_BOUNDARY_INIT_GRACE` | `0` | Drop the first N boundary fires (process-wide, across all threads) before publishing (skip init noise). |
 | `LIBCOV_BOUNDARY_NOTIFY_FD` | unset | Inherited **eventfd**; libcov writes 8 bytes after each snapshot. Anything else (e.g. a pipe, which could block or SIGPIPE the target inside the trap handler) is ignored with a warning. Counter polling works without it. |
 | `LIBCOV_BOUNDARY_EMULATE` | `1` | `0`: never emulate boundary markers; always use disarm + deferred re-arm (see Threading). |
+| `LIBCOV_SYNC_FALLBACK` | `auto` | `libcov_mt.so` only. Cross-core sync when the kernel lacks `membarrier(PRIVATE_EXPEDITED_SYNC_CORE)`: `auto` broadcasts `LIBCOV_SYNC_SIGNO` (default `SIGRTMAX-2`, `src/tunables.h`) to every peer thread after each patch batch; `tgkill` forces that even when SYNC_CORE works; `off` relies on cache maintenance alone. The broadcast is slow (about 10x on a 16-thread stress) and can make non-restarting syscalls return `EINTR`; see Design.md §17.2.5. |
 | `LIBCOV_ALLOW_ONESHOT_NOREARM` | unset | `1`: allow `MODE=oneshot` with `BOUNDARY_REARM=none` (first-hit-only snapshots). Otherwise that combination is refused and boundaries stay off. |
 
 ## Coverage model
@@ -593,7 +594,8 @@ across runs are easier with ASLR off.
   UDF is in the x86 (SDM 8.1.3) or AArch64 (CMODX) sets that may be
   rewritten while another core executes them. `libcov_mt.so` narrows
   the window as far as it can (single-copy-atomic store, cache
-  maintenance, `membarrier(SYNC_CORE)`); see `Design.md` §17.2.5.
+  maintenance, `membarrier(SYNC_CORE)` or, on kernels without it, a
+  signal broadcast to every peer thread); see `Design.md` §17.2.5.
 - **x86 blocks made only of 1-byte instructions** (`leave; ret`,
   `pop; ret`, a lone `ret`) can't hold the 2-byte UD2 and are not
   instrumented.
@@ -637,7 +639,8 @@ src/
   sink_shm.c          shm region (header + bitmap + ring); prev_loc def
   boundary.h/.c       LCVB1 parser; marker lookup; snapshot publish; re-arm;
                       per-thread depth + live bitmaps under MT
-  membarrier.h/.c     MT-only; PRIVATE_EXPEDITED_SYNC_CORE wrapper with fallback
+  membarrier.h/.c     MT-only; PRIVATE_EXPEDITED_SYNC_CORE, or a signal broadcast
+                      to every peer thread on kernels without it
   arch.h              backend interface (extern symbols, no #ifdefs)
   arch_x86_64.c       x86 UD2 head-only / 2 bytes (ST+MT share)
   arch_aarch64.c      UDF #0 / 4-byte fixed (ST+MT)
@@ -665,7 +668,8 @@ test/
                               must not mix threads
   run_validation_multimod.sh  native multi-module LCV3 test (exe + helper.so)
   target_signals.c            signal-mask / SIGILL-handler regression target
-  run_validation_signals.sh   native ST+MT signal-handling regression test
+  run_validation_signals.sh   native ST+MT signal-handling regression test, incl. the
+                              MT sync-broadcast signal (target use, blocking, SIG_IGN)
   run_validation_generator.sh generator: call-terminated blocks, indirect-call report,
                               branch-type classification
   run_validation_o2pie.sh     -O2 PIE builds of target_simple/target_dispatch under ST+MT

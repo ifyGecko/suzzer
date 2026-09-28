@@ -20,6 +20,18 @@
 #if defined(LIBCOV_THREADING_ST)
 #  include <pthread.h>
 #endif
+#if defined(LIBCOV_THREADING_MT)
+#  include "membarrier.h"
+#endif
+
+/* The MT sync-broadcast signal while it is active (membarrier.h), else -1. */
+static int sync_signo(void) {
+#if defined(LIBCOV_THREADING_MT)
+    return membarrier_sync_signo();
+#else
+    return -1;
+#endif
+}
 
 static int g_initialized = 0;
 
@@ -125,6 +137,11 @@ static void libcov_init(void) {
         init_fail("trap self-test failed, library inert (nothing armed)");
         return;
     }
+#if defined(LIBCOV_THREADING_MT)
+    /* Before handler_install: the trap handler's mask must leave the sync
+     * broadcast signal deliverable if that fallback is active. */
+    membarrier_init();
+#endif
     /* Install the handler BEFORE arming: if install fails we must not
      * leave trap encodings in the target with nothing to catch them. */
     struct sigaction prev;
@@ -191,6 +208,13 @@ static signal_fn real_signal_fn(void) {
 int sigaction(int signo, const struct sigaction *act, struct sigaction *oldact) {
     sigaction_fn real = real_sigaction_fn();
     if (!real) { errno = ENOSYS; return -1; }
+#if defined(LIBCOV_THREADING_MT)
+    if (g_initialized && act && signo == sync_signo()) {
+        int dfl = (act->sa_flags & SA_SIGINFO) ? act->sa_sigaction == NULL
+                                               : act->sa_handler == SIG_DFL;
+        if (!dfl) membarrier_release_signal("the target installed a handler for");
+    }
+#endif
     if (g_initialized && signo == LIBCOV_TRAP_SIGNO) {
         if (oldact) {
             if (g_target_trap_sa_valid) *oldact = g_target_trap_sa;
@@ -206,6 +230,10 @@ int sigaction(int signo, const struct sigaction *act, struct sigaction *oldact) 
 sighandler_fn signal(int signo, sighandler_fn h) {
     signal_fn real = real_signal_fn();
     if (!real) { errno = ENOSYS; return SIG_ERR; }
+#if defined(LIBCOV_THREADING_MT)
+    if (g_initialized && signo == sync_signo() && h != SIG_DFL)
+        membarrier_release_signal("the target installed a handler for");
+#endif
     if (g_initialized && signo == LIBCOV_TRAP_SIGNO) {
         sighandler_fn prev = g_target_trap_sa_valid ? g_target_trap_sa.sa_handler : SIG_DFL;
         memset(&g_target_trap_sa, 0, sizeof g_target_trap_sa);
@@ -227,6 +255,10 @@ void handler_build_mask(sigset_t *mask) {
     sigdelset(mask, SIGFPE);
     sigdelset(mask, SIGTRAP);
     sigdelset(mask, LIBCOV_TRAP_SIGNO);
+    /* The sync-broadcast handler only bumps a counter, so it is safe
+     * mid-trap, and a broadcaster waits for every peer, including peers
+     * inside this handler. */
+    if (sync_signo() > 0) sigdelset(mask, sync_signo());
 }
 
 void libcov_chain_trap(int signo, siginfo_t *info, void *uctx) {
@@ -270,16 +302,21 @@ void libcov_chain_trap(int signo, siginfo_t *info, void *uctx) {
  * the kernel resets the disposition to SIG_DFL and kills the process.
  * Daemons routinely block every signal in worker threads (sigfillset +
  * pthread_sigmask), so strip our trap signal from any mask the target
- * installs while libcov is active. */
+ * installs while libcov is active. The MT sync-broadcast signal is
+ * stripped too: a peer that blocks it never acknowledges, and every
+ * broadcast would wait out LIBCOV_SYNC_TIMEOUT_NS. */
 
 typedef int (*sigmask_fn)(int, const sigset_t *, sigset_t *);
 
 static int filter_mask(int how, const sigset_t *set, sigset_t *copy) {
     if (!g_initialized || !set) return 0;
     if (how != SIG_BLOCK && how != SIG_SETMASK) return 0;
-    if (!sigismember(set, LIBCOV_TRAP_SIGNO)) return 0;
+    int ss = sync_signo();
+    if (!sigismember(set, LIBCOV_TRAP_SIGNO) && !(ss > 0 && sigismember(set, ss)))
+        return 0;
     *copy = *set;
     sigdelset(copy, LIBCOV_TRAP_SIGNO);
+    if (ss > 0) sigdelset(copy, ss);
     return 1;
 }
 

@@ -180,6 +180,14 @@ the MT stress test fail against the pre-fix code.
   - on ppc64 ELFv2, it put the marker in the 8-byte global-entry stub,
     which direct calls skip. It now uses the local entry, as
     gen_patchlist does.
+- **Signal broadcast when there is no `membarrier(SYNC_CORE)`**
+  (`membarrier.c`). The context-synchronization step now works on
+  pre-4.16 kernels: `LIBCOV_SYNC_SIGNO` goes to every peer, each one
+  acknowledges from its handler, and broadcasts are coalesced (Design.md
+  §17.2.5). `LIBCOV_SYNC_FALLBACK=auto|tgkill|off`. The target keeps the
+  signal if it uses it. `run_validation_mt.sh`, `_boundary_mt.sh` and
+  `_signals.sh` run with it forced (target handler, default action,
+  `SIG_IGN` before exec, a peer blocking every signal).
 - **README drift.** Fixed: the 64 KB bitmap claims, the x86 patch
   length, the chaining claim, the missing coverage-model docs, the
   "threads scope iterations cleanly" claim, and the `LIBCOV_MODULE`
@@ -198,9 +206,7 @@ the MT stress test fail against the pre-fix code.
   write, and `membarrier(SYNC_CORE)` context-synchronizes every core
   per batch (Design.md §17.2.5). Remaining:
   - confirm on real hardware that the residual window is harmless
-    (next item);
-  - `tgkill` broadcast fallback for kernels without SYNC_CORE (see
-    Backlog → MT).
+    (next item).
 - [ ] **Real-hardware MT validation.** 9 of 11 backends are build-only in
   `run_cross_mt.sh`. The new RWX + atomic store path has only run on
   x86_64 hardware (and under qemu for x86_64 and aarch64). CI boards:
@@ -349,9 +355,6 @@ the MT stress test fail against the pre-fix code.
 - Runtime-selectable N (compile-time N becomes the maximum).
 - Tag N and the coverage model in the shm header's spare flag bits.
 - Hybrid publish (an edge map plus an N-gram map) when a consumer needs it.
-
-### MT
-- A `tgkill` broadcast fallback for kernels without `membarrier(SYNC_CORE)`.
 
 ### Tooling
 - `suzzer-relay`: an on-device bitmap server (TCP, serial, …).

@@ -20,6 +20,9 @@
 #      MIN_FRACTION_4 of the snapshots. (While one worker holds the marker
 #      disarmed, others pass it untrapped and two iterations merge, ~10-20%
 #      with 4 workers; a stall costs ~100%.)
+#   6. with LIBCOV_SYNC_FALLBACK=tgkill (the signal broadcast that replaces
+#      membarrier(SYNC_CORE) on older kernels) and 4 workers: the same
+#      bar as 4.
 #
 # A small number of stray buckets is tolerated (MISMATCH_TOLERANCE):
 # under MT a site disarmed by one thread doesn't trap for the other, which
@@ -75,6 +78,9 @@ check_combo() {  # <mode> <rearm>
     run_dump "$WORK/aabb.out"     aabb     "$ITERS"
     run_dump "$WORK/aaaabbbb.out" aaaabbbb "$ITERS"
     LIBCOV_BOUNDARY_EMULATE=0 run_dump "$WORK/aabb.noemu.out" aabb "$ITERS"
+    LIBCOV_SYNC_FALLBACK=tgkill run_dump "$WORK/aabb.tgkill.out" aabb "$ITERS"
+    grep -q 'tgkill broadcast fallback active' "$WORK/aabb.tgkill.out.err" \
+        || { echo "FAIL: forced sync fallback not active" >&2; exit 1; }
     python3 - "$WORK" "$MISMATCH_TOLERANCE" "$mode" "$rearm" "$ITERS" \
               "$MIN_FRACTION_4" "$MIN_FRACTION_EMU" <<'EOF'
 import re, sys
@@ -149,6 +155,7 @@ check(f"{work}/ab.out", 2, frac_emu)
 check(f"{work}/aabb.out", 4, frac_emu)
 check(f"{work}/aaaabbbb.out", 8, frac_emu)
 check(f"{work}/aabb.noemu.out", 4, frac4, " no-emulation")
+check(f"{work}/aabb.tgkill.out", 4, frac_emu, " tgkill-sync")
 EOF
 }
 

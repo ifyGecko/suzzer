@@ -33,6 +33,8 @@
  *      b. Context synchronization, once per batch: membarrier(PRIVATE_
  *         EXPEDITED_SYNC_CORE) IPIs every CPU running this process so
  *         each one discards already-fetched/prefetched instructions.
+ *         Without it, membarrier.c signals every peer thread instead
+ *         (LIBCOV_SYNC_FALLBACK).
  *
  *      membarrier does NOT do (a): an earlier version skipped clear_cache
  *      whenever SYNC_CORE was active, which could leave peers -- and the
@@ -99,8 +101,10 @@ static int     g_initialized   = 0;
 static int     g_direct        = 0;
 
 /* Cached at mt_init_once. When 1, patch_sync_batch_end() issues one
- * membarrier(SYNC_CORE) IPI per batch; when 0 it is a no-op and peers
- * rely on the per-write clear_cache alone (see header comment (3)). */
+ * cross-core sync per batch -- the membarrier(SYNC_CORE) IPI, or the
+ * signal broadcast on kernels without it (membarrier.h); when 0 it is a
+ * no-op and peers rely on the per-write clear_cache alone (see header
+ * comment (3)). */
 static int     g_have_sync_core = 0;
 
 /* Global spinlock that serializes the mprotect+write+mprotect dance in
@@ -153,7 +157,8 @@ static void mt_init_once(void) {
     g_have_sync_core = membarrier_has_sync_core();
 #if !defined(__x86_64__) && !defined(__i386__)
     if (!g_have_sync_core)
-        libcov_logf("patch_mt: WARNING -- no membarrier(SYNC_CORE) on a weakly-"
+        libcov_logf("patch_mt: WARNING -- no cross-core sync (no membarrier(SYNC_CORE), "
+                    "signal fallback off or refused) on a weakly-"
                     "ordered ISA: peer threads may fetch stale instruction bytes "
                     "after arm/disarm (missed or spurious traps)");
 #endif

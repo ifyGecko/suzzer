@@ -210,6 +210,43 @@
 #endif
 
 /* ------------------------------------------------------------------ */
+/* MT cross-core sync fallback (membarrier.c)                         */
+/* ------------------------------------------------------------------ */
+
+/* LIBCOV_SYNC_SIGNO
+ *   Signal libcov_mt.so sends to every peer thread after patching when
+ *   the kernel lacks membarrier(PRIVATE_EXPEDITED_SYNC_CORE) (or with
+ *   LIBCOV_SYNC_FALLBACK=tgkill). Returning from its handler is the
+ *   context-synchronizing event. Must be a signal the target doesn't use:
+ *   if it has a handler for it at init, or installs one later, libcov
+ *   hands the signal back and turns the fallback off (WARNING).
+ *
+ *   Default SIGRTMAX - 2 (glibc reserves the lowest RT signals; targets
+ *   that use RT signals usually count up from SIGRTMIN).
+ *
+ *   Override at build: -DLIBCOV_SYNC_SIGNO='(SIGRTMAX - 5)'
+ */
+#ifndef LIBCOV_SYNC_SIGNO
+#define LIBCOV_SYNC_SIGNO (SIGRTMAX - 2)
+#endif
+
+/* LIBCOV_SYNC_TIMEOUT_NS
+ *   How long a broadcast waits for every peer to acknowledge the sync
+ *   signal. A thread in uninterruptible sleep, stopped, or with the
+ *   signal blocked through a raw syscall never acknowledges in time; it
+ *   isn't running user code then, and it context-synchronizes on its own
+ *   way back to user mode. Every broadcast that times out costs this
+ *   much, so keep it short.
+ *
+ *   Default 1 ms.
+ *
+ *   Override at build: -DLIBCOV_SYNC_TIMEOUT_NS=200000ULL
+ */
+#ifndef LIBCOV_SYNC_TIMEOUT_NS
+#define LIBCOV_SYNC_TIMEOUT_NS 1000000ULL
+#endif
+
+/* ------------------------------------------------------------------ */
 /* Init-time logging (util.c)                                         */
 /* ------------------------------------------------------------------ */
 
