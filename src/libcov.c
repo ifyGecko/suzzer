@@ -17,6 +17,10 @@
 
 static int g_initialized = 0;
 
+/* Storage for what the target *thinks* its trap-signal handler is. */
+static struct sigaction g_target_trap_sa;
+static int              g_target_trap_sa_valid = 0;
+
 static unsigned parse_ring_size(void) {
     const char *s = getenv("LIBCOV_BOUNDARY_RING");
     if (!s || !*s) return 4;
@@ -85,12 +89,18 @@ static void libcov_init(void) {
         libcov_logf("init: sink_init failed");
         return;
     }
-    if (patch_arm_all() == 0) {
-        libcov_logf("init: nothing armed, aborting");
+    /* Install the handler BEFORE arming: if install fails we must not
+     * leave trap encodings in the target with nothing to catch them. */
+    struct sigaction prev;
+    memset(&prev, 0, sizeof prev);
+    if (handler_install(mode, &prev) != 0) {
+        libcov_logf("init: handler_install failed");
         return;
     }
-    if (handler_install(mode) != 0) {
-        libcov_logf("init: handler_install failed");
+    g_target_trap_sa = prev;
+    g_target_trap_sa_valid = 1;
+    if (patch_arm_all() == 0) {
+        libcov_logf("init: nothing armed, aborting");
         return;
     }
 
@@ -134,10 +144,6 @@ static signal_fn real_signal_fn(void) {
     return p;
 }
 
-/* Storage for what the target *thinks* its trap-signal handler is. */
-static struct sigaction g_target_trap_sa;
-static int              g_target_trap_sa_valid = 0;
-
 int sigaction(int signo, const struct sigaction *act, struct sigaction *oldact) {
     sigaction_fn real = real_sigaction_fn();
     if (!real) { errno = ENOSYS; return -1; }
@@ -165,4 +171,88 @@ sighandler_fn signal(int signo, sighandler_fn h) {
         return prev;
     }
     return real(signo, h);
+}
+
+/* ---- chaining non-libcov traps to the target's handler ------------ */
+
+void handler_build_mask(sigset_t *mask) {
+    sigfillset(mask);
+    sigdelset(mask, SIGILL);
+    sigdelset(mask, SIGSEGV);
+    sigdelset(mask, SIGBUS);
+    sigdelset(mask, SIGFPE);
+    sigdelset(mask, SIGTRAP);
+    sigdelset(mask, LIBCOV_TRAP_SIGNO);
+}
+
+void libcov_chain_trap(int signo, siginfo_t *info, void *uctx) {
+    /* g_target_trap_sa holds the pre-init disposition (seeded in
+     * libcov_init) or whatever the target installed later through the
+     * sigaction()/signal() interposers above. */
+    struct sigaction sa = g_target_trap_sa;
+    int have = g_target_trap_sa_valid;
+
+    if (have && (sa.sa_flags & SA_SIGINFO) && sa.sa_sigaction) {
+        if (sa.sa_flags & SA_RESETHAND) {
+            memset(&g_target_trap_sa, 0, sizeof g_target_trap_sa);
+            g_target_trap_sa.sa_handler = SIG_DFL;
+        }
+        sa.sa_sigaction(signo, info, uctx);
+        return;
+    }
+    if (have && !(sa.sa_flags & SA_SIGINFO) &&
+        sa.sa_handler != SIG_DFL && sa.sa_handler != SIG_IGN) {
+        if (sa.sa_flags & SA_RESETHAND) {
+            memset(&g_target_trap_sa, 0, sizeof g_target_trap_sa);
+            g_target_trap_sa.sa_handler = SIG_DFL;
+        }
+        sa.sa_handler(signo);
+        return;
+    }
+    /* SIG_DFL, or SIG_IGN (which the kernel also overrides to the default
+     * action for a synchronous fault -- returning would re-execute the
+     * faulting instruction forever): restore the default disposition so
+     * the re-executed instruction kills the process with the usual
+     * signal exit status / core. */
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof dfl);
+    dfl.sa_handler = SIG_DFL;
+    sigaction_fn real = real_sigaction_fn();
+    if (real) real(signo, &dfl, NULL);
+}
+
+/* ---- signal-mask interception (hardening) ------------------------- *
+ * A synchronous trap signal that is blocked when it fires is not queued:
+ * the kernel resets the disposition to SIG_DFL and kills the process.
+ * Daemons routinely block every signal in worker threads (sigfillset +
+ * pthread_sigmask), so strip our trap signal from any mask the target
+ * installs while libcov is active. */
+
+typedef int (*sigmask_fn)(int, const sigset_t *, sigset_t *);
+
+static int filter_mask(int how, const sigset_t *set, sigset_t *copy) {
+    if (!g_initialized || !set) return 0;
+    if (how != SIG_BLOCK && how != SIG_SETMASK) return 0;
+    if (!sigismember(set, LIBCOV_TRAP_SIGNO)) return 0;
+    *copy = *set;
+    sigdelset(copy, LIBCOV_TRAP_SIGNO);
+    return 1;
+}
+
+int sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
+    static sigmask_fn real;
+    if (!real) real = (sigmask_fn)dlsym(RTLD_NEXT, "sigprocmask");
+    if (!real) { errno = ENOSYS; return -1; }
+    sigset_t copy;
+    if (filter_mask(how, set, &copy)) set = &copy;
+    return real(how, set, oldset);
+}
+
+int pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset) {
+    static sigmask_fn real;
+    if (!real) real = (sigmask_fn)dlsym(RTLD_NEXT, "pthread_sigmask");
+    if (!real) return ENOSYS;
+    sigset_t copy;
+    if (filter_mask(how, set, &copy)) set = &copy;
+    return real(how, set, oldset);
 }

@@ -15,7 +15,6 @@
 #include <errno.h>
 
 static enum libcov_mode  g_mode = LIBCOV_MODE_LEAPFROG;
-static struct sigaction  g_prev_sa;
 static struct patch_entry *g_last_restored = NULL;
 
 /* Real sigaction symbol from libc; resolved at install time so our own
@@ -24,31 +23,13 @@ static struct patch_entry *g_last_restored = NULL;
 typedef int (*sigaction_fn)(int, const struct sigaction *, struct sigaction *);
 static sigaction_fn real_sigaction = NULL;
 
-static void chain_or_default(int signo, siginfo_t *info, void *uctx) {
-    /* If a previous handler was registered, dispatch to it; otherwise
-     * restore the default disposition so the process dies as it normally
-     * would (with a useful core / signal exit code). */
-    if (g_prev_sa.sa_flags & SA_SIGINFO) {
-        if (g_prev_sa.sa_sigaction) g_prev_sa.sa_sigaction(signo, info, uctx);
-    } else if (g_prev_sa.sa_handler == SIG_DFL) {
-        struct sigaction dfl;
-        memset(&dfl, 0, sizeof dfl);
-        dfl.sa_handler = SIG_DFL;
-        if (real_sigaction) real_sigaction(signo, &dfl, NULL);
-        /* Returning will re-execute the illegal instruction and re-trigger
-         * SIGILL, which now goes to the default handler. */
-    } else if (g_prev_sa.sa_handler != SIG_IGN) {
-        g_prev_sa.sa_handler(signo);
-    }
-}
-
 static void trap_handler(int signo, siginfo_t *info, void *uctx) {
     ucontext_t *uc = (ucontext_t *)uctx;
     uintptr_t pc = libcov_arch_pc_from_uctx(uc);
 
     struct patch_entry *e = patch_lookup(pc);
     if (!e || !e->patched) {
-        chain_or_default(signo, info, uctx);
+        libcov_chain_trap(signo, info, uctx);
         return;
     }
 
@@ -78,7 +59,7 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
     /* Returning resumes execution at pc; kernel re-fetches the now-valid insn. */
 }
 
-int handler_install(enum libcov_mode mode) {
+int handler_install(enum libcov_mode mode, struct sigaction *prev_out) {
     g_mode = mode;
 
     real_sigaction = (sigaction_fn)dlsym(RTLD_NEXT, "sigaction");
@@ -95,9 +76,9 @@ int handler_install(enum libcov_mode mode) {
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = trap_handler;
     sa.sa_flags     = SA_SIGINFO | SA_NODEFER;
-    sigemptyset(&sa.sa_mask);
+    handler_build_mask(&sa.sa_mask);
 
-    if (real_sigaction(LIBCOV_TRAP_SIGNO, &sa, &g_prev_sa) < 0) {
+    if (real_sigaction(LIBCOV_TRAP_SIGNO, &sa, prev_out) < 0) {
         libcov_logf("handler: sigaction(signo=%d): %s",
                     LIBCOV_TRAP_SIGNO, strerror(errno));
         return -1;

@@ -121,10 +121,12 @@ extern uint32_t libcov_prev_loc[LIBCOV_NGRAM_WIN];
 static inline uint32_t sink_hash_pc(uintptr_t pc, uint8_t module_idx) {
     /* Hash module-offset (pc - base[module_idx]), not absolute pc, so
      * PIE/ASLR doesn't randomise the bitmap layout per execve. See the
-     * comment on libcov_module_bases above. The bitmap is shared across
-     * modules; cross-module hash collisions are possible but accepted
-     * (same trade-off as same-module collisions on the index). */
-    uint64_t v = (uint64_t)(pc - libcov_module_bases[module_idx]);
+     * comment on libcov_module_bases above. module_idx is mixed in so the
+     * same offset in two different modules doesn't land in the same
+     * bucket; the term is 0 for module 0, so single-module bitmaps are
+     * unchanged. */
+    uint64_t v = (uint64_t)(pc - libcov_module_bases[module_idx])
+               ^ ((uint64_t)module_idx * 0x9E3779B97F4A7C15ULL);
     v ^= v >> 33;
     v *= 0xff51afd7ed558ccdULL;
     v ^= v >> 33;
@@ -145,13 +147,24 @@ static inline uint32_t sink_spread(uint32_t id) {
 }
 
 #if LIBCOV_NGRAM_ROTATE
-/* Position-dependent rotate so {A,B,C} and {C,B,A} index differently.
- * The rotation amounts are chosen non-zero and coprime-ish vs. 32 so
- * adjacent slots don't share rotation amounts. */
+/* Per-slot rotation amounts, set by sink_init() from the runtime map
+ * width. Distinct, non-zero and < map bits, so every history slot is a
+ * bijection on [0, map_size) and keeps its full entropy.
+ *
+ * (The previous version rotated the full 32-bit word and then masked to
+ * the map: bits rotated above the mask were discarded, so on a 4 KiB map
+ * slots 2 and 3 contributed 0 bits and slot 1 only 2 -- ROTATE=1 made
+ * high-N coverage *less* path-sensitive, not more.) */
+extern uint8_t libcov_ngram_rot_r[LIBCOV_NGRAM_WIN];
+extern uint8_t libcov_map_bits;
+
+/* Position-dependent rotate within the map width so {A,B,C} and {B,A,C}
+ * (history-slot permutations, which plain XOR folds together) index
+ * differently. */
 static inline uint32_t sink_ngram_rot(uint32_t v, unsigned j) {
-    unsigned r = ((j + 1u) * 5u) & 31u;   /* 5, 10, 15, 20, 25, 30, 3 */
-    if (!r) return v;
-    return (uint32_t)((v << r) | (v >> (32u - r)));
+    unsigned r = libcov_ngram_rot_r[j];
+    unsigned b = libcov_map_bits;
+    return ((v << r) | (v >> (b - r))) & libcov_map_mask;
 }
 #endif
 

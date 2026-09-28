@@ -11,6 +11,7 @@ wall-clock dominated by it on medium-sized binaries.
 
 Per-arch behavior:
   x86_64, aarch64, arm (ARM mode), powerpc, riscv64: patch block terminators
+                                                     (last >= 2-byte insn)
   arm (Thumb mode):                                  patch first 2 bytes only
   mips, mips64:                                      patch block ENTRIES
                                                      (avoids branch delay slots)
@@ -117,6 +118,7 @@ Usage:
 """
 import argparse
 import json
+import os
 import re
 import struct
 import sys
@@ -158,6 +160,10 @@ def open_rizin(binary):
     re-ran `aaa` on every command and that dominated wall-clock cost on
     anything larger than the toy test target.
     """
+    # rzpipe busy-loops forever (100% CPU, no error) when rizin cannot
+    # open the file, so check up front.
+    if not os.path.isfile(binary) or not os.access(binary, os.R_OK):
+        sys.exit(f"error: cannot read binary {binary!r}")
     try:
         rz = rzpipe.open(binary)
     except Exception as e:
@@ -219,7 +225,26 @@ def _is_branch_at(rz, addr):
     return t in BRANCH_TYPES
 
 
-def pick_sites(rz, fn, strategy, arch):
+def pick_terminator(insns, ok=None):
+    """Return the instruction to patch for a block under the terminator
+    strategy: the LAST instruction that is at least 2 bytes long (the
+    smallest trap encoding) and satisfies `ok`, or None.
+
+    Walking back matters on x86: blocks ending in a 1-byte `ret` (every
+    function exit) used to be dropped entirely. Any earlier instruction of
+    a straight-line block executes whenever the block completes, so it is
+    an equally valid probe. gen_boundary.py uses this same helper so
+    boundary markers stay co-located with patched sites."""
+    for insn in reversed(insns):
+        if int(insn.get("size", 0)) < 2:
+            continue
+        if ok is not None and not ok(insn):
+            continue
+        return insn
+    return None
+
+
+def pick_sites(rz, fn, strategy, arch, ok=None):
     is_mips = arch in ("mips", )
     blocks = rz.cmdj(f"afbj @ {fn['offset']}") or []
     sites = []
@@ -240,7 +265,9 @@ def pick_sites(rz, fn, strategy, arch):
                     continue
             pick = insns[idx]
         else:
-            pick = insns[-1]
+            pick = pick_terminator(insns, ok)
+            if pick is None:
+                continue
         sites.append((int(pick["offset"]), int(pick["size"]), pick["bytes"]))
     return sites
 
@@ -487,6 +514,11 @@ def collect_module_records(args, rz, module_idx, module_name):
     arch  = info["arch"]
     bits  = info["bits"]
     strategy = args.strategy if args.strategy != "auto" else default_strategy(arch, bits)
+    if arch == "mips" and strategy == "terminator":
+        # rizin places the branch delay slot inside the branch's block, so
+        # the terminator IS the delay slot: trapping there reports the
+        # branch's PC semantics wrong and restoring it crashes the target.
+        sys.exit("error: --strategy terminator is unsafe on MIPS (delay slots); use entry")
 
     if args.verbose:
         print(f"module[{module_idx}] '{module_name}': arch={arch} bits={bits} "
@@ -584,7 +616,14 @@ def collect_module_records(args, rz, module_idx, module_name):
     records = []
     mt_skipped_alignment = 0
     for fn in fns:
-        sites = pick_sites(rz, fn, strategy, arch)
+        # Let the terminator walk-back skip candidates MT would reject, so
+        # an odd-address x86 terminator falls back to an earlier, aligned
+        # instruction instead of losing the whole block.
+        ok = None
+        if args.threading == "mt":
+            width = mt_atomic_width(arch, fn["bits"])
+            ok = lambda insn, w=width: mt_addr_safe(arch, int(insn["offset"]), w)
+        sites = pick_sites(rz, fn, strategy, arch, ok)
         for addr, size, bhex in sites:
             if addr in seen:
                 continue

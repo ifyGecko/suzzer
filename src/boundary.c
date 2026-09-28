@@ -63,6 +63,11 @@ static int g_paired_mode = 0;
 
 static uint32_t g_init_grace_initial = 0;
 
+/* Process-wide: LIBCOV_BOUNDARY_INIT_GRACE=N drops the first N boundary
+ * fires in the whole process, not N per thread (a 16-thread daemon with
+ * a per-thread counter would silently drop 16*N). Decremented by CAS. */
+static uint32_t g_init_grace_remaining = 0;
+
 static struct libcov_shm_header *g_hdr      = NULL;
 static uint8_t                  *g_ring_base = NULL;
 static size_t                    g_slot_stride = 0;
@@ -79,8 +84,6 @@ static size_t g_touched_cap = 0;
 /* ---- per-thread (MT) / global (ST) ------------------------------- */
 
 static TLS uint32_t g_depth = 0;
-static TLS uint32_t g_init_grace_remaining = 0;
-static TLS int      g_init_grace_initialized = 0;
 
 /* "Touched this iter" set -- a stack of patch_entry pointers appended on
  * every disarm during the current iteration, drained at boundary. Sized
@@ -178,14 +181,19 @@ static int load_sidecar(const char *path, uintptr_t module_base) {
 
     const struct lcvb_record *rec =
         (const struct lcvb_record *)((const char *)map + sizeof(*h));
-    int saw_end = 0;
+    int saw_end = 0, saw_filter = 0;
     for (size_t i = 0; i < g_marker_count; i++) {
         g_markers[i].addr         = module_base + (uintptr_t)rec[i].offset;
         g_markers[i].kind         = rec[i].kind;
         g_markers[i].depth_filter = rec[i].depth_filter;
         if (rec[i].kind == LIBCOV_BOUNDARY_KIND_END) saw_end = 1;
+        if (rec[i].depth_filter) saw_filter = 1;
     }
     g_paired_mode = saw_end;
+    if (!saw_end && saw_filter)
+        libcov_logf("boundary: WARNING -- depth_filter set on a begin-only sidecar "
+                    "(no END markers); it has no effect and recursive BEGIN hits "
+                    "will each fire a boundary. Add END markers for depth tracking.");
     munmap(map, st.st_size);
 
     qsort(g_markers, g_marker_count, sizeof(*g_markers), cmp_marker);
@@ -232,6 +240,7 @@ int boundary_init(void) {
 
     const char *grace_str = getenv("LIBCOV_BOUNDARY_INIT_GRACE");
     if (grace_str && *grace_str) g_init_grace_initial = (uint32_t)atoi(grace_str);
+    g_init_grace_remaining = g_init_grace_initial;
 
     const char *efd_str = getenv("LIBCOV_BOUNDARY_NOTIFY_FD");
     if (efd_str && *efd_str) {
@@ -248,6 +257,11 @@ int boundary_init(void) {
     size_t patch_n = 0;
     config_table_mut(&patch_n);
     g_touched_cap = patch_n;
+    /* Pre-allocate the init thread's touched set so ST (and the MT main
+     * thread) never calls calloc from inside the signal handler. Other MT
+     * threads still allocate lazily on first trap -- see TODO.md. */
+    if (g_rearm == LIBCOV_REARM_TOUCHED && g_touched_cap > 0)
+        g_touched = calloc(g_touched_cap, sizeof(struct patch_entry *));
 
     g_ring_size   = g_hdr->ring_size;
     g_slot_stride = g_hdr->slot_stride;
@@ -351,7 +365,11 @@ static void publish_snapshot(uint64_t gen) {
      * generations behind doesn't see a half-zeroed slot stamped with a
      * stale gen. */
     struct libcov_ring_slot_hdr *next = slot_at(gen + 1);
-    __atomic_store_n(&next->slot_gen, (uint64_t)0, __ATOMIC_RELEASE);
+    __atomic_store_n(&next->slot_gen, (uint64_t)0, __ATOMIC_RELAXED);
+    /* Seqlock writer: slot_gen=0 must be visible before any of the memset
+     * stores below. A release *store* only orders earlier accesses; the
+     * fence orders it against the later plain stores (dmb on ARM). */
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     libcov_bitmap = slot_bitmap(next);
     memset(libcov_bitmap, 0, libcov_map_size);
 
@@ -419,13 +437,6 @@ static void maybe_record_init(uint64_t gen) {
 void boundary_on_trap(uintptr_t pc, struct patch_entry *e) {
     if (!g_enabled) return;
 
-    /* Initialize per-thread grace counter on first use. (TLS guarantees
-     * one-time init per thread; we use a flag to detect that.) */
-    if (!g_init_grace_initialized) {
-        g_init_grace_remaining   = g_init_grace_initial;
-        g_init_grace_initialized = 1;
-    }
-
     /* Flush any deferred marker re-arm from a previous boundary fire on
      * this thread -- but only if this trap is at a different pc
      * (otherwise we'd re-trap on the same site we're trying to leave).
@@ -441,8 +452,9 @@ void boundary_on_trap(uintptr_t pc, struct patch_entry *e) {
         g_pending_marker_rearm = NULL;
     }
 
-    /* Track this disarm so 'touched' re-arm can find it later. */
-    if (e) touched_append(e);
+    /* Track this disarm so 'touched' re-arm can find it later. Only needed
+     * (and only allocates) under REARM=touched. */
+    if (e && g_rearm == LIBCOV_REARM_TOUCHED) touched_append(e);
 
     struct marker *m = marker_lookup(pc);
     if (!m) return;
@@ -468,9 +480,11 @@ void boundary_on_trap(uintptr_t pc, struct patch_entry *e) {
     }
     if (!is_boundary) return;
 
-    if (g_init_grace_remaining) {
-        g_init_grace_remaining--;
-        return;
+    uint32_t grace = __atomic_load_n(&g_init_grace_remaining, __ATOMIC_RELAXED);
+    while (grace) {
+        if (__atomic_compare_exchange_n(&g_init_grace_remaining, &grace, grace - 1,
+                                        0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            return;
     }
 
     /* Advance generation and publish. gen 0 is reserved as "no snapshot

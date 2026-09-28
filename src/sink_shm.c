@@ -22,6 +22,22 @@ uint8_t *libcov_bitmap  = NULL;
 uint32_t libcov_map_size = LIBCOV_MAP_SIZE;
 uint32_t libcov_map_mask = LIBCOV_MAP_MASK;
 
+#if LIBCOV_NGRAM_ROTATE
+uint8_t libcov_map_bits = LIBCOV_MAP_SIZE_POW2;
+uint8_t libcov_ngram_rot_r[LIBCOV_NGRAM_WIN];
+
+/* Spread WIN distinct rotation amounts across [1, bits-1]. */
+static void compute_ngram_rot(unsigned bits) {
+    unsigned step = (bits - 1) / LIBCOV_NGRAM_WIN;
+    if (step == 0) step = 1;
+    for (unsigned j = 0; j < LIBCOV_NGRAM_WIN; j++) {
+        unsigned r = 1 + j * step;
+        if (r >= bits) r = 1 + (r % (bits - 1));
+        libcov_ngram_rot_r[j] = (uint8_t)r;
+    }
+}
+#endif
+
 /* Per-module load bases. Populated in config.c::config_load() from
  * util_module_base() for each module name in the LCV3 header's name
  * table. Indexed by patch_entry.module_idx in sink_hash_pc. Entries
@@ -94,6 +110,14 @@ int sink_init(const char *path, unsigned ring_size, size_t map_size) {
     }
     libcov_map_size = (uint32_t)map_size;
     libcov_map_mask = (uint32_t)map_size - 1u;
+#if LIBCOV_NGRAM_ROTATE
+    {
+        unsigned bits = 0;
+        while ((1u << bits) < (uint32_t)map_size) bits++;
+        libcov_map_bits = (uint8_t)bits;
+        compute_ngram_rot(bits);
+    }
+#endif
 
     size_t bitmap_off, ring_off, slot_stride;
     size_t total = compute_shm_size(ring_size, map_size,

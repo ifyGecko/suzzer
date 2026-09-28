@@ -6,11 +6,13 @@ Boundary markers tell libcov "this address means a new iteration has
 started." The marker set is per-target and orthogonal to the patch list;
 this script lets you generate one from a small list of symbol names.
 
-Each named function is resolved to the LAST instruction of its FIRST basic
-block (the same address gen_patchlist.py would pick when patching that
-function), so the boundary marker is guaranteed to coincide with a
-patched site -- without that, the trap never fires and the boundary
-never publishes.
+Each named function is resolved to the last patchable (>= 2 byte)
+instruction of its FIRST basic block -- the same address gen_patchlist.py
+picks with its terminator strategy -- so the marker coincides with a
+patched site. Without that, the trap never fires and the boundary never
+publishes. Pass --patchlist to verify this against the actual patch list
+(recommended: include/exclude filters, --root slicing, MT alignment and
+MIPS entry strategy can all leave the chosen address unpatched).
 
 Output layout matches src/boundary.h:
   header: magic[4]='LCVB', version=1, count, flags
@@ -29,9 +31,14 @@ Example:
 """
 import argparse
 import json
+import os
 import struct
 import subprocess
 import sys
+
+sys.dont_write_bytecode = True  # no tools/__pycache__ from the import below
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from gen_patchlist import pick_terminator  # noqa: E402
 
 
 def rizin(binary, cmds):
@@ -113,7 +120,23 @@ def first_bb_terminator(binary, fn_addr):
     insns = rizin_json(binary, ["aaa", f"pdj {n} @ {int(first['addr'])}"]) or []
     if not insns:
         return None
-    return int(insns[-1]["offset"])
+    pick = pick_terminator(insns)
+    return int(pick["offset"]) if pick else None
+
+
+def patchlist_offsets(path):
+    """Set of module-0 record offsets in an LCV3 patch list."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if data[:4] != b"LCV3":
+        sys.exit(f"{path}: not an LCV3 patch list")
+    count = struct.unpack_from("<I", data, 8)[0]
+    out = set()
+    for i in range(count):
+        off, _ln, midx = struct.unpack_from("<QBB", data, 24 + i * 14)
+        if midx == 0:
+            out.add(off)
+    return out
 
 
 KIND_MAP = {"begin": 0, "end": 1}
@@ -138,8 +161,12 @@ def main():
     ap.add_argument("output")
     ap.add_argument("specs", nargs="+",
                     help="SYM[:kind[:depth_filter]] (e.g. iter_begin:begin:zero)")
+    ap.add_argument("--patchlist", metavar="LCV",
+                    help="verify every marker lands on a site in this LCV3 "
+                         "patch list (module 0); exit non-zero if not")
     ap.add_argument("--verbose", "-v", action="store_true")
     args = ap.parse_args()
+    patched = patchlist_offsets(args.patchlist) if args.patchlist else None
 
     baddr = get_image_base(args.binary)
     fns = get_function_addrs(args.binary)
@@ -155,6 +182,9 @@ def main():
         if term is None:
             sys.exit(f"could not find first-BB terminator for {name} @ 0x{fn_addr:x}")
         offset = term - baddr
+        if patched is not None and offset not in patched:
+            sys.exit(f"error: marker {name} at off=0x{offset:x} is not a patched "
+                     f"site in {args.patchlist}; the boundary would never fire")
         records.append((offset, kind, depth))
         if args.verbose:
             print(f"  marker {name} entry=0x{fn_addr:x} term=0x{term:x} "
@@ -167,6 +197,9 @@ def main():
         for offset, kind, depth in records:
             f.write(struct.pack("<QBB6s", offset, kind, depth, b"\x00" * 6))
 
+    if not any(k == 1 for _, k, _ in records) and any(d for _, _, d in records):
+        print("warning: depth_filter=zero has no effect without END markers "
+              "(begin-only sidecar)", file=sys.stderr)
     print(f"wrote {len(records)} marker(s) to {args.output}", file=sys.stderr)
 
 

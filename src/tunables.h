@@ -163,10 +163,11 @@
 
 /* LIBCOV_NGRAM_ROTATE
  *   When 1, each prev[j] slot is rotated by a position-dependent amount
- *   before being XORed into the index. With plain XOR (default), windows
- *   {A,B,C} and {C,B,A} hash to the same bucket because XOR commutes.
- *   Rotation breaks that symmetry so reordered sequences index to
- *   distinct buckets, reducing collisions at higher N.
+ *   (within the runtime map width) before being XORed into the index.
+ *   With plain XOR (default) the history slots commute, so for N>=3 the
+ *   windows A,B,C and B,A,C (same current site, permuted history) hash to
+ *   the same bucket. Rotation breaks that symmetry so reordered histories
+ *   index to distinct buckets. Recommended whenever N >= 3.
  *
  *     0     plain XOR (default; N=2 stays bit-identical to AFL).
  *     1     per-position rotation enabled.

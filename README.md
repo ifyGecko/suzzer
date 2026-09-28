@@ -7,8 +7,9 @@ threading variants are built as separate LEGO bricks:
   surface area.
 - **`libcov_mt.so`** -- thread-safe: per-thread TLS prev_loc, atomic
   saturating bitmap, atomic per-site state machine (spinlock-serialized
-  byte writes), `/proc/self/mem` for mprotect-free patching, and
-  `membarrier(SYNC_CORE)` for cross-CPU instruction-cache visibility.
+  writes), single-copy-atomic stores into code pages made R|W|X once at
+  init, and `membarrier(SYNC_CORE)` for cross-CPU instruction-cache
+  visibility.
 
 Both variants share the same backends across 11 architectures. Pick the
 brick that fits your target.
@@ -20,7 +21,8 @@ trap-raising encoding. When the CPU traps, our `LD_PRELOAD`-injected
 signal handler:
 
 1. Reads the faulting PC from `ucontext`.
-2. Emits an AFL-style edge into a 64 KB shared bitmap.
+2. Emits an AFL-style edge into a shared bitmap (auto-sized from the
+   patch count by default -- see [Coverage model](#coverage-model)).
 3. Restores the original instruction so execution continues.
 
 No JIT, no embedded interpreter, no ptrace, no kernel module. Just libc +
@@ -35,7 +37,7 @@ per-backend tunables header (see [Tunables](#tunables)).
 
 | Backend           | Default trap insn        | Patch len | Notes                                   |
 |-------------------|--------------------------|-----------|-----------------------------------------|
-| x86_64            | UD2 (`0F 0B`)            | 2..15 / 2 | ST: UD2 + NOP pad; MT: UD2 only         |
+| x86_64            | UD2 (`0F 0B`)            | 2         | Head-only; MT sites must be 2-aligned   |
 | aarch64           | UDF #0 (`0x00000000`)    | 4         |                                         |
 | arm (ARM mode)    | UDF `0xE7F000F0`         | 4         |                                         |
 | arm (Thumb mode)  | UDF.N `0xDE00`           | 2         | Per-function bits=16 detection          |
@@ -129,9 +131,10 @@ LD_PRELOAD=./build/aarch64/libcov_st.so \
     build/aarch64/target_simple 42
 ```
 
-The 64 KB AFL-style bitmap is written to `/tmp/cov` (or whatever path
-`LIBCOV_SHM_PATH` points at). An external fuzzer mmaps the same file/SHM
-and reads hit-counts.
+The shm region (header + bitmap + snapshot ring) is written to `/tmp/cov`
+(or whatever path `LIBCOV_SHM_PATH` points at). An external fuzzer mmaps
+the same file/SHM and reads hit-counts. **Read `map_size` and
+`bitmap_offset` from the header** -- the bitmap is not a fixed 64 KB.
 
 ## Selective instrumentation (call-graph slicing)
 
@@ -201,27 +204,43 @@ to be instrumented.
 | `LIBCOV_PATCHLIST` | *(required)* | Path to LCV3 patch list. If unset, the library is inert. |
 | `LIBCOV_SHM_PATH` | `/libcov_<pid>` | Bitmap path. Leading `/` and no other slashes → `shm_open`; otherwise a filesystem path. Falls back to `$TMPDIR/<name>` if `shm_open` fails. |
 | `LIBCOV_MODE` | `leapfrog` | `oneshot` (each site fires once, fastest) or `leapfrog` (re-arm previous site each trap; gives hit counts). |
-| `LIBCOV_MODULE` | basename of `argv[0]` | Module name for boundary-mode sidecar resolution only. The patch list itself carries its own module name table (LCV3) so this only affects `LIBCOV_BOUNDARY_LIST` lookups. |
+| `LIBCOV_MODULE` | basename of `/proc/self/exe` | Module name for boundary-mode sidecar resolution only. The patch list itself carries its own module name table (LCV3) so this only affects `LIBCOV_BOUNDARY_LIST` lookups. |
 | `LIBCOV_LOG` | unset (stderr) | Init-time diagnostic log. Never written from the signal handler. |
 | `LIBCOV_BOUNDARY_LIST` | unset | Path to LCVB1 iteration-boundary sidecar. Iteration framing is inert if unset. |
 | `LIBCOV_BOUNDARY_REARM` | `none` | `none` / `all` / `touched`. What to re-arm at each boundary fire. |
 | `LIBCOV_BOUNDARY_RING` | `4` | Number of snapshot slots (2..16). Driver lag tolerance = `RING - 1` iterations. |
-| `LIBCOV_BOUNDARY_INIT_GRACE` | `0` | Drop the first N marker hits before publishing (skip init noise). |
+| `LIBCOV_BOUNDARY_INIT_GRACE` | `0` | Drop the first N boundary fires (process-wide, across all threads) before publishing (skip init noise). |
 | `LIBCOV_BOUNDARY_NOTIFY_FD` | unset | Inherited fd; libcov writes 8 bytes after each snapshot (eventfd-style wakeup). Counter polling works without it. |
+
+## Coverage model
+
+`LIBCOV_COVERAGE_MODEL_SITE` in `src/tunables.h` picks how a trap becomes
+a bucket index:
+
+- `1` (**default**) -- **site-id**: each patch record's index in the
+  patch list is its id. The bitmap auto-sizes to
+  `next_pow2(n_sites * LIBCOV_MAP_FUDGE)` (clamped by
+  `LIBCOV_MAP_MIN_POW2`/`MAX_POW2`, never below `next_pow2(n_sites)`),
+  so at N=1 there are zero collisions. At N>=2 the history is folded in
+  and collisions become possible again (bump `LIBCOV_MAP_FUDGE` for
+  path-sensitive work).
+- `0` -- legacy **hashed-PC**: `hash(pc - module_base)` into a fixed
+  `1 << LIBCOV_MAP_SIZE_POW2` (64 KB) map.
 
 ## Coverage scheme (N-gram)
 
-How a trap turns into a bitmap bucket is configurable at build time
+How much history goes into a bucket index is configurable at build time
 through `LIBCOV_NGRAM_N` (and `LIBCOV_NGRAM_ROTATE`) in `src/tunables.h`.
+`cur` below is the site id (site-id model) or `hash(pc)` (hashed-PC model).
 The bitmap layout (size, hash, saturating uint8 counters, atomic emit
 under MT) is identical across all settings — readers, AFL-style
 drivers, and the snapshot ring need no changes.
 
 | `LIBCOV_NGRAM_N` | Scheme            | Index formula                                  | When to use                                 |
 |------------------|-------------------|------------------------------------------------|---------------------------------------------|
-| `1`              | Block coverage    | `idx = hash(pc)`                               | Lowest overhead; "did this block run" only. |
-| `2` (**default**)| AFL-style edges   | `idx = hash(pc) ^ prev[0]`                     | Bit-for-bit identical to historical libcov. |
-| `3..8`           | N-gram coverage   | `idx = hash(pc) ^ prev[0] ^ ... ^ prev[N-2]`   | Path-sensitive; distinguishes loop trips, dispatch sequences, and call-chain variants the same edge map collapses. |
+| `1`              | Block coverage    | `idx = cur`                                    | Lowest overhead; "did this block run" only. |
+| `2` (**default**)| AFL-style edges   | `idx = cur ^ prev[0]`                          | Hashed-PC model: bit-identical to historical libcov. |
+| `3..8`           | N-gram coverage   | `idx = cur ^ prev[0] ^ ... ^ prev[N-2]`        | Path-sensitive; distinguishes loop trips, dispatch sequences, and call-chain variants the same edge map collapses. |
 
 ```sh
 # Block coverage (cheapest):
@@ -230,7 +249,8 @@ make EXTRA_CFLAGS='-DLIBCOV_NGRAM_N=1'
 # 4-gram coverage:
 make EXTRA_CFLAGS='-DLIBCOV_NGRAM_N=4'
 
-# 8-gram with per-position rotation (defeats {A,B,C} == {C,B,A} XOR collisions):
+# 8-gram with per-position rotation (defeats A,B,C == B,A,C history-permutation collisions;
+# recommended for any N >= 3):
 make EXTRA_CFLAGS='-DLIBCOV_NGRAM_N=8 -DLIBCOV_NGRAM_ROTATE=1'
 ```
 
@@ -301,7 +321,7 @@ The shm region grows beyond the live bitmap:
 ```
 offset                       contents
 0                            struct libcov_shm_header  (72 B with x86_64 alignment)
-bitmap_offset                live bitmap               (64 KB)
+bitmap_offset                live bitmap               (map_size bytes)
 ring_offset                  RING * slot_stride        (per-iter snapshots)
 ```
 
@@ -357,11 +377,14 @@ it from per-input attribution.
 ### Threading
 
 Per-thread state is `__thread` under `libcov_mt.so`: depth counter,
-touched-set scratch, deferred-marker-rearm pointer. Concurrent worker
-threads scope their own iterations cleanly. Snapshot publish is
-last-writer-wins on `gen_current`; the seqlock check on the reader
-side handles the brief window where `gen_current` has advanced but the
-target slot hasn't yet been stamped.
+touched-set scratch, deferred-marker-rearm pointer. **The live bitmap is
+shared**, however: when one thread publishes, every other thread's
+in-flight coverage lands in that snapshot or the next. With more than one
+thread running iterations concurrently, per-iteration snapshots mix
+threads -- use one worker thread per process for clean attribution (see
+TODO.md). Snapshot publish is last-writer-wins on `gen_current`; the
+seqlock check on the reader side handles the brief window where
+`gen_current` has advanced but the target slot hasn't yet been stamped.
 
 ## Patch list format (LCV3)
 
@@ -437,9 +460,10 @@ uint8_t  reserved[6];
 ```
 
 All little-endian. `tools/gen_boundary.py` emits this. The generator
-resolves a function name to the LAST instruction of its FIRST basic
-block (the same address `gen_patchlist.py` would pick for that BB), so
-the boundary marker is guaranteed to be co-located with a patched site.
+resolves a function name to the last >= 2-byte instruction of its FIRST
+basic block (the same address `gen_patchlist.py` would pick for that BB).
+Pass `--patchlist <lcv>` to have it verify each marker really is a patched
+site (filters, slicing and MT alignment can all exclude it).
 
 ## Shm header layout
 
@@ -449,7 +473,7 @@ the boundary marker is guaranteed to be co-located with a patched site.
 char     magic[4]    = "LCVS";
 uint16_t version     = 1;
 uint16_t ring_size;
-uint32_t map_size    = 65536;
+uint32_t map_size;        // live bitmap bytes (power of two)
 uint32_t slot_stride;     // sizeof(ring_slot_hdr) + map_size
 uint32_t flags;           // bit0 = boundaries active, bit1 = MT-variant libcov
 uint64_t gen_current;     // atomic; last fully-published iteration
@@ -479,8 +503,15 @@ across runs are easier with ASLR off.
 - `sigaction(2)` and `signal(2)` are intercepted; if the target tries to
   install its own handler for the backend's trap signal post-init, the
   request is acknowledged with success but our handler stays installed.
-  The target's intended handler is stashed and chained for *real* traps
-  (faults at addresses not in our patch table).
+  The target's intended handler (or the pre-init one) is stashed and
+  chained for *real* traps (faults at addresses not in our patch table),
+  honouring `SA_SIGINFO` and `SA_RESETHAND`; `SIG_DFL`/`SIG_IGN` die with
+  the default action as the kernel would.
+- `sigprocmask(2)` and `pthread_sigmask(3)` are intercepted to strip the
+  trap signal from any mask the target blocks: a blocked synchronous trap
+  signal is fatal.
+- The trap handler runs with every asynchronous signal blocked, so a
+  target signal handler can never run instrumented code mid-patch.
 - Init-time byte validation: every patch record's `orig[]` is compared
   against the actual bytes at the target address; mismatches abort with a
   clear log line so stale patch lists are caught immediately.
@@ -499,9 +530,12 @@ across runs are easier with ASLR off.
   `src/patch_mt.c`; real-hardware validation is a TODO.
 - **No JIT/self-modifying code support.** Newly-generated code is not in
   the patch list and won't be instrumented.
-- **W^X-strict kernels** that refuse a transient `RW` on a code page will
-  fail at `patch_arm`. The library uses two `mprotect` calls per site
-  (never `RWX`) to maximise compatibility.
+- **W^X-strict kernels.** `libcov_st.so` uses two `mprotect` calls per
+  arm/disarm (transient `RW`, never `RWX`). `libcov_mt.so` makes each
+  patched code page `RWX` once at init so writes are single atomic
+  stores; if the kernel refuses, it falls back to non-atomic
+  `pwrite(/proc/self/mem)` and logs a WARNING (torn instructions become
+  possible under concurrency).
 - **Per-arch length minimums.** Fixed-width-insn architectures (everything
   except x86) can only patch full instructions. x86_64 can patch any
   instruction >= 2 bytes; 1-byte insns (`ret`, `push rbp`) are skipped by
@@ -554,6 +588,8 @@ test/
   run_validation_mt.sh        native MT regression test + stress
   run_validation_boundary.sh  native boundary-mode test + (MODE, REARM) matrix
   run_validation_multimod.sh  native multi-module LCV3 test (exe + helper.so)
+  target_signals.c            signal-mask / SIGILL-handler regression target
+  run_validation_signals.sh   native ST+MT signal-handling regression test
   run_cross.sh                all-arch ST validation under qemu-user-static
   run_cross_mt.sh             all-arch MT validation (full run for x86_64+aarch64;
                               build-only for the other 9 due to qemu-user TCG limits)
@@ -585,6 +621,9 @@ make THREADING=mt
 
 # Native (x86_64) boundary mode (long-running target_loop + ring reader):
 ./test/run_validation_boundary.sh
+
+# Native signal handling (blocked masks, target SIGILL handlers), ST + MT:
+./test/run_validation_signals.sh
 
 # All backends, ST, under qemu-user-static:
 ./test/run_cross.sh        # PASS=12  FAIL=0  SKIP=0

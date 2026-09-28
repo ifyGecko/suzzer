@@ -26,7 +26,11 @@ void libcov_logf(const char *fmt, ...) {
     va_start(ap, fmt);
     n += vsnprintf(buf + n, sizeof buf - n, fmt, ap);
     va_end(ap);
-    if (n < (int)sizeof buf - 1) { buf[n++] = '\n'; }
+    /* vsnprintf returns the untruncated length; clamp so a long message
+     * (e.g. a 4 KiB path) doesn't make write() read past buf. */
+    if (n < 0) return;
+    if (n > (int)sizeof buf - 1) n = (int)sizeof buf - 1;
+    buf[n++] = '\n';
     (void)write(log_fd, buf, (size_t)n);
 }
 
