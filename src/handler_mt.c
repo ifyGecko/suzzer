@@ -10,8 +10,8 @@
  *   for "is this site currently a trap"; per-thread last_restored is just
  *   a hint for which site to re-arm next.
  *
- *   g_prev_sa (the chain-target sigaction) stays shared and read-only after
- *   install; that's safe.
+ *   Non-libcov traps chain through libcov_chain_trap() (libcov.c), shared
+ *   with the ST handler.
  *
  *   The real_sigaction pointer is resolved once at install (under the main
  *   thread) and then read-only.
@@ -34,24 +34,10 @@
 #include <dlfcn.h>
 
 static enum libcov_mode  g_mode = LIBCOV_MODE_LEAPFROG;
-static struct sigaction  g_prev_sa;
 static __thread struct patch_entry *g_last_restored = NULL;
 
 typedef int (*sigaction_fn)(int, const struct sigaction *, struct sigaction *);
 static sigaction_fn real_sigaction = NULL;
-
-static void chain_or_default(int signo, siginfo_t *info, void *uctx) {
-    if (g_prev_sa.sa_flags & SA_SIGINFO) {
-        if (g_prev_sa.sa_sigaction) g_prev_sa.sa_sigaction(signo, info, uctx);
-    } else if (g_prev_sa.sa_handler == SIG_DFL) {
-        struct sigaction dfl;
-        memset(&dfl, 0, sizeof dfl);
-        dfl.sa_handler = SIG_DFL;
-        if (real_sigaction) real_sigaction(signo, &dfl, NULL);
-    } else if (g_prev_sa.sa_handler != SIG_IGN) {
-        g_prev_sa.sa_handler(signo);
-    }
-}
 
 static void trap_handler(int signo, siginfo_t *info, void *uctx) {
     ucontext_t *uc = (ucontext_t *)uctx;
@@ -59,7 +45,7 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
 
     struct patch_entry *e = patch_lookup(pc);
     if (!e) {
-        chain_or_default(signo, info, uctx);
+        libcov_chain_trap(signo, info, uctx);
         return;
     }
     /* Concurrent traps at the same site from multiple threads converge here.
@@ -72,14 +58,33 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
      * coalesces the per-write membarrier IPIs (disarm + leapfrog arm +
      * any boundary rearms) into a single broadcast. */
     sink_emit(pc, e->module_idx, e->site_id);
+
+    if (e->emulate) {
+        /* Boundary marker the backend can execute itself: it stays armed
+         * (so no peer can pass it untrapped). Do the leapfrog re-arm of
+         * our previous site, the boundary work, then perform the marker's
+         * instruction on the context and return past it. */
+        struct patch_entry *last = g_last_restored;
+        if (g_mode == LIBCOV_MODE_LEAPFROG && last && !last->marker &&
+            !__atomic_load_n(&last->patched, __ATOMIC_RELAXED))
+            patch_arm_unsynced(last);
+        g_last_restored = NULL;
+        boundary_on_trap(pc, e);
+        libcov_arch_emulate(uc, pc, e->orig, e->len);
+        patch_sync_batch_end();
+        return;
+    }
+
     patch_disarm_unsynced(e);
 
     if (g_mode == LIBCOV_MODE_LEAPFROG) {
         /* Per-thread leapfrog. The arm cmpxchg in patch_arm guards against
          * arming a site that another thread already armed via its own
-         * leapfrog -- in that case our arm is a no-op, which is correct. */
+         * leapfrog -- in that case our arm is a no-op, which is correct.
+         * Boundary markers are skipped: boundary.c re-arms them once every
+         * thread that trapped on them has moved past. */
         struct patch_entry *last = g_last_restored;
-        if (last && last != e &&
+        if (last && last != e && !last->marker &&
             !__atomic_load_n(&last->patched, __ATOMIC_RELAXED)) {
             patch_arm_unsynced(last);
         }
@@ -100,7 +105,7 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
     patch_sync_batch_end();
 }
 
-int handler_install(enum libcov_mode mode) {
+int handler_install(enum libcov_mode mode, struct sigaction *prev_out) {
     g_mode = mode;
 
     real_sigaction = (sigaction_fn)dlsym(RTLD_NEXT, "sigaction");
@@ -116,9 +121,9 @@ int handler_install(enum libcov_mode mode) {
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = trap_handler;
     sa.sa_flags     = SA_SIGINFO | SA_NODEFER;
-    sigemptyset(&sa.sa_mask);
+    handler_build_mask(&sa.sa_mask);
 
-    if (real_sigaction(LIBCOV_TRAP_SIGNO, &sa, &g_prev_sa) < 0) {
+    if (real_sigaction(LIBCOV_TRAP_SIGNO, &sa, prev_out) < 0) {
         libcov_logf("handler_mt: sigaction(signo=%d): %s",
                     LIBCOV_TRAP_SIGNO, strerror(errno));
         return -1;

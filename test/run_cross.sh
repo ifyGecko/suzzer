@@ -11,6 +11,15 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Per-run scratch dir (fixed /tmp paths made parallel runs collide). Kept
+# when anything fails, since the per-arch logs in it are how you debug.
+WORK=$(mktemp -d -t libcov_cross.XXXXXX)
+keep_work_on_failure() {
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then rm -rf "$WORK"; else echo "logs kept in $WORK" >&2; fi
+    return $rc
+}
+trap keep_work_on_failure EXIT
 cd "$ROOT"
 
 ARCHES=( x86_64 aarch64 arm arm-thumb mips mipsel mips64 mips64el powerpc powerpc64 powerpc64le riscv64 )
@@ -63,16 +72,11 @@ run_target_clean() {
     fi
 }
 
-# The shm file is laid out as a 72-byte libcov_shm_header followed by the
-# 64 KB live bitmap (and the snapshot ring, unused when boundaries are
-# off). Bitmap statistics must skip the header.
+# Live-bitmap statistics, "<nonzero> <sum>". test/shm_bitmap.py reads the
+# size and offset from the header (both vary: auto-sized map, target ABI
+# and byte order).
 count_edges() {
-    python3 -c "
-import sys
-with open(sys.argv[1],'rb') as f: d=f.read()
-if d[:4] == b'LCVS': d = d[72:72+65536]
-n=sum(1 for b in d if b); t=sum(d)
-print(n,t)" "$1"
+    python3 "$ROOT/test/shm_bitmap.py" stats "$1" | cut -d' ' -f1,2
 }
 
 PASS=0
@@ -107,14 +111,14 @@ for arch in "${ARCHES[@]}"; do
 
     target_bin=build/$build_arch/$target_name
 
-    LCV=/tmp/$arch.lcv
-    SHM=/tmp/$arch.shm
-    LOG=/tmp/$arch.log
-    OUT=/tmp/$arch.out
+    LCV=$WORK/$arch.lcv
+    SHM=$WORK/$arch.shm
+    LOG=$WORK/$arch.log
+    OUT=$WORK/$arch.out
 
     if ! ./tools/gen_patchlist.py "$target_bin" "$LCV" \
             --include-pat '^dbg\.(main|classify|loop_sum|cmdline)$' \
-            >/dev/null 2>/tmp/$arch.gen.log; then
+            >/dev/null 2>$WORK/$arch.gen.log; then
         echo "FAIL gen_patchlist"; FAIL=$((FAIL+1)); FAILED+=("$arch:gen"); continue
     fi
 
@@ -161,10 +165,7 @@ with open('$LCV','rb') as f:
     LIBCOV_PATCHLIST="$LCV" LIBCOV_SHM_PATH="$SHM" LIBCOV_LOG=/dev/null \
         LIBCOV_MODE=leapfrog \
         run_target "$build_arch" "$libcov_so" "$target_bin" 99 > "$OUT.lf" 2>&1
-    maxhits=$(python3 -c "
-d=open('$SHM','rb').read()
-if d[:4] == b'LCVS': d = d[72:72+65536]
-print(max(d) if d else 0)")
+    maxhits=$(python3 "$ROOT/test/shm_bitmap.py" stats "$SHM" | cut -d' ' -f3)
     if (( maxhits < 2 )); then
         echo "FAIL leapfrog never recorded multi-hit (max=$maxhits)"
         FAIL=$((FAIL+1)); FAILED+=("$arch:leapfrog"); continue

@@ -84,7 +84,10 @@ static int read_slot(void *shm_base, uint64_t target_gen, uint8_t *out,
     uint64_t tid = s->tid;
     uint64_t ns  = s->ns;
 
-    uint64_t post = __atomic_load_n(&s->slot_gen, __ATOMIC_ACQUIRE);
+    /* Seqlock reader: keep the memcpy loads above from being reordered
+     * after the re-check (an acquire load only orders LATER accesses). */
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    uint64_t post = __atomic_load_n(&s->slot_gen, __ATOMIC_RELAXED);
     if (post != target_gen) return 1;  /* writer overwrote our slot mid-read */
 
     if (tid_out) *tid_out = tid;

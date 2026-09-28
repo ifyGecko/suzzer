@@ -17,4 +17,13 @@ uintptr_t util_module_base(const char *modname);
  * ourselves). Both 0 on failure. */
 void util_self_range(uintptr_t *lo, uintptr_t *hi);
 
+/* Spin-wait backoff for the signal-safe spinlocks (patch_mt.c entry and
+ * fallback locks, boundary.c slot locks). Call once per failed acquire.
+ * After LIBCOV_SPIN_YIELD_AFTER spins it yields the CPU: on a single-core
+ * part with SCHED_FIFO threads, a pure spin can starve the lock holder
+ * forever. sched_yield is a plain syscall with no libc state, so it is
+ * safe in the trap handler. */
+#define LIBCOV_SPIN_YIELD_AFTER 64u
+void libcov_spin_backoff(unsigned *spins);
+
 #endif

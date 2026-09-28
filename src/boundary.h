@@ -16,10 +16,11 @@
  *     against desync.
  *
  * Threading: most state is shared across threads; depth tracking, the
- * touched-this-iter stack, and the deferred-rearm slot are per-thread
- * (__thread) under LIBCOV_THREADING_MT so two concurrent request handlers
- * don't corrupt each other's iteration scoping. The same source compiles
- * with plain globals under LIBCOV_THREADING_ST.
+ * touched-this-iter stack, and (once a thread fires its first boundary)
+ * the live bitmap are per-thread (__thread) under LIBCOV_THREADING_MT so
+ * two concurrent request handlers don't corrupt each other's iteration
+ * scoping or snapshots. The same source compiles with plain globals under
+ * LIBCOV_THREADING_ST. See boundary.c's header for the details.
  *
  * Boundaries are inert unless LIBCOV_BOUNDARY_LIST is set; existing
  * coverage runs are unaffected.

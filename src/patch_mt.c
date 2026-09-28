@@ -7,21 +7,38 @@
  *      concurrent arm/disarm requests on the same site serialize cleanly:
  *      only the winner does the byte-write; the loser no-ops.
  *
- *  (2) Writes go through /proc/self/mem (pwrite) when available. This
- *      bypasses mprotect entirely, so peer threads keep executing on the
- *      R|X mapping unperturbed -- no transient writable window on the code
- *      page. Falls back to mprotect+memcpy on hardened kernels where
- *      /proc/self/mem writes are blocked. The fallback dance is serialized
- *      globally (g_fallback_lock): mprotect bits are per-page, so the
- *      per-entry e->lock cannot prevent two threads patching different
- *      entries on the same page from racing on the page protection.
+ *  (2) Writes are a single naturally-sized atomic store. At init every
+ *      page holding a patch site is mprotect'ed R|W|X once (never
+ *      dropping X, so peer threads keep executing), after which arm/disarm
+ *      is one __atomic_store_n of the 2- or 4-byte encoding -- no syscall
+ *      on the hot path.
  *
- *  (3) Cross-CPU instruction-cache coherence: after each successful write,
- *      we call membarrier(PRIVATE_EXPEDITED_SYNC_CORE). On x86 this is a
- *      kernel no-op (the architecture is strongly ordered + I-cache is
- *      snoopy). On weak ISAs it IPIs every CPU the process has run on,
- *      forcing each one to serialize its pipeline; peer threads see the
- *      new bytes on their next fetch.
+ *      Why not pwrite(/proc/self/mem)? That was the previous primary path
+ *      and it TEARS: the kernel copies through memcpy, which for 2-4 byte
+ *      lengths does byte-wise stores (rep movsb / split byte moves). A peer
+ *      CPU could fetch UD2's first byte next to the original's second byte
+ *      (e.g. `0f 07` = SYSRET -> #GP -> SIGSEGV), which crashed the 16-thread
+ *      stress test roughly 1 run in 10 on x86_64. /proc/self/mem is now
+ *      only a last-resort fallback for kernels that refuse R|W|X (W^X-strict
+ *      / SELinux execmod), with a loud warning at init.
+ *
+ *  (3) Cross-CPU instruction visibility is two separate steps, and both
+ *      are required on weakly-ordered ISAs:
+ *
+ *      a. Cache maintenance, after EVERY write: __builtin___clear_cache
+ *         (aarch64 DC CVAU + IC IVAU, broadcast to the inner-shareable
+ *         domain; arm/mips/riscv cacheflush syscalls; ppc dcbst/icbi).
+ *         This makes the new bytes reachable by instruction fetch on
+ *         every core. It compiles to nothing on x86 (coherent I-cache).
+ *      b. Context synchronization, once per batch: membarrier(PRIVATE_
+ *         EXPEDITED_SYNC_CORE) IPIs every CPU running this process so
+ *         each one discards already-fetched/prefetched instructions.
+ *         Without it, membarrier.c signals every peer thread instead
+ *         (LIBCOV_SYNC_FALLBACK).
+ *
+ *      membarrier does NOT do (a): an earlier version skipped clear_cache
+ *      whenever SYNC_CORE was active, which could leave peers -- and the
+ *      writer itself -- fetching stale bytes on non-coherent I-caches.
  *
  * Atomicity argument for the byte-write:
  *
@@ -33,18 +50,33 @@
  *  - arm-Thumb / riscv64-compressed: 2-byte half-word stores naturally
  *    aligned. Single-copy-atomic on ARMv7+ and RV32IC/RV64IC.
  *
- *  - x86_64: arch_x86_64.c's MT path (#ifdef LIBCOV_THREADING_MT)
- *    writes only 2 bytes (UD2 head) and the backend's
- *    libcov_max_patch_len is 2 (see tunables_x86_64.h), so the generator
- *    must emit MT records with len=2. Intel SDM guarantees aligned
- *    16-bit stores are atomic; in practice 16-bit stores that fit
- *    within a cache line are atomic on all P6+ CPUs.
+ *  - x86_64: the backend writes only 2 bytes (UD2 head) and
+ *    libcov_max_patch_len is 2 (see tunables_x86_64.h). Intel SDM 8.1.1
+ *    guarantees 16-bit stores are atomic when aligned, and (P6 onward)
+ *    also when unaligned but contained in one cache line. We therefore
+ *    accept any address whose 2 bytes don't span a 64-byte line; the
+ *    generator's --threading mt mode applies the same rule.
  *
  * What we still don't claim:
  *
  *  - If the patch list contains addresses that violate the alignment
- *    assumption above, behavior is undefined under MT. The generator's
- *    --threading mt mode is responsible for emitting only aligned sites.
+ *    assumption above, write_bytes() refuses the direct store and uses
+ *    the (non-atomic) fallback path.
+ *  - Architectural cross-modifying-code rules. The trap design is fixed
+ *    (SIGILL from an illegal encoding), and neither UD2 nor UDF is in
+ *    the architectures' blessed sets: x86 SDM 8.1.3 wants the executing
+ *    core to serialize before running modified code, and the AArch64
+ *    CMODX list (B/BL/NOP/BRK/SVC/HVC/SMC/ISB) excludes UDF. A peer that
+ *    is fetching the site at the exact moment of the store may, per the
+ *    spec, execute a CONSTRAINED UNPREDICTABLE mix. What we provide:
+ *      - the store is single-copy atomic, so no torn encoding is ever
+ *        in memory;
+ *      - (3a) + (3b) above, so once patch_sync_batch_end() returns every
+ *        CPU observes the new bytes (x86: SYNC_CORE's IPI + iret is the
+ *        serializing event SDM 8.1.3 asks for).
+ *    The residual window is a fetch racing the store itself. In practice
+ *    that fetch returns the old or the new word, never a mix; this is the
+ *    point the real-hardware MT validation (TODO.md) is meant to confirm.
  */
 #define _GNU_SOURCE
 #include "patch.h"
@@ -64,11 +96,15 @@ static long    g_pagesize      = 0;
 static int     g_mem_fd        = -1;
 static int     g_initialized   = 0;
 
-/* Cached at mt_init_once. When 1, membarrier(SYNC_CORE) covers the
- * writer's own CPU pipeline too -- so we can skip the per-write
- * __builtin___clear_cache and rely on a single trailing IPI. When 0,
- * each write must clear_cache locally and the trailing IPI is a no-op.
- * See patch_sync_batch_end() and the doc on patch.h's _unsynced variants. */
+/* 1 when every patched page was successfully made R|W|X at init, so
+ * arm/disarm can use a direct atomic store. See header comment (2). */
+static int     g_direct        = 0;
+
+/* Cached at mt_init_once. When 1, patch_sync_batch_end() issues one
+ * cross-core sync per batch -- the membarrier(SYNC_CORE) IPI, or the
+ * signal broadcast on kernels without it (membarrier.h); when 0 it is a
+ * no-op and peers rely on the per-write clear_cache alone (see header
+ * comment (3)). */
 static int     g_have_sync_core = 0;
 
 /* Global spinlock that serializes the mprotect+write+mprotect dance in
@@ -81,20 +117,51 @@ static int     g_have_sync_core = 0;
  * need this lock because pwrite bypasses VMA permission checks. */
 static uint8_t g_fallback_lock = 0;
 
+/* Make every page that holds a patch site R|W|X, once. The table is
+ * sorted by address so consecutive entries share pages; each distinct
+ * page is mprotect'ed once. Returns 0 if every page succeeded. */
+static int make_sites_writable(void) {
+    size_t n;
+    struct patch_entry *t = config_table_mut(&n);
+    if (!t) return -1;
+    uintptr_t mask = ~((uintptr_t)g_pagesize - 1);
+    uintptr_t last_lo = 0, last_hi = 0;
+    for (size_t i = 0; i < n; i++) {
+        uintptr_t lo = t[i].addr & mask;
+        uintptr_t hi = (t[i].addr + t[i].len + (uintptr_t)g_pagesize - 1) & mask;
+        if (lo >= last_lo && hi <= last_hi) continue;
+        if (mprotect((void *)lo, hi - lo, PROT_READ | PROT_WRITE | PROT_EXEC) < 0) {
+            libcov_logf("patch_mt: mprotect RWX 0x%lx: %s",
+                        (unsigned long)lo, strerror(errno));
+            return -1;
+        }
+        last_lo = lo; last_hi = hi;
+    }
+    return 0;
+}
+
 static void mt_init_once(void) {
     if (g_initialized) return;
     g_pagesize = sysconf(_SC_PAGESIZE);
-    g_mem_fd   = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
-    if (g_mem_fd < 0) {
-        libcov_logf("patch_mt: /proc/self/mem open failed (errno=%d) -- "
-                    "falling back to mprotect path; peer threads may briefly "
-                    "fault on the writer page during arm/disarm",
-                    errno);
+    if (make_sites_writable() == 0) {
+        g_direct = 1;
+        libcov_logf("patch_mt: code pages R|W|X; direct atomic-store patching");
     } else {
-        libcov_logf("patch_mt: /proc/self/mem fd=%d (mprotect-free writes)", g_mem_fd);
+        g_mem_fd = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
+        libcov_logf("patch_mt: WARNING -- cannot make code pages writable; "
+                    "falling back to %s. These writes are NOT single-copy "
+                    "atomic: a peer thread may execute a torn instruction.",
+                    g_mem_fd >= 0 ? "pwrite(/proc/self/mem)" : "mprotect+memcpy");
     }
     membarrier_init();
     g_have_sync_core = membarrier_has_sync_core();
+#if !defined(__x86_64__) && !defined(__i386__)
+    if (!g_have_sync_core)
+        libcov_logf("patch_mt: WARNING -- no cross-core sync (no membarrier(SYNC_CORE), "
+                    "signal fallback off or refused) on a weakly-"
+                    "ordered ISA: peer threads may fetch stale instruction bytes "
+                    "after arm/disarm (missed or spurious traps)");
+#endif
     g_initialized = 1;
 }
 
@@ -116,10 +183,11 @@ static int protect_range(uintptr_t addr, size_t len, int prot) {
  * critical section can take its own trap). */
 static inline void fallback_lock(void) {
     uint8_t expected = 0;
+    unsigned spins = 0;
     while (!__atomic_compare_exchange_n(&g_fallback_lock, &expected, 1,
                                         0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
         expected = 0;
-        __asm__ volatile ("" ::: "memory");
+        libcov_spin_backoff(&spins);
     }
 }
 
@@ -129,26 +197,46 @@ static inline void fallback_unlock(void) {
 
 /* Single write of `len` bytes at `addr`. The byte sequence is staged in a
  * caller-provided buffer first so the arch backend's write_illegal can
- * still target a normal pointer. Returns 0 on success.
- *
- * After a successful /proc/self/mem write we issue a same-permission
- * mprotect on the page. On real Linux this is essentially a no-op: the
- * VMA permission flags don't change. Under qemu-user, however, mprotect
- * is the hook qemu uses to invalidate its TCG (translation cache) for
- * the affected page -- without it, qemu keeps executing the cached
- * host-side translation of the *original* bytes and the trap never
- * fires. This kick is required for cross-arch MT validation to work
- * under qemu-user and is harmlessly cheap on real hardware. */
+ * still target a normal pointer. Returns 0 on success. */
+/* x86 cache-line size used for the unaligned-store atomicity rule. 64 on
+ * every x86_64 part; the generator uses the same constant. */
+#define LIBCOV_X86_CACHE_LINE 64
+
 static int write_bytes(uintptr_t addr, const void *src, size_t len) {
+#if defined(__x86_64__)
+    /* x86: a 16-bit store that stays inside one cache line is single-copy
+     * atomic even when unaligned (SDM 8.1.1). Plain `movw` rather than
+     * __atomic_store_n, which requires natural alignment. x86 stores are
+     * already release-ordered; the "memory" clobber stops the compiler
+     * reordering around it. */
+    if (g_direct && len == 2 &&
+        (addr & (LIBCOV_X86_CACHE_LINE - 1)) <= LIBCOV_X86_CACHE_LINE - 2) {
+        uint16_t v; memcpy(&v, src, 2);
+        __asm__ volatile ("movw %1, %0"
+                          : "=m" (*(volatile uint16_t *)addr)
+                          : "r" (v)
+                          : "memory");
+        return 0;
+    }
+#endif
+    /* Primary path: one single-copy-atomic store into the R|W|X page. */
+    if (g_direct && (addr % len) == 0 && (len == 2 || len == 4)) {
+        if (len == 2) {
+            uint16_t v; memcpy(&v, src, 2);
+            __atomic_store_n((uint16_t *)addr, v, __ATOMIC_RELEASE);
+        } else {
+            uint32_t v; memcpy(&v, src, 4);
+            __atomic_store_n((uint32_t *)addr, v, __ATOMIC_RELEASE);
+        }
+        return 0;
+    }
+    /* Fallbacks below are NOT atomic w.r.t. peer instruction fetch. */
     if (g_mem_fd >= 0) {
         ssize_t w = pwrite(g_mem_fd, src, len, (off_t)addr);
         return (w == (ssize_t)len) ? 0 : -1;
     }
-    /* Fallback path: mprotect dance. Single naturally-aligned write into
-     * the now-RW page preserves the atomicity argument above. The window
-     * where the page is RW is brief but non-zero; peer threads executing
-     * the same page see no permission change for execute (Linux's RW flag
-     * doesn't clear X on the PTE), so they keep executing.
+    /* mprotect dance. Keep PROT_EXEC throughout: dropping it (plain RW)
+     * would SIGSEGV any peer thread executing the same page.
      *
      * Serialized globally via g_fallback_lock: mprotect's permission bits
      * are per-page, but the per-entry e->lock is keyed per-entry, so two
@@ -157,7 +245,7 @@ static int write_bytes(uintptr_t addr, const void *src, size_t len) {
      * still pending. The global lock closes that window. */
     fallback_lock();
     int rv = -1;
-    if (protect_range(addr, len, PROT_READ | PROT_WRITE) == 0) {
+    if (protect_range(addr, len, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
         memcpy((void *)addr, src, len);
         if (protect_range(addr, len, PROT_READ | PROT_EXEC) == 0) {
             rv = 0;
@@ -172,9 +260,9 @@ int patch_validate(const struct patch_entry *e) {
     return memcmp((void *)e->addr, e->orig, e->len) == 0 ? 0 : -1;
 }
 
-/* Acquire e->lock by spinning on a 0->1 cmpxchg. Bounded wait because the
- * critical section is just one pwrite + clear_cache + membarrier (single
- * digit microseconds). Safe in a signal handler:
+/* Acquire e->lock by spinning on a 0->1 cmpxchg, yielding after a bounded
+ * spin (libcov_spin_backoff) so a preempted holder can run. The critical
+ * section is one store + clear_cache. Safe in a signal handler:
  *
  *  - The same thread never recursively acquires the same entry's lock:
  *    patch_arm/disarm are called outside the trap PC's basic block, so a
@@ -185,10 +273,11 @@ int patch_validate(const struct patch_entry *e) {
  *    signal-context caller. */
 static inline void entry_lock(struct patch_entry *e) {
     uint8_t expected = 0;
+    unsigned spins = 0;
     while (!__atomic_compare_exchange_n(&e->lock, &expected, 1,
                                         0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
         expected = 0;
-        __asm__ volatile ("" ::: "memory");
+        libcov_spin_backoff(&spins);
     }
 }
 
@@ -196,19 +285,16 @@ static inline void entry_unlock(struct patch_entry *e) {
     __atomic_store_n(&e->lock, 0, __ATOMIC_RELEASE);
 }
 
-/* Write-bytes core, no sync. On kernels without membarrier(SYNC_CORE)
- * we still need a writer-local clear_cache here so the writer's own CPU
- * sees the new bytes the next time it fetches; the trailing
- * patch_sync_batch_end() can then be a no-op. When SYNC_CORE is active
- * we skip clear_cache and rely on the IPI broadcast to serialize every
- * CPU (writer included) -- that's the A4 saving.
+/* Write-bytes core, no cross-core sync. Cache maintenance is done here
+ * unconditionally (header comment (3a)): membarrier(SYNC_CORE) only
+ * context-synchronizes CPUs, it does not clean the D-cache or invalidate
+ * the I-cache, so it cannot stand in for clear_cache on weak ISAs.
+ * Compiles to nothing on x86.
  *
  * Always inlined by gcc -O2 in practice; named for readability. */
 static inline int patch_write_inner(struct patch_entry *e, const void *bytes) {
     if (write_bytes(e->addr, bytes, e->len) != 0) return -1;
-    if (!g_have_sync_core) {
-        __builtin___clear_cache((char *)e->addr, (char *)e->addr + e->len);
-    }
+    __builtin___clear_cache((char *)e->addr, (char *)e->addr + e->len);
     return 0;
 }
 
@@ -243,12 +329,12 @@ int patch_disarm_unsynced(struct patch_entry *e) {
 }
 
 void patch_sync_batch_end(void) {
-    /* One IPI for the whole batch (handler trap pair, boundary rearm).
-     * No-op when membarrier isn't available -- in that case
-     * patch_write_inner already did a writer-local clear_cache per
-     * write, so peer threads on weakly-ordered ISAs still pick up the
-     * change on their next fetch (modulo the documented residual race
-     * window for the SYNC_CORE-less fallback path). */
+    /* One IPI for the whole batch (handler trap pair, boundary rearm):
+     * the context-synchronization step (3b). Cache maintenance (3a) was
+     * already done per write in patch_write_inner. No-op when membarrier
+     * isn't available; peers then pick the change up whenever they next
+     * context-synchronize (exception return, etc.), which on weakly-
+     * ordered ISAs is the documented residual window (init WARNING). */
     if (g_have_sync_core) membarrier_sync_core();
 }
 

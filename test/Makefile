@@ -8,12 +8,14 @@ BUILD ?= ../build/$(ARCH)
 CC      := $(CROSS)gcc
 CFLAGS  ?= -O0 -g -Wall -Wextra
 
-.PHONY: all clean mt loop demalloc multimod
+.PHONY: all clean mt loop demalloc multimod o2pie
 
-all: $(BUILD)/target_simple $(BUILD)/target_loop $(BUILD)/fuzz_driver
+all: $(BUILD)/target_simple $(BUILD)/target_loop $(BUILD)/target_orderable \
+     $(BUILD)/target_dispatch $(BUILD)/target_markers $(BUILD)/fuzz_driver
 
-# pthread MT stress target. Built on demand by the MT validation scripts.
-mt: $(BUILD)/target_simple_mt
+# pthread MT stress target + multi-worker boundary target and its ring
+# reader. Built on demand by the MT validation scripts.
+mt: $(BUILD)/target_simple_mt $(BUILD)/target_loop_mt $(BUILD)/ring_dump
 
 # Multi-module target + helper .so. Built on demand by
 # run_validation_multimod.sh which exercises LCV3's multi-module path.
@@ -44,12 +46,45 @@ $(BUILD)/target_simple: target_simple.c
 $(BUILD)/target_loop: target_loop.c
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -o $@ $<
 
-# Thumb variant: only built when explicitly asked (make thumb).
+# Ordering-sensitive target for the N-gram checks in
+# run_validation_coverage_options.sh.
+$(BUILD)/target_orderable: target_orderable.c
+	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -o $@ $<
+
+# Generator regressions (run_validation_generator.sh): function-pointer
+# dispatch + a block whose callee may exit.
+$(BUILD)/target_dispatch: target_dispatch.c
+	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -o $@ $<
+
+# -O2 PIE builds of the ground-truth targets (run_validation_o2pie.sh).
+# Every other target is -O0 -no-pie; real targets have tail calls, cold
+# splits, jump tables and shrink-wrapped prologues, and a load base that
+# moves under ASLR.
+O2PIE_CFLAGS := -O2 -g -Wall -fPIE -pie -fno-stack-protector
+ifeq ($(ARCH),arm)
+  O2PIE_CFLAGS += -marm
+endif
+o2pie: $(BUILD)/target_simple_o2pie $(BUILD)/target_dispatch_o2pie
+
+$(BUILD)/target_simple_o2pie: target_simple.c
+	$(CC) $(O2PIE_CFLAGS) -o $@ $<
+
+$(BUILD)/target_dispatch_o2pie: target_dispatch.c
+	$(CC) $(O2PIE_CFLAGS) -o $@ $<
+
+# Boundary-marker emulation (run_validation_marker_emulation.sh).
+$(BUILD)/target_markers: target_markers.c
+	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -o $@ $<
+
+# Thumb variants: only built when explicitly asked (make thumb).
 $(BUILD)/target_simple_thumb: target_simple.c
 	$(CC) $(CFLAGS) -no-pie -fno-stack-protector -mthumb -o $@ $<
 
+$(BUILD)/target_markers_thumb: target_markers.c
+	$(CC) $(CFLAGS) -no-pie -fno-stack-protector -mthumb -o $@ $<
+
 .PHONY: thumb
-thumb: $(BUILD)/target_simple_thumb
+thumb: $(BUILD)/target_simple_thumb $(BUILD)/target_markers_thumb
 
 # Driver pulls struct definitions from ../src/{boundary,sink}.h for the
 # shm layout; no separate header install step needed.
@@ -64,6 +99,15 @@ $(BUILD)/fuzz_driver: fuzz_driver.c ../src/boundary.h ../src/sink.h
 
 $(BUILD)/target_simple_mt: target_simple_mt.c
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -pthread -o $@ $<
+
+$(BUILD)/target_loop_mt: target_loop_mt.c
+	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -pthread -o $@ $<
+
+# Passive ring reader for targets that iterate on their own
+# (run_validation_boundary_mt.sh). Same build shape as fuzz_driver.
+$(BUILD)/ring_dump: ring_dump.c ../src/boundary.h
+	$(CC) -O2 -g -Wall -Wextra -I../src -o $@ ring_dump.c \
+	    -Wl,--as-needed -latomic
 
 # target_demalloc deliberately keeps the libc allocator behavior under
 # LD_PRELOAD interception, so it is a normal -no-pie -O0 build.
@@ -80,10 +124,13 @@ $(BUILD)/libmultimod_helper.so: libmultimod_helper.c libmultimod_helper.h
 $(BUILD)/target_multimod: target_multimod.c libmultimod_helper.h \
                           $(BUILD)/libmultimod_helper.so
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -I. -o $@ target_multimod.c \
-	    -L$(BUILD) -lmultimod_helper -Wl,-rpath,$(BUILD)
+	    -L$(BUILD) -lmultimod_helper -Wl,-rpath,$(abspath $(BUILD))
 
 clean:
-	rm -rf $(BUILD)/target_simple $(BUILD)/target_simple_thumb \
+	rm -rf $(BUILD)/target_simple $(BUILD)/target_orderable $(BUILD)/target_dispatch \
+	       $(BUILD)/target_markers $(BUILD)/target_markers_thumb \
+	       $(BUILD)/target_simple_o2pie $(BUILD)/target_dispatch_o2pie $(BUILD)/target_simple_thumb \
 	       $(BUILD)/target_simple_mt $(BUILD)/target_loop \
+	       $(BUILD)/target_loop_mt $(BUILD)/ring_dump \
 	       $(BUILD)/target_demalloc $(BUILD)/fuzz_driver \
 	       $(BUILD)/target_multimod $(BUILD)/libmultimod_helper.so

@@ -3,11 +3,14 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Per-run scratch dir: fixed /tmp paths made parallel runs collide.
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
 ARCH="${ARCH:-$(uname -m)}"
 LIB="$ROOT/build/$ARCH/libcov_st.so"
 TARGET="$ROOT/build/$ARCH/target_simple"
-LCV="/tmp/target_simple.lcv"
-SHM="/tmp/libcov_validate"
+LCV="$WORK/target_simple.lcv"
+SHM="$WORK/libcov_validate"
 
 if [[ "$(cat /proc/sys/kernel/randomize_va_space)" != "0" ]]; then
     echo "WARN: ASLR is on; PoC assumes ASLR off for deterministic addresses" >&2
@@ -25,12 +28,7 @@ echo ">> regenerate patch list"
 # checks below only care about the bitmap region. Use python to avoid
 # the SIGPIPE-vs-pipefail interaction of a tail|head pipeline.
 extract_bitmap() {
-    python3 -c "
-import sys
-with open(sys.argv[1],'rb') as f:
-    f.seek(72); d = f.read(65536)
-with open(sys.argv[2],'wb') as f:
-    f.write(d)" "$1" "$2"
+    python3 "$ROOT/test/shm_bitmap.py" extract "$1" "$2"
 }
 
 run_one() {
@@ -42,22 +40,22 @@ run_one() {
 }
 
 echo ">> oneshot: same input twice should produce identical bitmap"
-run_one oneshot 42 /tmp/v_a
-run_one oneshot 42 /tmp/v_b
-diff -q /tmp/v_a.bitmap /tmp/v_b.bitmap || { echo "FAIL: oneshot non-deterministic"; exit 1; }
+run_one oneshot 42 $WORK/v_a
+run_one oneshot 42 $WORK/v_b
+diff -q $WORK/v_a.bitmap $WORK/v_b.bitmap || { echo "FAIL: oneshot non-deterministic"; exit 1; }
 echo "   OK"
 
 echo ">> oneshot: different inputs should differ"
-run_one oneshot 42  /tmp/v_42
-run_one oneshot -3  /tmp/v_neg
-if cmp -s /tmp/v_42.bitmap /tmp/v_neg.bitmap; then
+run_one oneshot 42  $WORK/v_42
+run_one oneshot -3  $WORK/v_neg
+if cmp -s $WORK/v_42.bitmap $WORK/v_neg.bitmap; then
     echo "FAIL: bitmaps identical for different inputs"; exit 1
 fi
 echo "   OK"
 
 echo ">> leapfrog: should record hit-counts > 1 (loop iterations)"
-run_one leapfrog 99 /tmp/v_lf
-max=$(python3 -c "import sys; d=open('/tmp/v_lf.bitmap','rb').read(); print(max(d))")
+run_one leapfrog 99 $WORK/v_lf
+max=$(python3 -c "import sys; d=open('$WORK/v_lf.bitmap','rb').read(); print(max(d))")
 if [[ "$max" -lt 2 ]]; then
     echo "FAIL: leapfrog never recorded a multi-hit (max=$max)"; exit 1
 fi
@@ -65,9 +63,9 @@ echo "   OK (max hits = $max)"
 
 echo ">> target output unchanged under libcov"
 LIBCOV_PATCHLIST="$LCV" LIBCOV_SHM_PATH="$SHM" LIBCOV_MODE=leapfrog \
-    LIBCOV_LOG=/dev/null LD_PRELOAD="$LIB" "$TARGET" 42 > /tmp/v_with
-"$TARGET" 42 > /tmp/v_without
-diff -q /tmp/v_with /tmp/v_without || { echo "FAIL: target output differs"; exit 1; }
+    LIBCOV_LOG=/dev/null LD_PRELOAD="$LIB" "$TARGET" 42 > $WORK/v_with
+"$TARGET" 42 > $WORK/v_without
+diff -q $WORK/v_with $WORK/v_without || { echo "FAIL: target output differs"; exit 1; }
 echo "   OK"
 
 echo

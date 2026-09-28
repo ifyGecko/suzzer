@@ -1,0 +1,4 @@
+# Build output (make, make test, the cross suites).
+build/
+# Python bytecode from importing tools/gen_patchlist.py.
+__pycache__/

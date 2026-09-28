@@ -11,6 +11,7 @@ wall-clock dominated by it on medium-sized binaries.
 
 Per-arch behavior:
   x86_64, aarch64, arm (ARM mode), powerpc, riscv64: patch block terminators
+                                                     (last >= 2-byte insn)
   arm (Thumb mode):                                  patch first 2 bytes only
   mips, mips64:                                      patch block ENTRIES
                                                      (avoids branch delay slots)
@@ -22,12 +23,12 @@ never touched. ST and MT use the same patch shape.
 Threading-mode selection (--threading):
   st (default) -- single-threaded libcov: arch-natural patch width
                   (x86=2, fixed-width 4-byte ISAs=4, Thumb/RV-C=2).
-  mt           -- multi-threaded libcov: same widths, plus alignment
-                  filtering so every site's write is a single naturally-
-                  aligned store (the largest atomic write each ISA
-                  guarantees). For x86, also skips any site whose 2-byte
-                  write would straddle a 64-byte cache line (Intel does
-                  not guarantee atomicity in that case).
+  mt           -- multi-threaded libcov: same widths, plus filtering so
+                  every site's write is a single-copy-atomic store. On
+                  fixed-width ISAs that means naturally aligned. On x86
+                  any address works except one whose 2-byte write would
+                  straddle a 64-byte cache line (Intel guarantees atomicity
+                  for unaligned 16-bit stores only within a line).
 
 Multi-module instrumentation:
   The positional `binary` is always module index 0 (typically the main
@@ -117,6 +118,7 @@ Usage:
 """
 import argparse
 import json
+import os
 import re
 import struct
 import sys
@@ -158,6 +160,10 @@ def open_rizin(binary):
     re-ran `aaa` on every command and that dominated wall-clock cost on
     anything larger than the toy test target.
     """
+    # rzpipe busy-loops forever (100% CPU, no error) when rizin cannot
+    # open the file, so check up front.
+    if not os.path.isfile(binary) or not os.access(binary, os.R_OK):
+        sys.exit(f"error: cannot read binary {binary!r}")
     try:
         rz = rzpipe.open(binary)
     except Exception as e:
@@ -200,26 +206,94 @@ def filter_functions(all_fns, include_re, exclude_re):
     return out
 
 
+def report_include_matches(fns, pattern, module_name, verbose):
+    """Make --include-pat's effect visible: list what it matched under -v,
+    and warn when one function name matched under two rizin prefixes
+    (sym.X and dbg.X), which usually means the pattern is looser than
+    intended."""
+    if verbose:
+        print(f"--include-pat {pattern!r} matched {len(fns)} function(s) in "
+              f"'{module_name}':", file=sys.stderr)
+        for f in fns:
+            print(f"  0x{f['offset']:x} {f['name']}", file=sys.stderr)
+    by_base = {}
+    for f in fns:
+        base = re.sub(r"^(sym|dbg|fcn|loc)\.", "", f["name"])
+        by_base.setdefault(base, []).append(f["name"])
+    for base, names in sorted(by_base.items()):
+        if len(names) > 1:
+            print(f"warning: --include-pat {pattern!r} matched {base!r} under "
+                  f"several names ({', '.join(names)}); sites at the same "
+                  f"address are deduplicated", file=sys.stderr)
+
+
 def get_block_insns(rz, addr, ninstr):
     return rz.cmdj(f"pdj {ninstr} @ {addr}") or []
 
 
-BRANCH_TYPES = {
-    "jmp", "ujmp", "cjmp", "ucjmp", "rjmp",
-    "call", "ucall", "ccall", "rcall", "icall",
-    "ret",
-}
+def op_class(insn_type):
+    """Classify a rizin op type as "call", "jmp", "ret" or None.
+
+    Matches by suffix rather than an exact list: rizin has many variants
+    (ucall/rcall/icall/ircall/ccall/uccall, ujmp/rjmp/ijmp/irjmp/mjmp/
+    rcjmp/mcjmp/cjmp/ucjmp, cret, ...), which differ across arches and
+    versions. MIPS branch-likely forms (beql, bnezl, bgezall, bc1tl) come
+    back as cjmp/ccall like their non-likely versions. An exact list that
+    missed one made the MIPS delay-slot check below fail, and the entry
+    strategy then patched a delay slot, which crashes the target."""
+    t = insn_type or ""
+    for cls in ("call", "jmp", "ret"):
+        if t.endswith(cls):
+            return cls
+    return None
+
+
+def is_indirect_transfer(insn_type):
+    """Call or jump whose target comes from a register or memory (function
+    pointers, vtables, jump tables, PLT-free tail calls through a
+    pointer). Static call-graph slicing can't see past these."""
+    t = insn_type or ""
+    return op_class(t) in ("call", "jmp") and t[:1] in ("u", "r", "i", "m")
 
 
 def _is_branch_at(rz, addr):
     insns = get_block_insns(rz, addr, 1)
     if not insns:
         return False
-    t = insns[0].get("type", "")
-    return t in BRANCH_TYPES
+    return op_class(insns[0].get("type")) is not None
 
 
-def pick_sites(rz, fn, strategy, arch):
+def pick_terminator(insns, ok=None):
+    """Return the instruction to patch for a block under the terminator
+    strategy, or None. Candidates must be at least 2 bytes long (the
+    smallest trap encoding) and satisfy `ok`.
+
+    - If the block makes a call before its last instruction, the first
+      such call. rizin doesn't split blocks at calls, so a block whose
+      callee never returns (abort, exit, longjmp, a throw -- or the
+      callee crashing, which is the interesting case when fuzzing) never
+      reaches its terminator and would never report. The call instruction
+      itself executes before the callee runs.
+    - Otherwise the LAST candidate. Walking back matters on x86: blocks
+      ending in a 1-byte `ret` (every function exit) used to be dropped
+      entirely. Any earlier instruction of a straight-line block executes
+      whenever the block completes, so it is an equally valid probe.
+
+    gen_boundary.py uses this same helper so boundary markers stay
+    co-located with patched sites."""
+    def eligible(insn):
+        return int(insn.get("size", 0)) >= 2 and (ok is None or ok(insn))
+
+    for insn in insns[:-1]:
+        if op_class(insn.get("type")) == "call" and eligible(insn):
+            return insn
+    for insn in reversed(insns):
+        if eligible(insn):
+            return insn
+    return None
+
+
+def pick_sites(rz, fn, strategy, arch, ok=None):
     is_mips = arch in ("mips", )
     blocks = rz.cmdj(f"afbj @ {fn['offset']}") or []
     sites = []
@@ -240,7 +314,9 @@ def pick_sites(rz, fn, strategy, arch):
                     continue
             pick = insns[idx]
         else:
-            pick = insns[-1]
+            pick = pick_terminator(insns, ok)
+            if pick is None:
+                continue
         sites.append((int(pick["offset"]), int(pick["size"]), pick["bytes"]))
     return sites
 
@@ -259,9 +335,9 @@ def mt_atomic_width(arch, fn_bits):
     aarch64, mips, mips64, ppc, ppc64: 4 (aligned word).
     riscv64: 2 (covers both c.unimp and the leading half of a 4-byte zero
              insn, both decode as illegal at the first 2 bytes).
-    x86:   2 (UD2 fits in 2 bytes; SDM guarantees aligned 16-bit stores
-             are atomic; we additionally require it not span a cache line,
-             enforced by the cache-line check below).
+    x86:   2 (UD2 fits in 2 bytes; SDM 8.1.1 guarantees 16-bit stores are
+             atomic when they don't span a cache line, aligned or not --
+             enforced by mt_addr_safe).
     """
     if arch == "arm":
         return 2 if fn_bits == 16 else 4
@@ -286,15 +362,15 @@ def mt_addr_safe(arch, addr, width):
     ISA rule, so the address-mod check is a tautology there; we still
     enforce it as a defensive guard against malformed rizin output.
 
-    For x86 only: also require the write not span a 64-byte cache line.
-    Intel SDM does not guarantee atomicity for accesses that cross a
-    cache-line boundary; a peer CPU could observe a partial write."""
-    if addr % width != 0:
-        return False
+    x86 is the exception: unaligned 16-bit stores are single-copy atomic
+    as long as they stay inside one 64-byte cache line (SDM 8.1.1), and
+    libcov_mt's write_bytes() uses a plain `movw` for them. Only a write
+    that spans a line is unsafe. The module load base is page-aligned, so
+    checking the link-time address is equivalent to checking the runtime
+    one. Keep the 64 in sync with LIBCOV_X86_CACHE_LINE in patch_mt.c."""
     if arch == "x86":
-        if (addr & 63) + width > 64:
-            return False
-    return True
+        return (addr & 63) + width <= 64
+    return addr % width == 0
 
 
 # ----------------------------------------------------------------------
@@ -373,6 +449,41 @@ def resolve_to_offset(token, all_fns):
     raise ValueError(f"could not resolve '{token}' to any function")
 
 
+def count_indirect_transfers(rz, offsets):
+    """offset -> (indirect calls, indirect jumps) for each function in
+    `offsets` that has any."""
+    out = {}
+    for off in offsets:
+        ops = rz.cmdj(f"pdfj @ {off}") or {}
+        calls = jumps = 0
+        for op in ops.get("ops", []) if isinstance(ops, dict) else []:
+            t = op.get("type")
+            if is_indirect_transfer(t):
+                if op_class(t) == "call":
+                    calls += 1
+                else:
+                    jumps += 1
+        if calls or jumps:
+            out[off] = (calls, jumps)
+    return out
+
+
+def report_indirect_transfers(indirect):
+    """The static call graph stops at indirect transfers, so code reached
+    only through function pointers, vtables or dispatch tables is silently
+    left out of a --root slice. Say how many there are. (Review C5)"""
+    calls = sum(c for c, _ in indirect.values())
+    jumps = sum(j for _, j in indirect.values())
+    if not calls and not jumps:
+        return
+    print(f"note: the slice has {calls} indirect call(s) and {jumps} indirect "
+          f"jump(s) in {len(indirect)} function(s). Their targets are not "
+          f"followed: code reached only through function pointers, vtables "
+          f"or dispatch tables is NOT instrumented unless you add it with "
+          f"--root (see --print-reachable for which functions).",
+          file=sys.stderr)
+
+
 def build_call_graph(rz, all_fns):
     """Build outgoing-call adjacency: offset -> set(offset).
 
@@ -408,7 +519,10 @@ def build_call_graph(rz, all_fns):
             break
         try:
             obj, end = decoder.raw_decode(raw, pos)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            print(f"warning: could not parse rizin 'afij @@F' output at "
+                  f"offset {pos} ({e.msg}); the call graph is truncated and "
+                  f"the slice may be missing functions", file=sys.stderr)
             break
         pos = end
         # obj is a list with (typically) one entry per afij invocation.
@@ -487,6 +601,11 @@ def collect_module_records(args, rz, module_idx, module_name):
     arch  = info["arch"]
     bits  = info["bits"]
     strategy = args.strategy if args.strategy != "auto" else default_strategy(arch, bits)
+    if arch == "mips" and strategy == "terminator":
+        # rizin places the branch delay slot inside the branch's block, so
+        # the terminator IS the delay slot: trapping there reports the
+        # branch's PC semantics wrong and restoring it crashes the target.
+        sys.exit("error: --strategy terminator is unsafe on MIPS (delay slots); use entry")
 
     if args.verbose:
         print(f"module[{module_idx}] '{module_name}': arch={arch} bits={bits} "
@@ -497,6 +616,8 @@ def collect_module_records(args, rz, module_idx, module_name):
     # resolution, and PPC64 dual-entry lookup.
     all_fns_raw = get_all_functions(rz)
     fns = filter_functions(all_fns_raw, inc, exc)
+    if inc:
+        report_include_matches(fns, args.include_pat, module_name, args.verbose)
 
     # Selective instrumentation: resolve --root / --cutoff and intersect the
     # regex-filtered fns with the call-graph slice reachable from the roots.
@@ -540,11 +661,17 @@ def collect_module_records(args, rz, module_idx, module_name):
               f"{len(roots)} root(s), {len(cutoffs)} cutoff(s){depth_note}",
               file=sys.stderr)
 
+        indirect = count_indirect_transfers(rz, reachable_offsets)
+        report_indirect_transfers(indirect)
+
         if args.print_reachable:
             by_off = {int(f["offset"]): f for f in all_fns}
             for off in sorted(reachable_offsets):
                 f = by_off.get(off, {"name": "?", "bits": 0})
-                print(f"  0x{off:x} {f['name']} bits={f.get('bits', 0)}",
+                calls, jumps = indirect.get(off, (0, 0))
+                note = (f" indirect: {calls} call(s), {jumps} jump(s)"
+                        if calls or jumps else "")
+                print(f"  0x{off:x} {f['name']} bits={f.get('bits', 0)}{note}",
                       file=sys.stderr)
             print("(--print-reachable: exiting before writing patchlist)",
                   file=sys.stderr)
@@ -584,7 +711,14 @@ def collect_module_records(args, rz, module_idx, module_name):
     records = []
     mt_skipped_alignment = 0
     for fn in fns:
-        sites = pick_sites(rz, fn, strategy, arch)
+        # Let the terminator walk-back skip candidates MT would reject, so
+        # a line-straddling x86 terminator falls back to an earlier
+        # instruction instead of losing the whole block.
+        ok = None
+        if args.threading == "mt":
+            width = mt_atomic_width(arch, fn["bits"])
+            ok = lambda insn, w=width: mt_addr_safe(arch, int(insn["offset"]), w)
+        sites = pick_sites(rz, fn, strategy, arch, ok)
         for addr, size, bhex in sites:
             if addr in seen:
                 continue
@@ -713,6 +847,16 @@ def run(args):
         all_records.extend(records)
         total_skipped += skipped
 
+    if not all_records and not args.allow_empty:
+        hint = ""
+        if args.include_pat:
+            hint = (" Check --include-pat: rizin names functions with debug "
+                    "info 'dbg.NAME' and others 'sym.NAME' (run with -v to "
+                    "see what matched).")
+        sys.exit(f"error: no patch sites selected; not writing {args.output}."
+                 f"{hint} Pass --allow-empty to write an empty patch list "
+                 f"anyway.")
+
     write_lcv3(args.output, [n for n, _ in module_specs], all_records,
                threading_hint)
 
@@ -770,6 +914,10 @@ def main():
                     help="resolve --root/--cutoff, print the reachable "
                          "function set to stderr, and exit without writing "
                          "the patchlist. Useful for iterating on a slice.")
+    ap.add_argument("--allow-empty", action="store_true",
+                    help="write the patch list even when no sites were "
+                         "selected (by default that is an error: an empty "
+                         "list makes libcov silently record nothing)")
     ap.add_argument("--verbose", "-v", action="store_true")
     args = ap.parse_args()
 
