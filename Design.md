@@ -500,16 +500,30 @@ tunables header. Different concern.
 
 ### 7.1 Page protection sequence
 
+By default (`LIBCOV_ST_PATCH=auto`) the ST engine makes every page that
+holds a patch site `PROT_READ | PROT_WRITE | PROT_EXEC` once, in
+`patch_arm_all`, exactly as the MT engine does (17.2.4). Every later
+arm/disarm is then
+
+```c
+libcov_arch_write_illegal(addr, len)    // or memcpy(addr, orig, len)
+__builtin___clear_cache(addr, addr + len)
+```
+
+with no syscall: leapfrog used to spend four `mprotect` calls per trap,
+and the page never goes non-executable under a running thread.
+
+Many hardened embedded kernels refuse `R|W|X` (SELinux `execmem`, PaX
+`MPROTECT`). If the one-time `mprotect` fails -- or with
+`LIBCOV_ST_PATCH=mprotect` -- each write uses the W^X-safe sequence,
+which never asks for write and execute at once:
+
 ```c
 mprotect(page, span, PROT_READ | PROT_WRITE)
 libcov_arch_write_illegal(addr, len)    // or memcpy(addr, orig, len)
 mprotect(page, span, PROT_READ | PROT_EXEC)
 __builtin___clear_cache(addr, addr + len)
 ```
-
-We never request `PROT_READ | PROT_WRITE | PROT_EXEC` even briefly:
-many hardened embedded kernels refuse W^X transitions. The two-step
-mprotect always presents a valid W^X view to the kernel.
 
 ### 7.2 Page-span calculation
 
@@ -687,7 +701,7 @@ The shipped consumers (`test/fuzz_driver.c`, the AFL-bitmap reader
 pattern) don't need to know `N` — the bitmap is still 64 KiB of
 saturating-count buckets and any "novelty" comparison works
 unchanged. If a future consumer wants to interpret the bitmap with
-knowledge of `N`, the spare bytes in `flags` or `reserved[16]` in
+knowledge of `N`, the spare bytes in `flags` or `reserved[4]` in
 `struct libcov_shm_header` are the natural place to record it
 (deferred until a consumer actually needs it).
 
@@ -770,7 +784,7 @@ can run user code that uses libc.
 2. parse LIBCOV_MODE       // default leapfrog
 3. sink_init(env)          // mmap bitmap
 4. config_load(patchlist)  // mmap LCV3, resolve module bases, build patch_table
-5. patch_arm_all()         // mprotect+write+mprotect+flush every entry
+5. patch_arm_all()         // code pages R|W|X once (or per-write mprotect), write+flush every entry
 6. handler_install(mode)   // sigaction(LIBCOV_TRAP_SIGNO, &sa, &g_prev_sa)
 7. set g_initialized = 1
 ```
@@ -809,15 +823,29 @@ sighandler_fn signal(int signo, sighandler_fn h);
 Both are exported by libcov.so. The dynamic linker resolves them in the
 target before libc's. Inside, we check `signo == LIBCOV_TRAP_SIGNO`:
 
-- If yes: silently report success, stash the requested handler in
-  `g_target_trap_sa`, but **don't actually install it**. Our handler
-  stays in place.
+- If yes: silently report success, stash the requested handler, but
+  **don't actually install it**. Our handler stays in place. The stash
+  (`g_tsa` in libcov.c) is a sequence-indexed double buffer: writers
+  serialize on a spinlock with async signals blocked and fill the
+  unpublished buffer; the trap handler reads it lock-free and retries
+  only if two writes landed during its copy.
 - If no: forward to the real implementation via
   `dlsym(RTLD_NEXT, "sigaction")` / `"signal"`.
 
 The stashed target handler is chained for *real* traps in
-`chain_or_default` — at addresses not in our patch table. The target's
-behavior for genuine LIBCOV_TRAP_SIGNO (default SIGILL) is preserved.
+`chain_or_default` (`libcov_chain_trap`) — at addresses not in our patch
+table. The target's behavior for genuine LIBCOV_TRAP_SIGNO (default
+SIGILL) is preserved, including its signal mask: the handler runs under
+the interrupted mask plus its `sa_mask` plus the signal (unless
+`SA_NODEFER`), not libcov's everything-blocked mask. The one deviation is
+that the trap signal (and the MT sync signal) stay unblocked, because
+the target's handler may itself run instrumented code.
+
+glibc's `bsd_signal`, `ssignal`, `sysv_signal`, `sigset`, `sigignore`,
+`sighold`, `siginterrupt` and `sigsuspend` call the kernel through
+internal aliases, not through the exported `sigaction`/`sigprocmask`, so
+they are interposed separately and each stashes the disposition glibc
+would have installed (e.g. `sysv_signal` → `SA_RESETHAND|SA_NODEFER`).
 
 `g_initialized` gates the interception: before constructor finishes, we
 forward everything to the real handlers, so an init-time `sigaction`
@@ -1087,8 +1115,10 @@ Designed for single-threaded targets. Smallest possible surface area.
   reads are race-free against init writes because init completes before
   any trap can fire (no patched sites exist yet).
 - The bitmap increment is a non-atomic `uint8_t` increment.
-- Byte writes via the classic mprotect dance: `R|X -> R|W -> memcpy
-  -> R|X`. Brief writable window on the code page.
+- Byte writes are plain stores into pages made `R|W|X` at init, or,
+  where the kernel refuses that, the classic mprotect dance
+  `R|X -> R|W -> memcpy -> R|X` (a brief non-executable window on the
+  code page).
 
 Under a multi-threaded target:
 
@@ -1339,9 +1369,12 @@ These are inherent to the present scope, not bugs:
 3. **No remote transport.** Coverage is local-only (shared memory). A
    relay binary is planned (see TODO.md).
 4. **Raw signal syscalls bypass interception.** `sigaction`, `signal`,
-   `sigprocmask` and `pthread_sigmask` are interposed, but raw
-   `rt_sigaction`/`rt_sigprocmask` syscalls and the `bsd_signal`/
-   `sigset`/`__sysv_signal` aliases are not (see TODO.md).
+   `sigprocmask`, `pthread_sigmask` and glibc's older wrappers
+   (`bsd_signal`, `ssignal`, `sysv_signal`/`__sysv_signal`, `sigset`,
+   `sigignore`, `sighold`, `siginterrupt`, `sigsuspend`) are interposed,
+   but raw `rt_sigaction`/`rt_sigprocmask` syscalls, the compat-only
+   `sigvec` and `sigpause` are not (syscall-level coverage needs seccomp
+   or libsyscall_intercept).
 5. **W^X-strict kernels that refuse any transient writable mapping over
    text** will trip the ST patch path's `mprotect(R|W)`. The MT path
    needs `R|W|X` once at init; if refused it falls back to non-atomic

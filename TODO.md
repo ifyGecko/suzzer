@@ -205,6 +205,118 @@ the MT stress test fail against the pre-fix code.
   length, the chaining claim, the missing coverage-model docs, the
   "threads scope iterations cleanly" claim, and the `LIBCOV_MODULE`
   default.
+- **Header dependencies.** The top-level, `test/` and `tools/` Makefiles
+  build with `-MMD -MP`, so editing a header (tunables, `patch.h`, ...)
+  rebuilds every object that includes it. The top-level include first
+  sat above `all:`, so once `.d` files existed a plain `make` built only
+  `libcov.o` (and `run_cross.sh` found no targets); `.DEFAULT_GOAL` is now
+  pinned, the include is last, and `make test` checks plain `make`
+  still builds the test targets.
+- **shm file fallback symlink attack** (`sink_shm.c`). The `$TMPDIR`
+  fallback opens with `O_NOFOLLOW | O_CLOEXEC`; `LIBCOV_LOG` is opened
+  with `O_CLOEXEC`.
+- **ST boundary mode left the live bitmap silently empty.** The shm
+  header now sets `LIBCOV_SHM_FLAG_LIVE_EMPTY` when the `bitmap_offset`
+  area isn't maintained, so drivers know to read the ring. (Review L1)
+- **MT `patch_lookup` mid-transition invariant** is written down in
+  `patch_mt.c`. (Review M4)
+- **Generator name handling.** `--exclude-pat` adds to the default
+  exclusions (`--no-default-exclude` drops them). Both generators share
+  `tools/rz_resolve.py`: names resolve before plain-hex addresses (so
+  `cafe` is a symbol), with the same suffix matching in both tools.
+  gen_boundary parses C++ `ns::fn` specs and reports bad specs as errors,
+  not tracebacks.
+- **Data in text** (`gen_patchlist.py`). Candidate sites that are data
+  (`invalid`, `.word`, ...) or Thumb IT-block conditional instructions are
+  skipped (also for gen_boundary's markers); overlapping sites are
+  dropped with a warning (`--fail-on-overlap` makes it an error); rizin
+  heuristic `fcn.*` functions are no longer instrumented unless
+  `--include-fcn` (the call-graph walk still goes through them).
+  `run_validation_generator_safety.sh`, plus a real `-mthumb` `ite` block
+  checked by hand.
+- **Signal interposer robustness** (`libcov.c`, `util.c`). Each one is a
+  `target_signals` mode in `run_validation_signals.sh`, and all but
+  `race` failed against the old code (ST and MT):
+  - the target's stashed trap disposition is a sequence-indexed double
+    buffer, so an interposer on one thread can't tear the copy the trap
+    handler reads on another (`race`);
+  - a chained target handler runs with the kernel's mask (interrupted
+    mask + `sa_mask` + signal unless `SA_NODEFER`), not libcov's
+    everything-blocked mask (`mask`);
+  - `bsd_signal`, `ssignal`, `sysv_signal`/`__sysv_signal`, `sigset`,
+    `sigignore`, `sighold`, `siginterrupt` and `sigsuspend` are
+    interposed: glibc routes them through internal calls, so
+    `sigignore(SIGILL)`/`sighold(SIGILL)` killed the target on its next
+    trap and `sigset`/`bsd_signal` replaced libcov's handler;
+  - post-init log lines are dropped once the log fd no longer refers to
+    the file it did at init, or is a socket (`logsock`, with `LIBCOV_LOG`
+    set and unset);
+  - the real `sigaction`/`pthread_sigmask` are resolved at init, never
+    by `dlsym` from the trap handler.
+- **Test traps are SIGILL on every arch.** `target_signals` used
+  `__builtin_trap()` for its "real illegal instruction" cases, which is
+  SIGTRAP (`brk`, `trap`, `ebreak`, `break`) on most backends, so those
+  checks compared one death with another. `test/sigill.h` now uses each
+  backend's own illegal encoding, and the new
+  `test/run_cross_signals.sh` runs every mode under qemu for all 11
+  cross targets (incl. arm-thumb), ST and MT.
+- **Ring overruns were silent.** (Review M3, partly) Default
+  `LIBCOV_BOUNDARY_RING` is 8 (was 4). The shm header counts MT
+  publishes dropped for a stale slot (`publish_dropped`, in former
+  reserved bytes). `fuzz_driver` resumes at the oldest readable
+  generation instead of the newest, counts overruns and lost gens,
+  reports them on exit and exits 3. `run_validation_boundary.sh` forces
+  an overrun (`FUZZ_DRIVER_BURST=1`, ring 2) and checks the accounting.
+- **Begin-only `depth_filter=zero`** is refused by `gen_boundary.py`
+  unless `--force` (it filters nothing without END markers). (Review C3)
+- **Re-exec wiped the shared region under the driver** (`sink_shm.c`).
+  The header records its creator (pid + start time, kept by `exec`);
+  `sink_init` decides under an `flock`: an in-place re-exec attaches and
+  keeps bitmap, ring and generations (ST resumes in slot
+  `gen_current + 1`); another live process's region is left alone (the
+  newcomer runs inert and logs it); a stale file is reset as before.
+  `%p` in `LIBCOV_SHM_PATH` gives each process its own region.
+  `run_validation_reexec.sh` (ST and MT) failed on everything but the
+  stale-file case before the fix. `run_cross.sh` now compares extracted
+  bitmaps rather than whole shm files (the header differs per run).
+- **Module resolution** (`util.c`, `config.c`, `gen_patchlist.py`). A
+  symlinked binary (busybox-style), a renamed copy and a binary deleted
+  after exec all left libcov inert, and two libraries with the same
+  basename silently resolved to the first (every site then failed its
+  byte check: zero coverage, no warning). Now: the generator names a
+  module after its symlink target; ` (deleted)` is ignored; an ambiguous
+  basename is logged; `LIBCOV_MODULE_RENAME=old=new` (bare name or
+  absolute path) maps renamed or same-basename modules; an unresolved
+  module 0 names the running executable in its hint. The main-exe lookup
+  (boundary sidecars) matches the exact path.
+  `run_validation_modules.sh` failed all four cases before.
+- **MIPS markers were never emulated** (`arch_mips_emulate.h`). They sit
+  on block-entry instructions, not branches, so the delay-slot objection
+  didn't apply: they are prologue ALU ops (`lui gp`, `daddiu sp`). The
+  register-only ones are now emulated on mips/mipsel/mips64/mips64el, so
+  MIPS markers are never disarmed either. `test/unit_mips_emulate.c`
+  checks every supported instruction, o32/n64 sign extension and the
+  refusals (mutations are caught); `run_validation_marker_emulation.sh`
+  expects 4/4 emulated under qemu on all four.
+- **ST patched with two `mprotect` calls per arm/disarm** (`patch_st.c`).
+  It now makes the patched pages `R|W|X` once, like MT, and arms/disarms
+  with plain stores: a leapfrog microbenchmark went from 1.98 s to 0.68 s
+  (1.2M `mprotect` calls to 9), bitmaps identical. W^X kernels that
+  refuse `R|W|X` fall back to the old path automatically;
+  `LIBCOV_ST_PATCH=mprotect` forces it. `test/wx_deny` (seccomp) plays
+  the W^X kernel, so `run_validation_patch_mode.sh` also covers MT's
+  `pwrite` fallback, which nothing exercised before.
+- **`--root`/`--cutoff` with `--module`** (`gen_patchlist.py`,
+  `rz_resolve.py`). Every root was resolved in every module, so the
+  combination always exited with an error; an address root had no upper
+  bound (a typo became the module's last function); `--print-reachable`
+  stopped after module 0. Now unqualified names resolve wherever they
+  are defined (PLT stubs don't count), `MODULE!NAME` pins a module, an
+  unqualified address means the primary binary, a module without a root
+  is skipped with a warning, addresses must fall inside a function's
+  `aflj` extent (also in gen_boundary), and `--print-reachable` lists
+  every module. `run_validation_multimod.sh` covers each case and runs
+  a sliced two-module list end to end.
 
 ---
 
@@ -230,12 +342,11 @@ the MT stress test fail against the pre-fix code.
 
 - [ ] **MT leapfrog/oneshot is sampled coverage.** A site that thread A
   has disarmed doesn't trap for thread B until it's re-armed, so B's
-  coverage there is missed. Markers are solved on x86_64/aarch64 by
-  emulation (see the fixed list). Remaining:
-  - MIPS markers still use disarm + re-arm (emulating a branch means
-    executing its delay slot).
-  - For coverage sites: consider a "re-arm after K traps process-wide"
-    policy, or accept and keep documenting that MT is sampled coverage.
+  coverage there is missed. Markers are solved on every backend by
+  emulation (see the fixed list). Remaining: for coverage sites,
+  consider a "re-arm after K traps process-wide" policy, or accept and
+  keep documenting that MT is sampled coverage. A MIPS marker that lands
+  on a store (not a register-only op) still uses disarm + re-arm.
 - [ ] **x86: blocks made only of 1-byte instructions are unpatchable**
   (`leave; ret`, `pop; ret`, a lone `ret`). A limit of the 2-byte UD2
   encoding; now documented in README. A generator-side mitigation would
@@ -245,82 +356,39 @@ the MT stress test fail against the pre-fix code.
   generation, so a driver sees two generations per input. Decide whether
   a BEGIN in paired mode should only reset (not publish), and document
   what drivers should expect.
-- [ ] **Begin-only `depth_filter`.** It now warns. Consider rejecting it
-  in `gen_boundary.py` unless `--force`. (Review C3)
 - [ ] **Leapfrog never records self-loops.** An A→A edge is never seen,
   because the current site is never re-armed by its own trap. A
   single-site hot loop counts once until some other site traps. Document
   it, or add a per-thread "re-arm self after N instructions"
   (single-step is too costly; accept it).
 - [ ] **Site-id collisions at N>=2.** The zero-collision guarantee holds
-  only at N=1. Consider auto-scaling `LIBCOV_MAP_FUDGE` with N, and log
-  the expected collision rate at init. (Review M2)
+  only at N=1. Init now logs N and the buckets per site; still open:
+  auto-scaling `LIBCOV_MAP_FUDGE` with N, and an actual expected
+  collision-rate estimate. (Review M2)
 - [ ] **`REARM=all` is O(n_sites) inside the signal handler.** It causes
-  jitter, and with `RING=2` it can overrun the ring. Consider a default
-  ring of 8, and make `fuzz_driver` treat OVERRUN as fatal (or at least
-  count it and report it on exit). (Review M3)
+  jitter. Overruns are now visible (see the fixed list); the handler
+  cost itself is unchanged -- a per-page or batched re-arm would cut it.
+  (Review M3, rest)
 
 ## P1: robustness
 
-- [ ] **fork / re-exec re-initialises the shared region.** A daemon that
-  re-execs itself (sshd per connection, nginx upgrade) inherits the
-  environment, runs `sink_init` again, and memsets the header and ring
-  while the driver is reading. If the header magic is already present,
-  attach instead of zeroing, or support a `%p` pid placeholder in
-  `LIBCOV_SHM_PATH`. Fork without exec shares one bitmap with ST
-  non-atomic increments. See the fork-per-connection backlog item.
-- [ ] **Race on `g_target_trap_sa`** (`libcov.c`). The `sigaction`
-  interposer on one thread can write it while a handler on another
-  thread reads it. Swap two buffers with an atomic index. Also, the
-  target handler's own `sa_mask` isn't applied when we chain to it.
-- [ ] **Bypasses of the handler interposers.** Raw `rt_sigaction` and
-  `rt_sigprocmask` syscalls, and `bsd_signal`/`sigset`/`__sysv_signal`,
-  aren't intercepted. Add the libc aliases; syscall-level coverage needs
-  seccomp or libsyscall_intercept.
-- [ ] **Runtime logging.** The `sigaction` interposer logs to fd 2 after
-  init, and a daemon may have reused fd 2 for a socket. `LIBCOV_LOG` is
-  opened without `O_CLOEXEC`.
-- [ ] **Module resolution** (`util_module_base`). It matches on
-  basename, so two libraries with the same basename in different
-  directories are ambiguous, and `"… (deleted)"` paths never match. The
-  primary module name is the basename of the path given to the
-  generator, so a symlinked or renamed binary won't resolve.
-- [ ] **shm file fallback** opens `$TMPDIR/<name>` with `O_CREAT` and no
-  `O_NOFOLLOW`, which allows a symlink attack on shared hosts.
-- [ ] **ST boundary mode leaves the `bitmap_offset` area unused.** A
-  legacy driver reads zeros. (Under MT it now holds non-worker threads'
-  cumulative coverage.) Set a header flag or field that points drivers
-  at the ring, or document it prominently. (Review L1)
-- [ ] **MT `patch_lookup` returns an entry whose `patched` may be
-  mid-transition.** It's correct today because the handler never reads
-  `patched` for the trapping entry and relies on the cmpxchg. Write that
-  invariant down in a comment. (Review M4)
-- [ ] **ST still does two `mprotect` calls per arm/disarm.** It could use
-  the same RWX-once approach as MT: much faster, with no transient
-  non-executable window. The current approach is kept for W^X
-  compatibility, so make it a tunable.
+- [ ] **Fork without exec shares one region.** The child keeps the
+  parent's mapping (with ST non-atomic increments, and interleaved
+  boundary publishes if both run markers). See the fork-per-connection
+  backlog item.
+- [ ] **Raw signal syscalls bypass the interposers.** `rt_sigaction` and
+  `rt_sigprocmask` issued directly (and the compat-only `sigvec`,
+  `sigpause`) aren't intercepted; the libc wrappers are. Syscall-level
+  coverage needs seccomp or libsyscall_intercept. Other mask-restoring
+  paths (`siglongjmp`, `setcontext`) also use glibc-internal calls.
 
 ## P2: generator (`tools/gen_patchlist.py`, `tools/gen_boundary.py`)
 
-- [ ] **`--root` or `--cutoff` with `--module` exits with an error**,
-  because roots are resolved inside every module. Address roots have no
-  upper bound: any address, including another module's or a typo,
-  resolves to the module's last function with only a note on stderr.
-  `--print-reachable` returns after module 0.
-- [ ] **Passing `--exclude-pat` replaces the default exclusions**
-  (`sym.imp.`, `_init`, …) instead of adding to them.
-- [ ] **Data in text and overlaps.** There is no overlap check between
-  sites, and heuristic `fcn.*` functions are included. Blocks that run
-  into literal pools or Thumb `tbb`/`tbh` tables could patch data. Data
-  reads never trap, so the corruption is permanent. Validate that sites
-  don't overlap, and skip functions with `fcn.` names unless opted in.
-- [ ] **Thumb detection is per function** (`fn["bits"]`). A UDF inside
-  an IT block has unpredictable behaviour. Skip IT-block terminators.
-- [ ] **Name parsing.** Names of 4+ hex characters (`cafe`, `beef`) are
-  parsed as addresses. gen_boundary's `split(":")` breaks on C++
-  `ns::fn`. gen_boundary raises raw tracebacks on bad specs. It lacks
-  gen_patchlist's suffix-match resolution, so the same name can resolve
-  differently in the two tools; share `resolve_to_offset`.
+- [ ] **Data in text, residual.** Data that decodes as a plausible
+  instruction can't be told apart by type; the overlap check and
+  `--strategy entry` are the backstops. An IT block that straddles a
+  basic-block boundary isn't detected. Thumb mode is still decided per
+  function (`fn["bits"]`).
 - [ ] **LCVB1 has no `module_idx`,** so markers can only live in the
   primary module. Add an LCVB2 with a module index.
 - [ ] **Indirect-call follow-ups.** `--root` runs now report the
@@ -339,9 +407,6 @@ the MT stress test fail against the pre-fix code.
 ## P2: tests and docs
 
 - [ ] Add a raw `clone(2)` MT stress harness (carried over).
-- [ ] The top-level Makefile has no header dependencies: editing a
-  header (tunables, `arch_ppc_emulate.h`, ...) doesn't rebuild the
-  objects. Add `-MMD -MP`.
 
 ---
 

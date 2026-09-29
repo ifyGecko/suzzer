@@ -53,8 +53,11 @@ uintptr_t libcov_arch_pc_from_uctx(const ucontext_t *uc);
  * perform it on the trapped context -- update the PC (and any register
  * the instruction writes) -- and return 1.
  *
- * Only side-effect-free control flow is supported (branches, and NOP-like
- * hints). A marker that can be emulated is never disarmed, so a peer
+ * Only instructions whose whole effect is on the PC and general registers
+ * are supported: branches and NOP-like hints, and on MIPS (whose markers
+ * are block-entry prologue instructions, never branches) register-only
+ * ALU ops such as lui/addiu. No memory access. A marker that can be
+ * emulated is never disarmed, so a peer
  * thread can never pass it untrapped (see boundary.c). Backends without
  * support return 0 and markers fall back to disarm + deferred re-arm. */
 int libcov_arch_emulate(ucontext_t *uc, uintptr_t addr,

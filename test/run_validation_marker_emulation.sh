@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# Boundary-marker emulation. On backends that support it (x86_64,
-# aarch64, arm/Thumb, riscv64, powerpc, powerpc64) libcov never disarms a
-# marker: the trap handler performs the marker's instruction itself and
-# moves the PC past it. A wrong emulation sends the target down the wrong
-# branch, so:
+# Boundary-marker emulation. On every backend libcov never disarms a
+# marker it can emulate: the trap handler performs the marker's
+# instruction itself and moves the PC past it. A wrong emulation sends the
+# target down the wrong branch (or corrupts a register), so:
 #
 #   target_markers calls four marker functions n times each; their
 #   branches cover the conditional forms each emulator decodes (see
@@ -13,10 +12,13 @@
 #     2. every marker call fired a boundary (gen_current == markers * n);
 #     3. the log reports every marker emulated (or 0 when disabled).
 #
-# MIPS (mips, mipsel, mips64, mips64el) doesn't emulate markers (delay
-# slots), so there both runs use the fallback and expect 0 emulated; the
-# check that matters is that every marker lands on a patched entry site
-# and fires.
+# MIPS (mips, mipsel, mips64, mips64el) puts markers on block-entry
+# instructions (delay slots rule out branches), which in target_markers
+# are prologue ALU ops (lui, daddiu); src/arch_mips_emulate.h performs
+# those, so there too every marker is emulated. Its decoder is also
+# unit-tested natively on every run (test/unit_mips_emulate.c): every
+# supported instruction, o32 vs n64 sign extension, and the instructions
+# it must refuse.
 #
 # ARCH=<cross arch> runs that build under qemu-<arch>-static. MT runs only
 # natively and for aarch64: qemu-user's translation cache can't follow
@@ -50,10 +52,7 @@ elif [[ -n "${QEMU[$ARCH]:-}" ]]; then
 else
     echo "ARCH=$ARCH: add a qemu runner here" >&2; exit 1
 fi
-case "$ARCH" in
-    x86_64|aarch64|arm|riscv64|powerpc|powerpc64|powerpc64le) EMULATES=1 ;;
-    *)                                                        EMULATES=0 ;;
-esac
+EMULATES=1     # every backend now emulates its markers
 case "$ARCH" in
     "$(uname -m)"|aarch64) THREADINGS=(st mt) ;;
     *)                     THREADINGS=(st) ;;
@@ -75,6 +74,10 @@ done
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
+
+${HOSTCC:-gcc} -O2 -Wall -Wextra -o "$WORK/unit_mips_emulate" "$ROOT/test/unit_mips_emulate.c" \
+    || fail "build unit_mips_emulate"
+"$WORK/unit_mips_emulate" | sed 's/^/   /' || fail "MIPS emulator unit test"   # pipefail
 
 for tgt in "${TARGETS[@]}"; do
 T="$B/$tgt"

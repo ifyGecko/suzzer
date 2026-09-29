@@ -4,13 +4,19 @@
 #include <stdint.h>
 
 /* Init-time logging. Writes "libcov: <msg>\n" to LIBCOV_LOG (or stderr if
- * unset). Never called from the signal handler. */
+ * unset). Never called from the signal handler. After libcov_log_seal()
+ * (end of init) a line is dropped unless the log fd still refers to the
+ * file it did at init and is not a socket: the target may have reused
+ * the fd number or dup2'd a socket onto fd 2. */
 void libcov_log_init(void);
+void libcov_log_seal(void);
 void libcov_logf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
-/* Returns load base of the first mapping whose pathname matches modname
- * (basename match). modname == NULL or "" -> match argv[0] basename.
- * Returns 0 on failure. */
+/* Returns the load base of the first mapping whose pathname matches
+ * modname, or 0. A bare name matches the basename; an absolute path (after
+ * realpath) matches the full path; NULL or "" matches the main executable
+ * exactly. A " (deleted)" suffix on the mapping is ignored. Logs a warning
+ * if a bare name matches two different files. */
 uintptr_t util_module_base(const char *modname);
 
 /* Returns [lo, hi) of libcov.so's own mapping (so we can refuse to patch

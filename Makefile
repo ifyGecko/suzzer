@@ -146,13 +146,14 @@ SRC := $(COMMON_SRC) $(PATCH_SRC) $(HANDLER_SRC) $(EXTRA_SRC) $(ARCH_SRC)
 OBJDIR := $(BUILD)/obj_$(THREADING)
 OBJ    := $(patsubst src/%.c,$(OBJDIR)/%.o,$(SRC))
 
-# Auto-generated header dependencies (-MMD -MP above). Editing a header
-# now rebuilds every object that includes it. .d files live in OBJDIR
-# (per arch+threading) and are removed by `clean` (rm -rf build).
 DEP := $(OBJ:.o=.d)
--include $(DEP)
 
 LIB := $(BUILD)/libcov_$(THREADING).so
+
+# Plain `make` means `all`. Pinned because the included .d files (end of
+# file) contain rules, and the first rule make sees is otherwise the
+# default goal: `make` would just rebuild libcov.o.
+.DEFAULT_GOAL := all
 
 .PHONY: all clean test test-targets all-arch all-variants native print-vars tools tools-clean
 
@@ -185,12 +186,19 @@ NATIVE_SUITES := run_validation run_validation_mt run_validation_boundary \
                  run_validation_boundary_mt run_validation_multimod \
                  run_validation_signals run_validation_coverage_options \
                  run_validation_failloud run_validation_generator \
-                 run_validation_o2pie run_validation_marker_emulation
+                 run_validation_generator_safety \
+                 run_validation_o2pie run_validation_marker_emulation \
+                 run_validation_reexec run_validation_modules \
+                 run_validation_patch_mode
 
 test:
 ifneq ($(ARCH),$(shell uname -m))
 	$(error make test runs the native suites; for ARCH=$(ARCH) use test/run_cross.sh / test/run_cross_mt.sh)
 endif
+	@# Plain `make` must still build the test targets (a stray rule from an
+	@# included .d file once became the default goal).
+	@$(MAKE) --no-print-directory -n 2>/dev/null | grep -q -- '-C test' \
+	    || { echo "FAIL: plain 'make' no longer builds 'all'" >&2; exit 1; }
 	$(MAKE) --no-print-directory THREADING=st native
 	$(MAKE) --no-print-directory THREADING=mt native
 	$(MAKE) --no-print-directory -C test ARCH=$(ARCH) BUILD=$(abspath $(BUILD)) all mt multimod o2pie
@@ -228,3 +236,9 @@ print-vars:
 	@echo "ARCH=$(ARCH) BACKEND=$(BACKEND) THREADING=$(THREADING)"
 	@echo "SRC=$(SRC)"
 	@echo "LIB=$(LIB)"
+
+# Auto-generated header dependencies (-MMD -MP in the compile rule).
+# Editing a header rebuilds every object that includes it. .d files live
+# in OBJDIR (per arch+threading) and are removed by `clean` (rm -rf build).
+# Kept last so none of their rules can become the default goal.
+-include $(DEP)

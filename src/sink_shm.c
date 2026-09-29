@@ -9,11 +9,14 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <signal.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 
 void   *libcov_shm_base = NULL;
 size_t  libcov_shm_size = 0;
+int     libcov_shm_attached = 0;
 uint8_t *libcov_bitmap  = NULL;
 #if defined(LIBCOV_THREADING_MT)
 __thread uint8_t *libcov_thread_bitmap = NULL;
@@ -60,7 +63,7 @@ uint32_t libcov_prev_loc[LIBCOV_NGRAM_WIN] = {0};
 
 static int try_shm_open(const char *name, int *fd_out) {
     /* shm_open requires a leading slash. */
-    char buf[256];
+    char buf[272];
     if (name[0] != '/') {
         snprintf(buf, sizeof buf, "/%s", name);
         name = buf;
@@ -76,6 +79,71 @@ static int try_file_open(const char *path, int extra_flags, int *fd_out) {
     if (fd < 0) return -1;
     *fd_out = fd;
     return 0;
+}
+
+/* ---- region ownership ------------------------------------------------ *
+ * A daemon that re-execs itself (sshd, nginx's binary upgrade) inherits
+ * LD_PRELOAD and LIBCOV_SHM_PATH, so libcov initialises again in the new
+ * image. Zeroing the region then wipes the header and ring under a reading
+ * driver. The header records its creator (pid + start time, both kept by
+ * exec), and sink_init decides under an flock:
+ *
+ *   same process (in-place re-exec)  -> attach: keep contents and gens;
+ *   another live process             -> leave it alone, run inert;
+ *   nobody alive (stale file)        -> reset, as for any new run.
+ *
+ * %p in LIBCOV_SHM_PATH gives each process its own region instead. */
+
+/* Start time of `pid` (0 = self) in clock ticks since boot, low 32 bits,
+ * from /proc/<pid>/stat field 22; 0 if unavailable. */
+static uint32_t proc_start_time(pid_t pid) {
+    char path[64];
+    if (pid) snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    else     snprintf(path, sizeof path, "/proc/self/stat");
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    char buf[1024];
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    /* comm (field 2) may contain spaces; fields after the last ')' don't. */
+    char *p = strrchr(buf, ')');
+    if (!p || !p[1]) return 0;
+    p += 2;
+    for (int field = 3; *p && field < 22; p++)
+        if (*p == ' ') field++;
+    return (uint32_t)strtoull(p, NULL, 10);
+}
+
+static int owner_alive(uint32_t pid, uint32_t start) {
+    if (!pid) return 0;
+    uint32_t cur = proc_start_time((pid_t)pid);
+    if (cur) return cur == start;       /* a reused pid has another start time */
+    return kill((pid_t)pid, 0) == 0 || errno == EPERM;   /* no /proc */
+}
+
+/* Copy `in` to `out`, replacing %p with our pid and %% with %. */
+static int expand_path(const char *in, char *out, size_t n) {
+    size_t o = 0;
+    for (const char *p = in; *p; p++) {
+        char tmp[16];
+        const char *piece = tmp;
+        if (p[0] == '%' && p[1] == 'p') { snprintf(tmp, sizeof tmp, "%d", (int)getpid()); p++; }
+        else if (p[0] == '%' && p[1] == '%') { tmp[0] = '%'; tmp[1] = 0; p++; }
+        else { tmp[0] = *p; tmp[1] = 0; }
+        size_t l = strlen(piece);
+        if (o + l >= n) return -1;
+        memcpy(out + o, piece, l);
+        o += l;
+    }
+    out[o] = 0;
+    return 0;
+}
+
+static void unlock_close(int fd) {
+    flock(fd, LOCK_UN);
+    close(fd);
 }
 
 /* Total shm size = header + live bitmap + ring*slot_stride. */
@@ -94,10 +162,16 @@ static size_t compute_shm_size(unsigned ring_size, size_t map_size,
 }
 
 int sink_init(const char *path, unsigned ring_size, size_t map_size) {
-    char default_path[128];
+    char default_path[128], expanded[256];
     if (!path || !*path) {
         snprintf(default_path, sizeof default_path, "/libcov_%d", (int)getpid());
         path = default_path;
+    } else if (strchr(path, '%')) {
+        if (expand_path(path, expanded, sizeof expanded) != 0) {
+            libcov_logf("sink: LIBCOV_SHM_PATH too long after %%p expansion");
+            return -1;
+        }
+        path = expanded;
     }
 
     if (ring_size < 2)  ring_size = 2;
@@ -144,7 +218,7 @@ int sink_init(const char *path, unsigned ring_size, size_t map_size) {
         if (try_shm_open(path, &fd) < 0) {
             const char *tmpdir = getenv("TMPDIR");
             if (!tmpdir || !*tmpdir) tmpdir = "/tmp";
-            char fallback[256];
+            char fallback[512];
             const char *bare = (path[0] == '/') ? path + 1 : path;
             snprintf(fallback, sizeof fallback, "%s/%s", tmpdir, bare);
             if (try_file_open(fallback, O_NOFOLLOW | O_CLOEXEC, &fd) < 0) {
@@ -155,15 +229,67 @@ int sink_init(const char *path, unsigned ring_size, size_t map_size) {
         }
     }
 
+    /* Decide between attach / leave alone / reset while holding the lock,
+     * so two processes initialising at once can't both claim the region.
+     * Released explicitly (unlock_close): an flock belongs to the open
+     * file description, which our mmap keeps alive after close(fd). */
+    if (flock(fd, LOCK_EX) != 0)
+        libcov_logf("sink: flock(%s): %s (continuing unlocked)", path, strerror(errno));
+    uint32_t my_pid = (uint32_t)getpid(), my_start = proc_start_time(0);
+    void *m = NULL;
+    struct stat st;
+    if (fstat(fd, &st) == 0 &&
+        (size_t)st.st_size >= sizeof(struct libcov_shm_header)) {
+        void *old = mmap(NULL, (size_t)st.st_size, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, fd, 0);
+        if (old != MAP_FAILED) {
+            struct libcov_shm_header *oh = (struct libcov_shm_header *)old;
+            int ours = !memcmp(oh->magic, LIBCOV_SHM_MAGIC, 4) &&
+                       oh->version == LIBCOV_SHM_VERSION && oh->owner_pid;
+            if (ours && oh->owner_pid == my_pid && oh->owner_start == my_start) {
+                if ((size_t)st.st_size == total && oh->ring_size == ring_size &&
+                    oh->map_size == map_size && oh->slot_stride == slot_stride) {
+                    m = old;
+                } else {
+                    libcov_logf("sink: re-exec with a different region layout "
+                                "(ring/map size changed); resetting %s", path);
+                }
+            } else if (ours && owner_alive(oh->owner_pid, oh->owner_start)) {
+                libcov_logf("sink: %s is in use by live pid %u; leaving it alone "
+                            "(put %%p in LIBCOV_SHM_PATH for one region per process)",
+                            path, oh->owner_pid);
+                munmap(old, (size_t)st.st_size);
+                unlock_close(fd);
+                return -1;
+            }
+            if (!m) munmap(old, (size_t)st.st_size);
+        }
+    }
+
+    if (m) {
+        struct libcov_shm_header *hdr = (struct libcov_shm_header *)m;
+        unlock_close(fd);
+        libcov_shm_base     = m;
+        libcov_shm_size     = total;
+        libcov_shm_attached = 1;
+        libcov_bitmap       = (uint8_t *)m + hdr->bitmap_offset;
+        memset(libcov_prev_loc, 0, sizeof libcov_prev_loc);
+        libcov_logf("sink: attached to this process's region from before exec "
+                    "(%s, gen_current=%lu); contents kept",
+                    path, (unsigned long)__atomic_load_n(&hdr->gen_current,
+                                                         __ATOMIC_ACQUIRE));
+        return 0;
+    }
+
     if (ftruncate(fd, (off_t)total) < 0) {
         libcov_logf("sink: ftruncate(%zu): %s", total, strerror(errno));
-        close(fd);
+        unlock_close(fd);
         return -1;
     }
-    void *m = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd);
+    m = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (m == MAP_FAILED) {
         libcov_logf("sink: mmap: %s", strerror(errno));
+        unlock_close(fd);
         return -1;
     }
 
@@ -184,6 +310,9 @@ int sink_init(const char *path, unsigned ring_size, size_t map_size) {
     hdr->gen_init      = 0;
     hdr->bitmap_offset = bitmap_off;
     hdr->ring_offset   = ring_off;
+    hdr->owner_pid     = my_pid;
+    hdr->owner_start   = my_start;
+    unlock_close(fd);   /* the header is stamped; let the next claimant look */
 
     libcov_shm_base = m;
     libcov_shm_size = total;

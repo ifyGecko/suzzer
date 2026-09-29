@@ -37,9 +37,22 @@ echo ">> regenerate patch list for target_loop"
     --include-pat '^dbg\.(main|classify|loop_sum|cmdline|process_one|iter_begin)$' \
     >/dev/null 2>$WORK/v_b.gen.log
 
-echo ">> generate boundary sidecar (iter_begin = depth-zero begin marker)"
-"$ROOT/tools/gen_boundary.py" "$TARGET" "$LCVB" iter_begin:begin:zero \
+echo ">> generate boundary sidecar (iter_begin = begin marker)"
+"$ROOT/tools/gen_boundary.py" "$TARGET" "$LCVB" iter_begin:begin \
     >/dev/null 2>$WORK/v_b.bnd.log
+
+echo ">> a begin-only sidecar with depth_filter=zero is refused unless --force"
+if "$ROOT/tools/gen_boundary.py" "$TARGET" "$WORK/zero.lcvb" iter_begin:begin:zero \
+        >/dev/null 2>"$WORK/zero.err"; then
+    echo "FAIL: begin-only :zero accepted" >&2; exit 1
+fi
+grep -q 'no effect without END markers' "$WORK/zero.err" && [[ ! -e "$WORK/zero.lcvb" ]] \
+    || { echo "FAIL: refusal message missing or file written: $(cat "$WORK/zero.err")" >&2; exit 1; }
+"$ROOT/tools/gen_boundary.py" "$TARGET" "$WORK/zero.lcvb" iter_begin:begin:zero --force \
+    >/dev/null 2>"$WORK/zero.err" && [[ -s "$WORK/zero.lcvb" ]] \
+    && grep -q '^warning: depth_filter=zero' "$WORK/zero.err" \
+    || { echo "FAIL: --force did not write the sidecar with a warning" >&2; exit 1; }
+echo "   OK: refused without --force (nothing written); written with a warning under --force"
 
 OUT="$WORK/driver.out"
 
@@ -91,6 +104,40 @@ if [[ -z "$total_final" || "$total_final" -lt 5 ]]; then
     echo "FAIL: final cumulative coverage suspiciously low (total=$total_final)" >&2; exit 1
 fi
 echo "   OK: cumulative coverage = $total_final edges"
+
+grep -q ' overruns=0 lost_gens=0 read_failures=0 ' "$OUT" \
+    || { echo "FAIL: driver summary reports lost coverage" >&2; exit 1; }
+echo "   OK: driver summary: no overruns, no lost gens"
+
+echo
+echo ">> overrun accounting: burst all inputs, then read (FUZZ_DRIVER_BURST=1)"
+# The driver reads nothing until the target has exited, so every gen is
+# already published. A 2-slot ring keeps only the newest one readable:
+# the driver must count the loss and exit 3. A 16-slot ring holds all 6.
+burst() {  # <ring> <out>; prints the driver's exit status
+    local rc=0
+    printf '%s' "$INPUTS" | FUZZ_DRIVER_BURST=1 LIBCOV_BOUNDARY_RING="$1" \
+        "$DRIVER" "$LIB" "$LCV" "$LCVB" "$TARGET" > "$2" 2>&1 || rc=$?
+    echo "$rc"
+}
+rc=$(burst 2 "$WORK/burst2.out")
+lost=$(sed -n 's/.* lost_gens=\([0-9]*\).*/\1/p' "$WORK/burst2.out")
+if [[ "$rc" != 3 ]] || ! grep -q '^OVERRUN: ' "$WORK/burst2.out" \
+        || [[ -z "$lost" || "$lost" -lt 1 ]]; then
+    echo "FAIL: ring=2 burst: rc=$rc lost_gens=$lost (want rc=3, lost>=1)" >&2
+    cat "$WORK/burst2.out" >&2; exit 1
+fi
+# What survived is still reported: the newest gen is read after the skip.
+grep -q '^gen=.*(burst)' "$WORK/burst2.out" \
+    || { echo "FAIL: ring=2 burst read nothing after the overrun" >&2; exit 1; }
+echo "   OK: ring=2: overrun counted (lost_gens=$lost), exit 3, newest gen still read"
+rc=$(burst 16 "$WORK/burst16.out")
+g16=$(grep -c '^gen=' "$WORK/burst16.out" || true)
+if [[ "$rc" != 0 || "$g16" -lt 6 ]] || grep -q '^OVERRUN' "$WORK/burst16.out"; then
+    echo "FAIL: ring=16 burst: rc=$rc gens=$g16 (want rc=0, >=6 gens, no overrun)" >&2
+    cat "$WORK/burst16.out" >&2; exit 1
+fi
+echo "   OK: ring=16: all $g16 gens read, exit 0"
 
 echo
 echo ">> sanity-check the (MODE, REARM) matrix"

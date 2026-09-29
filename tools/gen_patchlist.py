@@ -125,7 +125,7 @@ import sys
 
 import rzpipe
 
-from rz_resolve import resolve_to_offset
+from rz_resolve import NotFound, resolve_to_offset
 
 
 # Functions excluded from instrumentation by default: PLT/import
@@ -241,9 +241,12 @@ def filter_functions(all_fns, include_re, exclude_re):
         if exclude_re and exclude_re.search(name):
             continue
         out.append({
-            "offset": int(f["offset"]),
-            "name":   name,
-            "bits":   int(f.get("bits", 0)),
+            "offset":   int(f["offset"]),
+            "name":     name,
+            "bits":     int(f.get("bits", 0)),
+            # extent, so resolve_to_offset can bound address lookups
+            "size":     int(f.get("size") or 0),
+            "maxbound": int(f.get("maxbound") or 0),
         })
     return out
 
@@ -305,10 +308,60 @@ def _is_branch_at(rz, addr):
     return op_class(insns[0].get("type")) is not None
 
 
+# Mnemonics rizin emits when it decodes bytes as data, not code (literal
+# pools, tbb/tbh jump-table payloads). Matched on the disasm mnemonic.
+_DATA_MNEMONICS = frozenset(
+    (".byte", ".word", ".short", ".hword", ".dword", ".qword", ".long",
+     ".asciz", ".ascii", ".string", ".data", ".fill"))
+
+
+def _insn_mnemonic(insn):
+    disasm = (insn.get("disasm") or "").strip().lower()
+    return disasm.split(None, 1)[0] if disasm else ""
+
+
+def _is_data(insn):
+    """True if rizin decoded this "instruction" as data rather than code: an
+    invalid/undecodable opcode, or a data directive (a literal-pool word, a
+    tbb/tbh jump-table payload). Patching data is PERMANENT corruption -- a
+    data read never traps, so the original bytes are never restored.
+
+    A literal word that happens to decode as a plausible instruction can't be
+    caught by type alone; the overlap check and --strategy entry are the
+    backstops for that residual case."""
+    if (insn.get("type") or "") == "invalid":
+        return True
+    return _insn_mnemonic(insn) in _DATA_MNEMONICS
+
+
+def _thumb_it_conditional_offsets(insns):
+    """Offsets of instructions made conditional by a preceding Thumb IT block.
+    A UDF trap on a conditional instruction is architecturally unpredictable,
+    so those instructions must not be chosen. The IT instruction itself stays
+    eligible -- it re-executes cleanly after restore.
+
+    Detected purely from the disasm mnemonic: an IT block opener is 'it'
+    optionally followed by 1-3 of {t,e} ('it','itt','ite','ittt',...), and it
+    conditionalises the next len(mnemonic)-1 instructions (1-4). This shape
+    only appears in real Thumb code, so it is a no-op on every other arch.
+    Limitation: an IT block that spans a basic-block boundary (rare -- rizin
+    seldom splits one) is not tracked across the split."""
+    cond = set()
+    n = len(insns)
+    for i, insn in enumerate(insns):
+        mnem = _insn_mnemonic(insn)
+        if mnem.startswith("it") and set(mnem[2:]) <= {"t", "e"}:
+            span = len(mnem) - 1  # conditional instructions after the IT
+            for j in range(i + 1, min(i + 1 + span, n)):
+                cond.add(int(insns[j].get("offset", -1)))
+    return cond
+
+
 def pick_terminator(insns, ok=None):
     """Return the instruction to patch for a block under the terminator
     strategy, or None. Candidates must be at least 2 bytes long (the
-    smallest trap encoding) and satisfy `ok`.
+    smallest trap encoding), must be code rather than data (_is_data), must
+    not sit inside a Thumb IT block, and must satisfy `ok`.
 
     - If the block makes a call before its last instruction, the first
       such call. rizin doesn't split blocks at calls, so a block whose
@@ -322,9 +375,14 @@ def pick_terminator(insns, ok=None):
       whenever the block completes, so it is an equally valid probe.
 
     gen_boundary.py uses this same helper so boundary markers stay
-    co-located with patched sites."""
+    co-located with patched sites (and inherit the data/IT-block skips)."""
+    it_cond = _thumb_it_conditional_offsets(insns)
+
     def eligible(insn):
-        return int(insn.get("size", 0)) >= 2 and (ok is None or ok(insn))
+        return (int(insn.get("size", 0)) >= 2
+                and not _is_data(insn)
+                and int(insn.get("offset", -1)) not in it_cond
+                and (ok is None or ok(insn)))
 
     for insn in insns[:-1]:
         if op_class(insn.get("type")) == "call" and eligible(insn):
@@ -340,12 +398,18 @@ def pick_entry(insns, in_delay_slot):
     strategy, or None. Normally the block's first instruction; if the
     block starts in a MIPS branch delay slot (the instruction before it is
     a branch), the second one -- trapping in a delay slot reports the
-    branch's PC and resumes at the branch.
+    branch's PC and resumes at the branch. Skips leading data words (a
+    literal pool at the block head) rather than patching them.
 
     gen_boundary.py uses this same helper so MIPS boundary markers stay
     co-located with patched sites."""
     idx = 1 if in_delay_slot else 0
-    return insns[idx] if idx < len(insns) else None
+    while idx < len(insns):
+        insn = insns[idx]
+        if int(insn.get("size", 0)) >= 2 and not _is_data(insn):
+            return insn
+        idx += 1
+    return None
 
 
 def pick_sites(rz, fn, strategy, arch, ok=None):
@@ -569,13 +633,118 @@ def bfs_reachable(roots, adj, cutoffs, max_depth=None):
     return out
 
 
-def collect_module_records(args, rz, module_idx, module_name):
+def validate_no_overlap(records, module_name, fail):
+    """Reject records whose [offset, offset+len) byte ranges overlap. An
+    overlap means one site would patch bytes another site owns -- a
+    double-patch that corrupts the target (a partial restore leaves stale
+    illegal bytes behind). Exact-duplicate addresses are already deduped
+    upstream, so only partial-range overlaps reach here.
+
+    `records` is a list of (offset, size, module_idx, orig). Offsets are
+    module-relative, so this is called per module. By default the later
+    (higher-offset) site of an overlapping pair is dropped with a warning;
+    with `fail` set the first overlap is a hard error. Returns the surviving
+    records in their original (discovery) order so downstream output is
+    otherwise unchanged."""
+    ordered = sorted(records, key=lambda r: (r[0], r[1]))
+    dropped = set()
+    prev = None
+    for rec in ordered:
+        off, size = rec[0], rec[1]
+        if prev is not None:
+            poff, psize = prev[0], prev[1]
+            if off < poff + psize:
+                msg = (f"site 0x{off:x} (len {size}) overlaps "
+                       f"0x{poff:x}-0x{poff + psize:x}")
+                if fail:
+                    sys.exit(f"error: {module_name}: {msg}")
+                print(f"warning: {module_name}: {msg}; dropping 0x{off:x}",
+                      file=sys.stderr)
+                dropped.add(id(rec))
+                # Keep `prev` as the earlier site so a run of overlaps all
+                # measure against the site actually retained.
+                continue
+        prev = rec
+    if not dropped:
+        return records
+    return [r for r in records if id(r) not in dropped]
+
+
+def parse_slice_specs(tokens, module_specs, flag):
+    """Parse --root / --cutoff tokens into specs.
+
+    `MOD!TOKEN` pins a spec to one module (MOD = the module's name, or the
+    basename of its path); `!` can't clash with --module's NAME:PATH or a
+    C++ `ns::fn`. An unqualified name resolves in every module that has
+    it; an unqualified explicit address (0x..., decimal) means module 0,
+    since module address ranges overlap."""
+    specs = []
+    for tok in tokens:
+        mod = None
+        body = tok
+        if "!" in tok:
+            mname, body = tok.split("!", 1)
+            for i, (name, path) in enumerate(module_specs):
+                if mname in (name, os.path.basename(path)):
+                    mod = i
+                    break
+            else:
+                names = ", ".join(n for n, _ in module_specs)
+                sys.exit(f"error: {flag} '{tok}': no module '{mname}' "
+                         f"(modules: {names})")
+            if not body:
+                sys.exit(f"error: {flag} '{tok}': empty name after '!'")
+        b = body.strip()
+        is_addr = b.startswith(("0x", "0X")) or b.isdigit()
+        specs.append({"tok": body, "mod": mod, "addr": is_addr, "orig": tok})
+    return specs
+
+
+def resolve_slice_specs(specs, module_idx, all_fns, found, stubs, flag, verbose):
+    """Resolve the specs that apply to module `module_idx` to function
+    entry offsets. Records in `found[i]` which modules spec i resolved in.
+    A qualified spec or an address must resolve where it applies; an
+    unqualified name that isn't here may live in another module (run()
+    checks it resolved somewhere). An unqualified name that only matches
+    an import stub (sym.imp.NAME: a PLT jump into the defining module)
+    doesn't count; `stubs[i]` remembers it for the error message."""
+    out = set()
+    for i, sp in enumerate(specs):
+        if sp["mod"] is not None and sp["mod"] != module_idx:
+            continue
+        if sp["mod"] is None and sp["addr"] and module_idx != 0:
+            continue
+        try:
+            off, fn = resolve_to_offset(sp["tok"], all_fns)
+        except NotFound as e:
+            if sp["mod"] is not None or sp["addr"]:
+                sys.exit(f"error: {flag} '{sp['orig']}': {e}")
+            continue
+        except ValueError as e:          # ambiguous within this module
+            sys.exit(f"error: {flag} '{sp['orig']}': {e}")
+        if (sp["mod"] is None and fn["name"].startswith("sym.imp.")
+                and not sp["tok"].startswith("sym.imp.")):
+            stubs.setdefault(i, (module_idx, fn["name"]))
+            continue
+        out.add(off)
+        found.setdefault(i, []).append(module_idx)
+        if verbose:
+            print(f"{flag[2:]}: module[{module_idx}] '{sp['orig']}' -> 0x{off:x} "
+                  f"({fn['name']})", file=sys.stderr)
+    return out
+
+
+def collect_module_records(args, rz, module_idx, module_name, slicing=None):
     """Walk one module's functions and return its patch records.
 
     Returns (records, mt_skipped_alignment). Each record is a tuple
     (offset, len, module_idx, orig_bytes) ready to be packed into the
     LCV3 wire format. The caller is responsible for combining records
     across modules and writing the final file.
+
+    `slicing` carries the parsed --root / --cutoff specs and the per-spec
+    "resolved in" maps shared across modules (see run()). With
+    --print-reachable the slice is printed and no records are returned.
     """
     inc = re.compile(args.include_pat) if args.include_pat else None
     exc_pats = []
@@ -615,23 +784,24 @@ def collect_module_records(args, rz, module_idx, module_name):
     # --root and a downstream callee that the user does want to instrument.
     if args.root:
         all_fns = filter_functions(all_fns_raw, None, None)
-        try:
-            roots = set()
-            for r in args.root:
-                off, fn = resolve_to_offset(r, all_fns)
-                roots.add(off)
-                if args.verbose:
-                    print(f"root:   '{r}' -> 0x{off:x} ({fn['name']})",
-                          file=sys.stderr)
-            cutoffs = set()
-            for c in args.cutoff:
-                off, fn = resolve_to_offset(c, all_fns)
-                cutoffs.add(off)
-                if args.verbose:
-                    print(f"cutoff: '{c}' -> 0x{off:x} ({fn['name']})",
-                          file=sys.stderr)
-        except ValueError as e:
-            sys.exit(f"error: {e}")
+        roots = resolve_slice_specs(slicing["roots"], module_idx, all_fns,
+                                    slicing["found_roots"], slicing["stub_roots"],
+                                    "--root", args.verbose)
+        cutoffs = resolve_slice_specs(slicing["cutoffs"], module_idx, all_fns,
+                                      slicing["found_cutoffs"],
+                                      slicing["stub_cutoffs"], "--cutoff",
+                                      args.verbose)
+        if not roots:
+            # Calls into another module go through its PLT and aren't
+            # followed, so a slice never reaches a module without its own
+            # root: instrumenting all of it would ignore the slice.
+            print(f"warning: module[{module_idx}] '{module_name}': no --root "
+                  f"resolves here, so nothing in it is instrumented (add "
+                  f"--root '{module_name}!FUNC')", file=sys.stderr)
+            if args.print_reachable:
+                print(f"module[{module_idx}] '{module_name}': no roots",
+                      file=sys.stderr)
+            return [], 0
 
         bad_roots = roots & cutoffs
         if bad_roots:
@@ -646,7 +816,8 @@ def collect_module_records(args, rz, module_idx, module_name):
         reachable_offsets = bfs_reachable(roots, adj, cutoffs, args.max_depth)
         depth_note = (f", max-depth={args.max_depth}"
                       if args.max_depth is not None else "")
-        print(f"reachable: {len(reachable_offsets)} function(s) from "
+        print(f"module[{module_idx}] '{module_name}': reachable: "
+              f"{len(reachable_offsets)} function(s) from "
               f"{len(roots)} root(s), {len(cutoffs)} cutoff(s){depth_note}",
               file=sys.stderr)
 
@@ -662,9 +833,7 @@ def collect_module_records(args, rz, module_idx, module_name):
                         if calls or jumps else "")
                 print(f"  0x{off:x} {f['name']} bits={f.get('bits', 0)}{note}",
                       file=sys.stderr)
-            print("(--print-reachable: exiting before writing patchlist)",
-                  file=sys.stderr)
-            return None, 0
+            return [], 0
 
         before = len(fns)
         fns = [f for f in fns if int(f["offset"]) in reachable_offsets]
@@ -699,7 +868,19 @@ def collect_module_records(args, rz, module_idx, module_name):
     seen = set()
     records = []
     mt_skipped_alignment = 0
+    fcn_skipped = 0
     for fn in fns:
+        # rizin heuristic functions (fcn.<addr>, no symbol) have the least
+        # reliable block boundaries and code/data classification, so patching
+        # inside them is the riskiest for data-in-text corruption. Skip them
+        # unless the user opts in. Only emission is skipped -- the call-graph
+        # BFS still traverses through them to reach real callees.
+        if not args.include_fcn and fn["name"].startswith("fcn."):
+            fcn_skipped += 1
+            if args.verbose:
+                print(f"  skip fn {fn['name']} (heuristic fcn.*; use --include-fcn)",
+                      file=sys.stderr)
+            continue
         # Let the terminator walk-back skip candidates MT would reject, so
         # a line-straddling x86 terminator falls back to an earlier
         # instruction instead of losing the whole block.
@@ -773,7 +954,27 @@ def collect_module_records(args, rz, module_idx, module_name):
                       f"midx={module_idx} bytes={orig.hex()} ({fn['name']})",
                       file=sys.stderr)
 
+    if fcn_skipped and args.verbose:
+        print(f"  skipped {fcn_skipped} heuristic fcn.* function(s) "
+              f"(use --include-fcn to instrument them)", file=sys.stderr)
+
+    records = validate_no_overlap(records, module_name, args.fail_on_overlap)
     return records, mt_skipped_alignment
+
+
+def runtime_module_name(name, path):
+    """The name libcov will find `path` under in /proc/self/maps.
+
+    maps lists the file actually mapped, i.e. the symlink target: a
+    patch list generated from /bin/ls -> busybox or libfoo.so.1 ->
+    libfoo.so.1.2.3 must name busybox / libfoo.so.1.2.3. Prints a note
+    when that differs from `name`."""
+    real = os.path.basename(os.path.realpath(path))
+    if real and real != name:
+        print(f"note: {path} is a symlink to {real}; naming the module "
+              f"'{real}' (the name /proc/self/maps shows)", file=sys.stderr)
+        return real
+    return name
 
 
 def write_lcv3(output_path, module_names, records, threading_hint):
@@ -802,7 +1003,7 @@ def run(args):
     # Module index 0 is always the positional `binary`. Additional
     # `--module name:path` flags become module indices 1, 2, ... in the
     # order they appear on the command line.
-    primary_name = args.binary.rsplit("/", 1)[-1]
+    primary_name = runtime_module_name(os.path.basename(args.binary), args.binary)
     module_specs = [(primary_name, args.binary)]
     for spec in args.module:
         if ":" not in spec:
@@ -810,10 +1011,22 @@ def run(args):
         name, path = spec.split(":", 1)
         if not name or not path:
             sys.exit(f"error: --module '{spec}' has empty NAME or PATH")
+        # NAME spelled as PATH's own (symlink) basename means "this file":
+        # store the real name, as for the primary. Any other NAME is the
+        # user's explicit choice and is kept.
+        if name == os.path.basename(path):
+            name = runtime_module_name(name, path)
         module_specs.append((name, path))
 
     if len(module_specs) > 255:
         sys.exit(f"error: too many modules ({len(module_specs)}); LCV3 caps at 255")
+
+    slicing = {
+        "roots":   parse_slice_specs(args.root, module_specs, "--root"),
+        "cutoffs": parse_slice_specs(args.cutoff, module_specs, "--cutoff"),
+        "found_roots": {}, "found_cutoffs": {},
+        "stub_roots": {}, "stub_cutoffs": {},
+    }
 
     all_records = []
     total_skipped = 0
@@ -823,18 +1036,38 @@ def run(args):
                   file=sys.stderr)
         rz = open_rizin(path)
         try:
-            result = collect_module_records(args, rz, module_idx, name)
+            records, skipped = collect_module_records(args, rz, module_idx,
+                                                      name, slicing)
         finally:
             try:
                 rz.quit()
             except Exception:
                 pass
-        if result is None or result[0] is None:
-            # --print-reachable returned early; no file written.
-            return
-        records, skipped = result
         all_records.extend(records)
         total_skipped += skipped
+
+    # Every unqualified --root / --cutoff name must have resolved in at
+    # least one module; say where a name resolved in several.
+    for key, flag in (("roots", "--root"), ("cutoffs", "--cutoff")):
+        found = slicing["found_" + key]
+        for i, sp in enumerate(slicing[key]):
+            mods = found.get(i, [])
+            if not mods:
+                stub = slicing["stub_" + key].get(i)
+                why = (f" (module[{stub[0]}] has only the import stub {stub[1]}; "
+                       f"add the module that defines it with --module)"
+                       if stub else "")
+                sys.exit(f"error: {flag} '{sp['orig']}': could not resolve it "
+                         f"in any module{why}")
+            if len(mods) > 1:
+                where = ", ".join(f"module[{m}] '{module_specs[m][0]}'" for m in mods)
+                print(f"note: {flag} '{sp['orig']}' resolved in {where} "
+                      f"(qualify it as MODULE!NAME to pick one)", file=sys.stderr)
+
+    if args.print_reachable:
+        print("(--print-reachable: exiting before writing patchlist)",
+              file=sys.stderr)
+        return
 
     if not all_records and not args.allow_empty:
         hint = ""
@@ -869,7 +1102,9 @@ def main():
                     help="add an auxiliary module to instrument alongside the "
                          "primary binary. NAME is the basename the runtime "
                          "looks up in /proc/self/maps (e.g. 'libfoo.so'); "
-                         "PATH is the ELF file rizin analyses. Repeatable; "
+                         "PATH is the ELF file rizin analyses. If NAME is "
+                         "PATH's basename and PATH is a symlink, the real "
+                         "file's name is stored instead. Repeatable; "
                          "each --module gets the next module_idx starting at 1.")
     ap.add_argument("--include-pat", default=None,
                     help="only include functions whose name matches this regex")
@@ -881,6 +1116,13 @@ def main():
                     help="do not apply the built-in exclusions "
                          "(sym.imp.*, CRT/init stubs); only --exclude-pat, "
                          "if given, is used")
+    ap.add_argument("--include-fcn", action="store_true",
+                    help="instrument rizin heuristic functions (fcn.*) too; "
+                         "skipped by default because their block boundaries and "
+                         "code/data classification are least reliable")
+    ap.add_argument("--fail-on-overlap", action="store_true",
+                    help="treat overlapping patch sites as a hard error instead "
+                         "of dropping the later site with a warning")
     ap.add_argument("--strategy", choices=["auto", "entry", "terminator"],
                     default="auto",
                     help="per-block patch site selection (auto = arch default)")
@@ -892,7 +1134,12 @@ def main():
                     help="instrument only the call-graph slice reachable from "
                          "this function/address. Repeatable. Accepts function "
                          "names (main, dbg.main, sym.parse_request) or "
-                         "addresses (0x401234). Combine with --cutoff to "
+                         "addresses (0x401234, which must fall inside a "
+                         "function). With --module, a name resolves in every "
+                         "module that has it, an address means the primary "
+                         "binary, and MODULE!NAME (e.g. 'libfoo.so!parse') "
+                         "pins one module; a module no root resolves in is "
+                         "not instrumented. Combine with --cutoff to "
                          "scope further. If omitted, all functions matching "
                          "--include-pat/--exclude-pat are instrumented "
                          "(legacy behavior).")
@@ -906,8 +1153,9 @@ def main():
                          "(default: unbounded). A root is depth 0.")
     ap.add_argument("--print-reachable", action="store_true",
                     help="resolve --root/--cutoff, print the reachable "
-                         "function set to stderr, and exit without writing "
-                         "the patchlist. Useful for iterating on a slice.")
+                         "function set of every module to stderr, and exit "
+                         "without writing the patchlist. Useful for iterating "
+                         "on a slice.")
     ap.add_argument("--allow-empty", action="store_true",
                     help="write the patch list even when no sites were "
                          "selected (by default that is an error: an empty "

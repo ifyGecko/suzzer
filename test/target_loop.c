@@ -17,12 +17,13 @@
  * 1-byte BB terminators (some arches' returns are short), so a straight-
  * line function ending in `ret` alone would never be patched and the
  * boundary would never fire. The runtime-impossible branch forces a
- * conditional jump that *is* patchable. __builtin_trap() emits an
- * architecture-appropriate trap instruction so this works on every arch
- * libcov supports (x86_64 UD2, aarch64 BRK, arm UDF, mips/ppc TRAP,
- * riscv UNIMP). The boundary trap fires before the branch executes;
- * once the handler restores the bytes, the branch is taken to the
- * unreachable side or not, exactly as the original program would. */
+ * conditional jump that *is* patchable. The __builtin_trap() only gives
+ * the impossible side a body the compiler keeps; it never executes (on
+ * several arches it would be a SIGTRAP instruction, which libcov never
+ * uses -- tests that need a real illegal instruction use test/sigill.h).
+ * The boundary trap fires before the branch executes; once the handler
+ * restores the bytes, the branch is taken to the unreachable side or
+ * not, exactly as the original program would. */
 __attribute__((noinline, used)) void iter_begin(unsigned iter) {
     if (iter == 0xffffffffu) {
         __builtin_trap();

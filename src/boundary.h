@@ -88,8 +88,25 @@ struct libcov_shm_header {
     uint64_t gen_init;        /* gen when init snapshot was captured (0 = none) */
     uint64_t bitmap_offset;   /* shm-base relative */
     uint64_t ring_offset;     /* shm-base relative */
-    uint8_t  reserved[16];
+    /* atomic: MT publishes libcov dropped because a publisher RING gens
+     * ahead already held the slot (that generation never reached the
+     * ring). Always 0 under ST. Readers compare it across a run. */
+    uint32_t publish_dropped;
+    /* The process that created the region: pid and its start time (clock
+     * ticks since boot, low 32 bits). exec keeps both, so an in-place
+     * re-exec recognises its own region and attaches instead of zeroing
+     * it; another live process leaves it alone (sink_shm.c). */
+    uint32_t owner_pid;
+    uint32_t owner_start;
+    uint8_t  reserved[4];
 };
+/* The layout is an ABI with out-of-process drivers: fields only ever take
+ * over reserved bytes. */
+_Static_assert(sizeof(struct libcov_shm_header) == 72, "shm header is 72 bytes");
+_Static_assert(__builtin_offsetof(struct libcov_shm_header, publish_dropped) == 56,
+               "publish_dropped sits at offset 56");
+_Static_assert(__builtin_offsetof(struct libcov_shm_header, owner_pid) == 60,
+               "owner_pid sits at offset 60");
 
 struct libcov_ring_slot_hdr {
     uint64_t slot_gen;        /* atomic: 0 = empty/in-progress; otherwise gen */

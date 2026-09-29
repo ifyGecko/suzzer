@@ -532,7 +532,7 @@ gen_lcv "$DFLT/target_loop" "$LOOP_LCV" \
     --threading "$THREADING" \
     --include-pat '^dbg\.(main|classify|loop_sum|cmdline|process_one|iter_begin)$' \
     || { fail "gen loop lcv"; exit 1; }
-"$ROOT/tools/gen_boundary.py" "$DFLT/target_loop" "$LOOP_LCVB" iter_begin:begin:zero \
+"$ROOT/tools/gen_boundary.py" "$DFLT/target_loop" "$LOOP_LCVB" iter_begin:begin \
     >/dev/null 2>"$SCRATCH/loop.bnd.log" \
     || { fail "gen loop lcvb"; exit 1; }
 
@@ -560,6 +560,15 @@ for r in 2 4 8; do
         fail "ring=$r requested, header reports ring=$got"
     fi
 done
+
+# Unset -> the default, 8 (4 used to overrun under REARM=all).
+run_loop_with_ring "" "$SCRATCH/t17_default.stats"
+got=$(sed -n 's/.*ring=\([0-9]*\).*/\1/p' "$SCRATCH/t17_default.stats")
+if [[ "$got" == 8 ]]; then
+    pass "ring unset -> default ring=8"
+else
+    fail "ring unset: header reports ring=$got, want the default 8"
+fi
 
 # ----------------------------------------------------------------------
 section "T18: LIBCOV_BOUNDARY_INIT_GRACE -- drops first N marker fires before publish"

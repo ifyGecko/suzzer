@@ -106,4 +106,75 @@ fi
 echo "   OK: both module bases resolved at init"
 
 echo
+echo ">> call-graph slices across modules (--root / --cutoff with --module)"
+MOD="libmultimod_helper.so:$HELPER"
+per_module() {  # "<records in module 0> <records in module 1>" of an LCV
+    python3 -c "
+import struct,sys
+d=open(sys.argv[1],'rb').read()
+cnt=struct.unpack_from('<I',d,8)[0]
+per=[0,0]
+for i in range(cnt): per[d[24+i*14+9]]+=1
+print(per[0], per[1])" "$1"
+}
+gen() { "$ROOT/tools/gen_patchlist.py" "$TARGET" "$@" --module "$MOD" \
+            --include-pat "$INCLUDE" >"$WORK/slice.out" 2>&1; }
+
+# A root only the executable has, and a helper with no root: used to
+# abort the whole run; now the helper is skipped with a warning.
+gen "$WORK/s1.lcv" --root main || { echo "FAIL: --root main --module: $(tail -2 "$WORK/slice.out")"; exit 1; }
+read m0 m1 < <(per_module "$WORK/s1.lcv")
+[[ $m0 -gt 0 && $m1 -eq 0 ]] && grep -q "module\[1\].*no --root resolves here" "$WORK/slice.out" \
+    || { echo "FAIL: --root main: records m0=$m0 m1=$m1 (want >0, 0) + a warning"; exit 1; }
+echo "   OK: --root main with --module: exe sliced ($m0), helper skipped with a warning"
+
+# MODULE!NAME pins a root to the helper: only helper_classify there.
+gen "$WORK/s2.lcv" --root main --root 'libmultimod_helper.so!helper_classify' \
+    || { echo "FAIL: qualified root: $(tail -2 "$WORK/slice.out")"; exit 1; }
+read q0 q1 < <(per_module "$WORK/s2.lcv")
+[[ $q0 -eq $m0 && $q1 -gt 0 && $q1 -lt $(per_module "$LCV_BOTH" | cut -d' ' -f2) ]] \
+    || { echo "FAIL: qualified root: m0=$q0 m1=$q1 (want m0=$m0, 0 < m1 < helper total)"; exit 1; }
+echo "   OK: 'libmultimod_helper.so!helper_classify' slices the helper ($q1 of its records)"
+
+# An unqualified name resolves in the module that defines it -- not in
+# the executable's PLT stub for it.
+gen "$WORK/s3.lcv" --root helper_print || { echo "FAIL: --root helper_print"; exit 1; }
+read u0 u1 < <(per_module "$WORK/s3.lcv")
+[[ $u0 -eq 0 && $u1 -gt 0 ]] \
+    || { echo "FAIL: --root helper_print: m0=$u0 m1=$u1 (want 0, >0)"; exit 1; }
+echo "   OK: unqualified helper_print resolves in the helper, not the exe's PLT stub"
+
+# Errors: a name no module defines, an unknown module, an address past
+# the last function (was silently the last function).
+for bad in "--root nosuch|could not resolve it in any module" \
+           "--root libnope.so!main|no module 'libnope.so'" \
+           "--root 0xdeadbeef|not within any known function"; do
+    args=${bad%%|*}; want=${bad#*|}
+    if gen "$WORK/bad.lcv" $args; then
+        echo "FAIL: '$args' accepted"; exit 1
+    fi
+    grep -q "$want" "$WORK/slice.out" \
+        || { echo "FAIL: '$args': want /$want/, got: $(tail -1 "$WORK/slice.out")"; exit 1; }
+done
+echo "   OK: unknown name / module and out-of-range address are errors"
+
+# --print-reachable covers every module.
+gen /dev/null --root main --root 'libmultimod_helper.so!helper_print' --print-reachable
+grep -q "module\[0\] 'target_multimod': reachable" "$WORK/slice.out" \
+    && grep -q "module\[1\] 'libmultimod_helper.so': reachable" "$WORK/slice.out" \
+    && grep -q "dbg.helper_print" "$WORK/slice.out" \
+    || { echo "FAIL: --print-reachable didn't list both modules: $(grep module "$WORK/slice.out")"; exit 1; }
+echo "   OK: --print-reachable lists both modules"
+
+# The sliced two-module list runs: same output, coverage from both.
+rm -f "$WORK/s2.shm"
+LIBCOV_PATCHLIST="$WORK/s2.lcv" LIBCOV_SHM_PATH="$WORK/s2.shm" LIBCOV_MODE=leapfrog \
+    LIBCOV_LOG="$WORK/s2.log" LD_PRELOAD="$LIB" "$TARGET" "${INPUTS[@]}" > "$WORK/s2.out" 2>&1
+diff -q "$WORK/multimod.bare" "$WORK/s2.out" >/dev/null \
+    || { echo "FAIL: sliced two-module run output differs"; exit 1; }
+grep -q "armed=$((q0 + q1)) " "$WORK/s2.log" \
+    || { echo "FAIL: sliced run: $(grep 'armed=' "$WORK/s2.log")"; exit 1; }
+echo "   OK: sliced two-module list: output matches, all $((q0 + q1)) sites armed"
+
+echo
 echo "ALL MULTIMOD VALIDATIONS PASSED ($ARCH)"

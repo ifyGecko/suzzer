@@ -12,8 +12,14 @@
  * Desync detection: each slot carries its own gen stamp; we read it
  * before and after the bitmap memcpy with acquire ordering. Mismatches
  * mean the writer overwrote our slot mid-read; we retry. If the writer
- * has advanced past us by >= ring_size iterations we've lost data and
- * report it loudly.
+ * has advanced past our window we've lost data: we report it, skip to
+ * the oldest slot that is still readable, and exit 3 at the end (lost
+ * coverage makes the run's results untrustworthy). The exit summary also
+ * reports libcov's own count of MT publishes it had to drop.
+ *
+ * FUZZ_DRIVER_BURST=1 writes every input and waits for the target to
+ * exit before reading anything -- a deterministic way to overrun a small
+ * ring (tests use it to check the overrun accounting).
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -95,6 +101,10 @@ static int read_slot(void *shm_base, uint64_t target_gen, uint8_t *out,
     return 0;
 }
 
+/* Lost-coverage accounting, reported on exit. */
+static unsigned g_overruns, g_read_failures;
+static uint64_t g_lost_gens;
+
 static uint64_t wait_gen_advance(void *shm_base, uint64_t prev_gen,
                                  unsigned timeout_ms) {
     volatile struct libcov_shm_header *hdr = shm_base;
@@ -130,17 +140,31 @@ static void drain_to(void *shm_base, uint64_t *prev_gen, uint64_t target_gen,
         } while (rc == 1 && ++attempts < 100);
 
         if (rc == -1) {
-            fprintf(stderr,
-                    "OVERRUN: writer advanced past gen=%lu, data lost; skipping ahead\n",
-                    (unsigned long)g);
+            /* Resume at the oldest gen still readable. ST's writer is
+             * already filling ring[(now + 1) % ring], which is where
+             * now - ring + 1 lived, so only RING - 1 gens stay readable
+             * (the README's "lag tolerance = RING - 1"). */
             volatile struct libcov_shm_header *hdr = shm_base;
-            *prev_gen = __atomic_load_n((uint64_t *)&hdr->gen_current,
-                                        __ATOMIC_ACQUIRE);
-            return;
+            uint64_t now = __atomic_load_n((uint64_t *)&hdr->gen_current,
+                                           __ATOMIC_ACQUIRE);
+            uint64_t ring = hdr->ring_size;
+            uint64_t oldest = now + 2 > ring ? now + 2 - ring : 1;
+            if (oldest <= g) oldest = g + 1;
+            fprintf(stderr,
+                    "OVERRUN: writer at gen=%lu, gens %lu..%lu lost (ring=%lu); "
+                    "resuming at %lu\n",
+                    (unsigned long)now, (unsigned long)g,
+                    (unsigned long)(oldest - 1), (unsigned long)ring,
+                    (unsigned long)oldest);
+            g_overruns++;
+            g_lost_gens += oldest - g;
+            *prev_gen = oldest - 1;
+            continue;
         }
         if (rc != 0) {
             fprintf(stderr, "read_slot gen=%lu failed (rc=%d) after %d attempts\n",
                     (unsigned long)g, rc, attempts);
+            g_read_failures++;
             return;
         }
 
@@ -280,7 +304,24 @@ int main(int argc, char **argv) {
     uint64_t consumed_gen = 0;
     char line[1024];
     unsigned input_idx = 0;
-    while (fgets(line, sizeof line, stdin)) {
+    const char *burst_env = getenv("FUZZ_DRIVER_BURST");
+    int burst = burst_env && !strcmp(burst_env, "1");
+    int st = 0, reaped = 0;
+    if (burst) {
+        while (fgets(line, sizeof line, stdin)) {
+            if (write(pipefd[1], line, strlen(line)) < 0) {
+                perror("write to target");
+                break;
+            }
+        }
+        close(pipefd[1]);
+        waitpid(pid, &st, 0);
+        reaped = 1;
+        uint64_t last = __atomic_load_n((uint64_t *)&hdr->gen_current,
+                                        __ATOMIC_ACQUIRE);
+        drain_to(shm_base, &consumed_gen, last, scratch, cumulative, map_size, "burst");
+    }
+    while (!burst && fgets(line, sizeof line, stdin)) {
         size_t L = strlen(line);
         if (L && line[L - 1] == '\n') line[L - 1] = 0;
 
@@ -300,26 +341,33 @@ int main(int argc, char **argv) {
         drain_to(shm_base, &consumed_gen, new_gen, scratch, cumulative, map_size, label);
     }
 
-    /* Close pipe to signal EOF; the target's post-loop iter_begin then
-     * flushes the last input's coverage. */
-    close(pipefd[1]);
+    if (!burst) {
+        /* Close pipe to signal EOF; the target's post-loop iter_begin then
+         * flushes the last input's coverage. */
+        close(pipefd[1]);
 
-    uint64_t final_gen = wait_gen_advance(shm_base, consumed_gen, 2000);
-    drain_to(shm_base, &consumed_gen, final_gen, scratch, cumulative, map_size, "EOF-flush");
+        uint64_t final_gen = wait_gen_advance(shm_base, consumed_gen, 2000);
+        drain_to(shm_base, &consumed_gen, final_gen, scratch, cumulative, map_size,
+                 "EOF-flush");
+    }
 
-    int st = 0;
-    waitpid(pid, &st, 0);
+    if (!reaped) waitpid(pid, &st, 0);
 
-    printf("driver: target exited %d  total_edges=%u  consumed_gen=%lu  gen_init=%lu\n",
+    uint32_t dropped = __atomic_load_n((uint32_t *)&hdr->publish_dropped,
+                                       __ATOMIC_ACQUIRE);
+    printf("driver: target exited %d  total_edges=%u  consumed_gen=%lu  gen_init=%lu"
+           "  overruns=%u lost_gens=%lu read_failures=%u publish_dropped=%u\n",
            WIFEXITED(st) ? WEXITSTATUS(st) : -WTERMSIG(st),
            count_set(cumulative, map_size),
            (unsigned long)consumed_gen,
            (unsigned long)__atomic_load_n((uint64_t *)&hdr->gen_init,
-                                          __ATOMIC_ACQUIRE));
+                                          __ATOMIC_ACQUIRE),
+           g_overruns, (unsigned long)g_lost_gens, g_read_failures, dropped);
 
     free(scratch);
     free(cumulative);
     munmap(shm_base, shm_size);
     unlink(shm_path);
-    return 0;
+    /* Lost coverage is a failed run, not a warning. */
+    return (g_overruns || g_read_failures) ? 3 : 0;
 }

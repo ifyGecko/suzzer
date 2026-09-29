@@ -157,11 +157,12 @@ int main(int argc, char **argv) {
     }
 
     printf("ring_dump: target exited %d gens=%lu overruns=%lu missing=%lu "
-           "gen_init=%lu\n",
+           "gen_init=%lu publish_dropped=%u\n",
            WIFEXITED(status) ? WEXITSTATUS(status) : -WTERMSIG(status),
            (unsigned long)published, (unsigned long)overruns,
            (unsigned long)missing,
-           (unsigned long)__atomic_load_n(&hdr->gen_init, __ATOMIC_ACQUIRE));
+           (unsigned long)__atomic_load_n(&hdr->gen_init, __ATOMIC_ACQUIRE),
+           __atomic_load_n(&hdr->publish_dropped, __ATOMIC_ACQUIRE));
     free(buf);
     munmap(base, size);
     unlink(shm_path);

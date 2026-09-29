@@ -132,18 +132,19 @@ with open('$LCV','rb') as f:
 
     libcov_so="$ROOT/build/$build_arch/libcov_st.so"
 
-    # Determinism check: same input twice = identical bitmaps.
+    # Determinism check: same input twice = identical bitmaps. Compare the
+    # live bitmaps, not whole files: the header records each run's pid.
     rm -f "$SHM" "$LOG"
     LIBCOV_PATCHLIST="$LCV" LIBCOV_SHM_PATH="$SHM" LIBCOV_LOG="$LOG" \
         LIBCOV_MODE=oneshot \
         run_target "$build_arch" "$libcov_so" "$target_bin" 42 > "$OUT.a" 2>&1
-    cp "$SHM" "$SHM.a"
+    python3 "$ROOT/test/shm_bitmap.py" extract "$SHM" "$SHM.a"
 
     rm -f "$SHM"
     LIBCOV_PATCHLIST="$LCV" LIBCOV_SHM_PATH="$SHM" LIBCOV_LOG=/dev/null \
         LIBCOV_MODE=oneshot \
         run_target "$build_arch" "$libcov_so" "$target_bin" 42 > "$OUT.b" 2>&1
-    cp "$SHM" "$SHM.b"
+    python3 "$ROOT/test/shm_bitmap.py" extract "$SHM" "$SHM.b"
 
     if ! cmp -s "$SHM.a" "$SHM.b"; then
         echo "FAIL non-deterministic oneshot bitmap"
@@ -155,7 +156,8 @@ with open('$LCV','rb') as f:
     LIBCOV_PATCHLIST="$LCV" LIBCOV_SHM_PATH="$SHM" LIBCOV_LOG=/dev/null \
         LIBCOV_MODE=oneshot \
         run_target "$build_arch" "$libcov_so" "$target_bin" -3 > "$OUT.neg" 2>&1
-    if cmp -s "$SHM.a" "$SHM"; then
+    python3 "$ROOT/test/shm_bitmap.py" extract "$SHM" "$SHM.neg"
+    if cmp -s "$SHM.a" "$SHM.neg"; then
         echo "FAIL bitmaps identical for input=42 vs -3"
         FAIL=$((FAIL+1)); FAILED+=("$arch:same_bitmap"); continue
     fi

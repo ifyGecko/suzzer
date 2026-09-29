@@ -78,6 +78,55 @@ static size_t parse_header(const char *bytes, size_t size,
     return sizeof(struct patchlist_header_v3);
 }
 
+/* LIBCOV_MODULE_RENAME=old=new[,old=new...]: resolve patch-list module
+ * `old` as `new` at runtime -- for a binary run under another name than
+ * the one it was generated from, or (with an absolute path) to pick one of
+ * several same-basename libraries. Returns `name` if no entry matches. */
+static const char *module_rename(const char *name, char *buf, size_t n) {
+    const char *env = getenv("LIBCOV_MODULE_RENAME");
+    if (!env || !*env) return name;
+    size_t nl = strlen(name);
+    for (const char *p = env; *p; ) {
+        const char *end = strchr(p, ',');
+        if (!end) end = p + strlen(p);
+        const char *eq = memchr(p, '=', (size_t)(end - p));
+        if (eq && (size_t)(eq - p) == nl && !memcmp(p, name, nl)) {
+            size_t vl = (size_t)(end - eq - 1);
+            if (vl && vl < n) {
+                memcpy(buf, eq + 1, vl);
+                buf[vl] = 0;
+                return buf;
+            }
+        }
+        p = *end ? end + 1 : end;
+    }
+    return name;
+}
+
+/* A module that isn't mapped: say what to do about it. For module 0 (the
+ * binary gen_patchlist was pointed at) the usual cause is running it
+ * under another name, so name the main executable. */
+static void log_unresolved(unsigned m, const char *name) {
+    char exe[4096];
+    ssize_t r = m == 0 ? readlink("/proc/self/exe", exe, sizeof exe - 1) : -1;
+    if (r > 0) {
+        exe[r] = 0;
+        char *d = strstr(exe, " (deleted)");
+        if (d && !d[10]) *d = 0;
+        const char *base = strrchr(exe, '/');
+        base = base ? base + 1 : exe;
+        if (strcmp(base, name) != 0) {
+            libcov_logf("config: cannot resolve module base for '%s': not mapped; "
+                        "the main executable is '%s' (run under another name? set "
+                        "LIBCOV_MODULE_RENAME=%s=%s)", name, base, name, base);
+            return;
+        }
+    }
+    libcov_logf("config: cannot resolve module base for '%s': not mapped (set "
+                "LIBCOV_MODULE_RENAME=%s=<mapped name or absolute path> if it "
+                "is loaded under another name)", name, name);
+}
+
 int config_load(const char *path) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) { libcov_logf("config: open(%s): %s", path, strerror(errno)); return -1; }
@@ -161,9 +210,14 @@ int config_load(const char *path) {
             libcov_logf("config: empty module name at index %u", m);
             munmap(map, st.st_size); return -1;
         }
-        uintptr_t b = util_module_base(name);
+        char alias[4096];
+        const char *rt = module_rename(name, alias, sizeof alias);
+        if (rt != name)
+            libcov_logf("config: module[%u] '%s' -> '%s' (LIBCOV_MODULE_RENAME)",
+                        m, name, rt);
+        uintptr_t b = util_module_base(rt);
         if (!b) {
-            libcov_logf("config: cannot resolve module base for '%s'", name);
+            log_unresolved(m, rt);
             munmap(map, st.st_size); return -1;
         }
         libcov_module_bases[m] = b;

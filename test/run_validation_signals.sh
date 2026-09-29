@@ -3,7 +3,11 @@
 #
 # Every mode of target_signals must behave exactly as it does without
 # libcov: same stdout, same exit status (realill must still die with
-# SIGILL), and the instrumented work() must record coverage.
+# SIGILL), and the instrumented work() must record coverage. That covers
+# the libc-alias modes (sigignore, sighold, bsd_signal, sysv_signal,
+# sigset, sigsuspend), the chained-handler mask, the handler-swap race and
+# post-init logging onto a reused fd. logsock runs a second time with
+# LIBCOV_LOG unset, so libcov logs to fd 2 and the target replaces fd 2.
 #
 # MT only, for LIBCOV_SYNC_FALLBACK=auto and =tgkill: the rt* modes, which
 # exercise the signal libcov_mt.so's sync broadcast owns (see
@@ -43,11 +47,16 @@ for th in st mt; do
     "$ROOT/tools/gen_patchlist.py" "$TARGET" "$LCV" --threading "$th" \
         --include-pat 'work$' >/dev/null 2>&1 \
         || { echo "FAIL: gen_patchlist ($th)"; fail=1; continue; }
-    for mode in block tblock probe siginfo realill; do
-        want_out=$("$TARGET" "$mode" 2>/dev/null); want_rc=$?
+    for mode in block tblock probe siginfo realill \
+                ignore hold bsd sysv sigset suspend mask race logsock logsock:stderr; do
+        # mode:stderr = same mode with LIBCOV_LOG unset (libcov logs to fd 2).
+        tmode=${mode%%:*}
+        logenv=LIBCOV_LOG=/dev/null
+        [[ $mode == *:stderr ]] && logenv=LIBCOV_LOG=
+        want_out=$("$TARGET" "$tmode" 2>/dev/null); want_rc=$?
         rm -f "$SHM"
-        got_out=$(LIBCOV_PATCHLIST="$LCV" LIBCOV_SHM_PATH="$SHM" LIBCOV_LOG=/dev/null \
-                  LD_PRELOAD="$LIB" "$TARGET" "$mode" 2>/dev/null); got_rc=$?
+        got_out=$(env LIBCOV_PATCHLIST="$LCV" LIBCOV_SHM_PATH="$SHM" "$logenv" \
+                  LD_PRELOAD="$LIB" "$TARGET" "$tmode" 2>/dev/null); got_rc=$?
         if [[ "$got_rc" != "$want_rc" || "$got_out" != "$want_out" ]]; then
             echo "FAIL: $th/$mode rc=$got_rc (want $want_rc) out=[$got_out] want=[$want_out]"
             fail=1; continue

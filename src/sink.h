@@ -90,6 +90,10 @@ int sink_init(const char *path, unsigned ring_size, size_t map_size);
  * pointers from the header's *_offset fields. */
 extern void  *libcov_shm_base;
 extern size_t libcov_shm_size;
+/* 1 if sink_init attached to this process's own region from before an
+ * in-place re-exec (contents, generations and ring kept), 0 if it created
+ * or reset the region. */
+extern int    libcov_shm_attached;
 
 extern uint8_t *libcov_bitmap;
 

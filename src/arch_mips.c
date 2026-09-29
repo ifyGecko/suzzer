@@ -20,6 +20,7 @@
 #include <string.h>
 #include "arch.h"
 #include "tunables_mips.h"
+#include "arch_mips_emulate.h"
 
 const char    *libcov_arch_name     = LIBCOV_ARCH_MIPS_NAME;
 const uint8_t  libcov_min_patch_len = LIBCOV_ARCH_MIPS_MIN_PATCH_LEN;
@@ -42,10 +43,12 @@ uintptr_t libcov_arch_pc_from_uctx(const ucontext_t *uc) {
     return (uintptr_t)uc->uc_mcontext.pc;
 }
 
-/* Marker emulation not implemented for this backend: markers use the
- * disarm + deferred re-arm protocol (see arch.h). */
+/* Marker emulation: markers are block-entry (prologue) instructions on
+ * MIPS, never branches; arch_mips_emulate.h performs the register-only
+ * ones. Others fall back to disarm + deferred re-arm (see arch.h). */
 int libcov_arch_emulate(ucontext_t *uc, uintptr_t addr,
                         const uint8_t *orig, uint8_t len) {
-    (void)uc; (void)addr; (void)orig; (void)len;
-    return 0;
+    (void)addr;
+    if (!uc) return mips_emulate(NULL, NULL, orig, len, 0);
+    return mips_emulate(uc->uc_mcontext.gregs, &uc->uc_mcontext.pc, orig, len, 0);
 }

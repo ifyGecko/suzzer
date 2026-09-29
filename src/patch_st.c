@@ -3,12 +3,28 @@
 #include "arch.h"
 #include "util.h"
 
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <errno.h>
 
 static long g_pagesize = 0;
+
+/* Patching mode (LIBCOV_ST_PATCH, decided once in patch_arm_all):
+ *
+ *   auto (default): make every page holding a patch site R|W|X once at
+ *     init; arm/disarm is then a plain store + cache flush. No syscalls
+ *     on the trap path (leapfrog used to cost ~4 mprotects per trap) and
+ *     no window where a code page is non-executable. If the kernel
+ *     refuses RWX (SELinux execmem, PaX MPROTECT, other W^X policies),
+ *     fall back to the per-write mode below.
+ *   mprotect: per write, R|W -> write -> R|X. Code pages are never
+ *     writable and executable at once.
+ *
+ * MT does the same RWX-once (patch_mt.c); it has no per-write fallback
+ * because that path isn't atomic for peer threads. */
+static int g_direct = 0;
 
 static void ensure_pagesize(void) {
     if (!g_pagesize) g_pagesize = sysconf(_SC_PAGESIZE);
@@ -29,22 +45,69 @@ int patch_validate(const struct patch_entry *e) {
     return memcmp((void *)e->addr, e->orig, e->len) == 0 ? 0 : -1;
 }
 
+/* Make every page that holds a patch site R|W|X, once (see g_direct).
+ * The table is sorted by address, so each distinct page range is
+ * mprotect'ed once. Returns 0 if every page succeeded. */
+static int make_sites_writable(void) {
+    size_t n;
+    struct patch_entry *t = config_table_mut(&n);
+    if (!t) return -1;
+    uintptr_t mask = ~((uintptr_t)g_pagesize - 1);
+    uintptr_t last_lo = 0, last_hi = 0;
+    for (size_t i = 0; i < n; i++) {
+        uintptr_t lo = t[i].addr & mask;
+        uintptr_t hi = (t[i].addr + t[i].len + (uintptr_t)g_pagesize - 1) & mask;
+        if (lo >= last_lo && hi <= last_hi) continue;
+        if (mprotect((void *)lo, hi - lo, PROT_READ | PROT_WRITE | PROT_EXEC) < 0) {
+            libcov_logf("patch: mprotect RWX 0x%lx: %s", (unsigned long)lo, strerror(errno));
+            return -1;
+        }
+        last_lo = lo; last_hi = hi;
+    }
+    return 0;
+}
+
+static void choose_mode(void) {
+    const char *m = getenv("LIBCOV_ST_PATCH");
+    if (m && !strcmp(m, "mprotect")) {
+        libcov_logf("patch: LIBCOV_ST_PATCH=mprotect; per-write mprotect patching");
+        return;
+    }
+    if (m && *m && strcmp(m, "auto") != 0)
+        libcov_logf("patch: unknown LIBCOV_ST_PATCH=%s; using auto", m);
+    if (make_sites_writable() == 0) {
+        g_direct = 1;
+        libcov_logf("patch: code pages R|W|X; direct-store patching");
+    } else {
+        /* Pages already made RWX go back to R|X on their first
+         * per-write patch; the rest never changed. */
+        libcov_logf("patch: code pages can't be made R|W|X (W^X policy?); "
+                    "falling back to per-write mprotect patching");
+    }
+}
+
+/* Write `len` bytes at a patch site, in whichever mode was chosen. */
+static int write_site(struct patch_entry *e, const void *bytes, int illegal) {
+    if (!g_direct &&
+        protect_range(e->addr, e->len, PROT_READ | PROT_WRITE) < 0) return -1;
+    if (illegal) libcov_arch_write_illegal((void *)e->addr, e->len);
+    else         memcpy((void *)e->addr, bytes, e->len);
+    if (!g_direct &&
+        protect_range(e->addr, e->len, PROT_READ | PROT_EXEC) < 0) return -1;
+    __builtin___clear_cache((char *)e->addr, (char *)e->addr + e->len);
+    return 0;
+}
+
 int patch_arm(struct patch_entry *e) {
     ensure_pagesize();
-    if (protect_range(e->addr, e->len, PROT_READ | PROT_WRITE) < 0) return -1;
-    libcov_arch_write_illegal((void *)e->addr, e->len);
-    if (protect_range(e->addr, e->len, PROT_READ | PROT_EXEC) < 0) return -1;
-    __builtin___clear_cache((char *)e->addr, (char *)e->addr + e->len);
+    if (write_site(e, NULL, 1) < 0) return -1;
     e->patched = 1;
     return 0;
 }
 
 int patch_disarm(struct patch_entry *e) {
     ensure_pagesize();
-    if (protect_range(e->addr, e->len, PROT_READ | PROT_WRITE) < 0) return -1;
-    memcpy((void *)e->addr, e->orig, e->len);
-    if (protect_range(e->addr, e->len, PROT_READ | PROT_EXEC) < 0) return -1;
-    __builtin___clear_cache((char *)e->addr, (char *)e->addr + e->len);
+    if (write_site(e, e->orig, 0) < 0) return -1;
     e->patched = 0;
     return 0;
 }
@@ -56,6 +119,9 @@ size_t patch_arm_all(void) {
 
     uintptr_t self_lo, self_hi;
     util_self_range(&self_lo, &self_hi);
+
+    ensure_pagesize();
+    choose_mode();
 
     size_t armed = 0, skipped = 0, validate_fail = 0;
     for (size_t i = 0; i < n; i++) {

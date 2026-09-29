@@ -25,11 +25,12 @@ Usage:
   ./gen_boundary.py <binary> <out.lcvb> SYM[:kind[:depth_filter]] ...
 
   kind         : "begin" (default) or "end"
-  depth_filter : "any" (default) or "zero"
+  depth_filter : "any" (default) or "zero". "zero" only means something
+                 with END markers (paired mode); a begin-only sidecar with
+                 it is refused unless --force.
 
 Example:
-  ./gen_boundary.py build/x86_64/target_loop /tmp/loop.lcvb \\
-      iter_begin:begin:zero
+  ./gen_boundary.py build/x86_64/target_loop /tmp/loop.lcvb iter_begin:begin
 """
 import argparse
 import json
@@ -81,7 +82,9 @@ def get_function_addrs(binary):
         if name:
             off = int(f["offset"])
             fns[name] = off
-            all_fns.append({"offset": off, "name": name})
+            all_fns.append({"offset": off, "name": name,
+                            "size": int(f.get("size") or 0),
+                            "maxbound": int(f.get("maxbound") or 0)})
     syms = {}
     for s in rizin_json(binary, ["isj"]) or []:
         name = s.get("name", "")
@@ -240,6 +243,9 @@ def main():
                     help="marker site selection; must match the patch list's "
                          "gen_patchlist.py --strategy (auto = arch default: "
                          "entry on MIPS, terminator elsewhere)")
+    ap.add_argument("--force", action="store_true",
+                    help="write a begin-only sidecar that uses depth_filter=zero "
+                         "anyway (it has no effect without END markers)")
     ap.add_argument("--verbose", "-v", action="store_true")
     args = ap.parse_args()
     patched = patchlist_offsets(args.patchlist) if args.patchlist else None
@@ -276,15 +282,23 @@ def main():
                   f"off=0x{offset:x} kind={kind} depth={depth}",
                   file=sys.stderr)
 
+    # Begin-only mode resets the depth after every fire, so a zero filter
+    # never filters anything: the spec almost certainly isn't what the user
+    # meant (e.g. a forgotten END marker). Checked before writing.
+    if not any(k == 1 for _, k, _ in records) and any(d for _, _, d in records):
+        msg = ("depth_filter=zero has no effect without END markers "
+               "(begin-only sidecar)")
+        if not args.force:
+            sys.exit(f"error: {msg}; drop ':zero', add an END marker, "
+                     f"or pass --force")
+        print(f"warning: {msg}", file=sys.stderr)
+
     with open(args.output, "wb") as f:
         f.write(b"LCVB")
         f.write(struct.pack("<III", 1, len(records), 0))  # version, count, flags
         for offset, kind, depth in records:
             f.write(struct.pack("<QBB6s", offset, kind, depth, b"\x00" * 6))
 
-    if not any(k == 1 for _, k, _ in records) and any(d for _, _, d in records):
-        print("warning: depth_filter=zero has no effect without END markers "
-              "(begin-only sidecar)", file=sys.stderr)
     print(f"wrote {len(records)} marker(s) to {args.output}", file=sys.stderr)
 
 

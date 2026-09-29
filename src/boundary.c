@@ -433,7 +433,13 @@ int boundary_init(void) {
      * so this is invisible to them. Legacy (no-boundary) users keep
      * the libcov_bitmap pointer at hdr->bitmap_offset from sink_init
      * -- this branch isn't taken when LIBCOV_BOUNDARY_LIST is unset. */
-    struct libcov_ring_slot_hdr *first_slot = slot_at(1);
+    /* After an in-place re-exec (libcov_shm_attached) the region kept
+     * its generations: the previous image was emitting into slot
+     * gen_current + 1, and the iteration it was in carries on here. */
+    uint64_t next_gen = 1;
+    if (libcov_shm_attached)
+        next_gen = __atomic_load_n(&g_hdr->gen_current, __ATOMIC_ACQUIRE) + 1;
+    struct libcov_ring_slot_hdr *first_slot = slot_at(next_gen);
     __atomic_store_n(&first_slot->slot_gen, (uint64_t)0, __ATOMIC_RELEASE);
     libcov_bitmap = slot_bitmap(first_slot);
 #endif
@@ -601,6 +607,7 @@ static void publish_copy(uint64_t gen, const uint8_t *src) {
      * newer data with older. */
     if (__atomic_load_n(&s->slot_gen, __ATOMIC_RELAXED) > gen) {
         slot_unlock(lock);
+        __atomic_add_fetch(&g_hdr->publish_dropped, 1u, __ATOMIC_RELAXED);
         return;
     }
     __atomic_store_n(&s->slot_gen, (uint64_t)0, __ATOMIC_RELAXED);

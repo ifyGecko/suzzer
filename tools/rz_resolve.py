@@ -9,9 +9,17 @@ previously each had its own resolver and, e.g., a bare `main` or a
 suffix-only name could land differently.
 
 `all_fns` is a list of dicts, each at least {"offset": int, "name": str}.
+Optional "size" / "maxbound" (from aflj) bound address lookups: an address
+past the end of the function below it is rejected instead of silently
+landing in whatever function happens to come last.
 """
 
 import sys
+
+
+class NotFound(ValueError):
+    """The token names no function (as opposed to an ambiguous name). Lets
+    multi-module callers try the next module."""
 
 
 def parse_int_maybe(tok):
@@ -60,10 +68,23 @@ def _resolve_name(token, all_fns):
     return None
 
 
+def _fn_end(f):
+    """Exclusive end of f's code, or None if aflj gave no size."""
+    ends = []
+    size = int(f.get("size") or 0)
+    if size > 0:
+        ends.append(int(f["offset"]) + size)
+    maxbound = int(f.get("maxbound") or 0)
+    if maxbound > int(f["offset"]):
+        ends.append(maxbound)   # split functions (.cold parts) reach further
+    return max(ends) if ends else None
+
+
 def _resolve_addr(addr, token, all_fns):
     """Return (offset, fn) for an address, resolving an in-function address
-    to the enclosing function's entry (with a stderr note). Raises ValueError
-    if the address is not within any known function."""
+    to the enclosing function's entry (with a stderr note). Raises NotFound
+    if the address is not within any known function -- below the first one,
+    or past the end of the one below it (when its size is known)."""
     for f in all_fns:
         if int(f["offset"]) == addr:
             return int(f["offset"]), f
@@ -74,11 +95,16 @@ def _resolve_addr(addr, token, all_fns):
         if o <= addr and (best is None or o > int(best["offset"])):
             best = f
     if best is not None:
+        end = _fn_end(best)
+        if end is not None and addr >= end:
+            raise NotFound(f"address {token} is not within any known function "
+                           f"(past the end of {best['name']}, "
+                           f"0x{int(best['offset']):x}-0x{end:x})")
         print(f"note: address 0x{addr:x} not a function entry; "
               f"using enclosing fn {best['name']} at 0x{int(best['offset']):x}",
               file=sys.stderr)
         return int(best["offset"]), best
-    raise ValueError(f"address {token} not within any known function")
+    raise NotFound(f"address {token} not within any known function")
 
 
 def resolve_to_offset(token, all_fns):
@@ -100,7 +126,8 @@ def resolve_to_offset(token, all_fns):
     That way a function literally named 'beef'/'cafe' resolves as a symbol;
     use a '0x' prefix to force the address reading.
 
-    Raises ValueError if unresolvable or if a suffix match is ambiguous.
+    Raises NotFound (a ValueError) if unresolvable, ValueError if a suffix
+    match is ambiguous.
     """
     s = token.strip()
     # Explicit address forms bind as addresses first.
@@ -118,4 +145,4 @@ def resolve_to_offset(token, all_fns):
     if addr is not None:
         return _resolve_addr(addr, token, all_fns)
 
-    raise ValueError(f"could not resolve '{token}' to any function")
+    raise NotFound(f"could not resolve '{token}' to any function")
