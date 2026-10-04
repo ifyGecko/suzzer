@@ -112,8 +112,25 @@ struct libcov_ring_slot_hdr {
     uint64_t slot_gen;        /* atomic: 0 = empty/in-progress; otherwise gen */
     uint64_t tid;
     uint64_t ns;              /* CLOCK_MONOTONIC at publish */
-    uint64_t flags;           /* reserved */
+    uint64_t flags;           /* LIBCOV_SLOT_FLAG_*: what the snapshot holds */
 };
+
+/* Ring slot flags: exactly one is set on every published slot (written
+ * before slot_gen is stamped, so a reader that validated the stamp sees
+ * them). A fuzzer that wants one snapshot per input keeps ITER slots.
+ *
+ *   INIT  coverage from startup to the first boundary (hdr->gen_init).
+ *   ITER  one iteration: in begin-only mode every later BEGIN publishes
+ *         the iteration it ends; in paired mode an END publishes the
+ *         BEGIN..END span (and a nested boundary, with depth_filter=any,
+ *         the segment since the previous one).
+ *   GAP   paired mode only: a BEGIN at depth 0 publishes what ran since the
+ *         previous END -- the harness between iterations, not an input.
+ *
+ * Slots from libcov builds before these flags existed carry 0. */
+#define LIBCOV_SLOT_FLAG_INIT (1u << 0)
+#define LIBCOV_SLOT_FLAG_ITER (1u << 1)
+#define LIBCOV_SLOT_FLAG_GAP  (1u << 2)
 /* followed by MAP_SIZE bytes of bitmap */
 
 /* ---- public API ------------------------------------------------------- */

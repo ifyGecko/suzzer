@@ -41,9 +41,21 @@ static uint64_t mono_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* Name of a slot's LIBCOV_SLOT_FLAG_* (boundary.h). */
+static const char *slot_kind(uint64_t flags) {
+    switch (flags) {
+    case LIBCOV_SLOT_FLAG_INIT: return "init";
+    case LIBCOV_SLOT_FLAG_ITER: return "iter";
+    case LIBCOV_SLOT_FLAG_GAP:  return "gap";
+    case 0:                     return "none";   /* pre-flags libcov */
+    default:                    return "?";
+    }
+}
+
 /* Seqlock read of one slot; same protocol as fuzz_driver.c::read_slot.
  * 0 = copied, 1 = not ready / torn (retry), -1 = overrun. */
-static int read_slot(void *base, uint64_t gen, uint8_t *out, uint64_t *tid) {
+static int read_slot(void *base, uint64_t gen, uint8_t *out, uint64_t *tid,
+                     uint64_t *flags) {
     struct libcov_shm_header *hdr = base;
     uint64_t now = __atomic_load_n(&hdr->gen_current, __ATOMIC_ACQUIRE);
     if (now < gen) return 1;
@@ -54,13 +66,16 @@ static int read_slot(void *base, uint64_t gen, uint8_t *out, uint64_t *tid) {
     if (__atomic_load_n(&s->slot_gen, __ATOMIC_ACQUIRE) != gen) return 1;
     memcpy(out, s + 1, hdr->map_size);
     *tid = s->tid;
+    *flags = s->flags;
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
     if (__atomic_load_n(&s->slot_gen, __ATOMIC_RELAXED) != gen) return 1;
     return 0;
 }
 
-static void dump(uint64_t gen, uint64_t tid, const uint8_t *map, size_t n) {
-    printf("gen=%lu tid=%lu idx=", (unsigned long)gen, (unsigned long)tid);
+static void dump(uint64_t gen, uint64_t tid, uint64_t flags, const uint8_t *map,
+                 size_t n) {
+    printf("gen=%lu tid=%lu kind=%s idx=", (unsigned long)gen, (unsigned long)tid,
+           slot_kind(flags));
     int first = 1;
     for (size_t i = 0; i < n; i++) {
         if (!map[i]) continue;
@@ -143,14 +158,15 @@ int main(int argc, char **argv) {
             sched_yield();
             continue;
         }
-        uint64_t tid = 0;
+        uint64_t tid = 0, flags = 0;
         int rc = 1;
         /* A publisher may have taken gen `next` but not stamped its slot
          * yet; give it up to 200 ms. */
         uint64_t deadline = mono_ns() + 200000000ull;
-        while ((rc = read_slot(base, next, buf, &tid)) == 1 && mono_ns() < deadline)
+        while ((rc = read_slot(base, next, buf, &tid, &flags)) == 1 &&
+               mono_ns() < deadline)
             sched_yield();
-        if (rc == 0)       { dump(next, tid, buf, map_size); published++; }
+        if (rc == 0)       { dump(next, tid, flags, buf, map_size); published++; }
         else if (rc == -1) { printf("OVERRUN gen=%lu\n", (unsigned long)next); overruns++; }
         else               { printf("MISSING gen=%lu\n", (unsigned long)next); missing++; }
         next++;

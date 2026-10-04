@@ -189,7 +189,7 @@ NATIVE_SUITES := run_validation run_validation_mt run_validation_boundary \
                  run_validation_generator_safety \
                  run_validation_o2pie run_validation_marker_emulation \
                  run_validation_reexec run_validation_modules \
-                 run_validation_patch_mode
+                 run_validation_patch_mode run_validation_paired
 
 test:
 ifneq ($(ARCH),$(shell uname -m))

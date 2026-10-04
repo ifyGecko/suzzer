@@ -317,6 +317,16 @@ the MT stress test fail against the pre-fix code.
   `aflj` extent (also in gen_boundary), and `--print-reachable` lists
   every module. `run_validation_multimod.sh` covers each case and runs
   a sliced two-module list end to end.
+- **Paired-mode semantics** (`boundary.c`/`.h`). A driver couldn't tell
+  an iteration from the END→BEGIN gap, both published as generations.
+  Decided: keep publishing both (nothing lost, an iteration without its
+  END isn't silently dropped) and tag every ring slot in its formerly
+  reserved `flags`: INIT, ITER or GAP. `fuzz_driver`/`ring_dump` print
+  the kind; README documents what each mode publishes. Paired mode had
+  no test at all: `run_validation_paired.sh` (new `target_paired`, ST
+  and MT) checks the kind sequence, that gaps hold only harness code
+  and that iterations vary with the input; `run_validation_boundary_mt.sh`
+  checks begin-only tagging under 2-8 workers.
 
 ---
 
@@ -351,11 +361,6 @@ the MT stress test fail against the pre-fix code.
   (`leave; ret`, `pop; ret`, a lone `ret`). A limit of the 2-byte UD2
   encoding; now documented in README. A generator-side mitigation would
   be patching the block's predecessor edge instead.
-- [ ] **Paired-mode semantics.** When both BEGIN and END fire, the gap
-  between iterations (END → next BEGIN) is published as its own
-  generation, so a driver sees two generations per input. Decide whether
-  a BEGIN in paired mode should only reset (not publish), and document
-  what drivers should expect.
 - [ ] **Leapfrog never records self-loops.** An A→A edge is never seen,
   because the current site is never re-armed by its own trap. A
   single-site hot loop counts once until some other site traps. Document

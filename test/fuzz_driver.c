@@ -68,11 +68,22 @@ static unsigned count_new(const uint8_t *cur, uint8_t *cumulative, size_t map_si
     return newly;
 }
 
+/* Name of a slot's LIBCOV_SLOT_FLAG_* (boundary.h). */
+static const char *slot_kind(uint64_t flags) {
+    switch (flags) {
+    case LIBCOV_SLOT_FLAG_INIT: return "init";
+    case LIBCOV_SLOT_FLAG_ITER: return "iter";
+    case LIBCOV_SLOT_FLAG_GAP:  return "gap";
+    case 0:                     return "none";   /* pre-flags libcov */
+    default:                    return "?";
+    }
+}
+
 /* Read a single slot with the seqlock pattern. Returns 0 on success
  * (target_gen's snapshot copied into out), 1 on torn read (retry),
  * -1 on overrun (writer advanced past our window), -2 on bad shm. */
 static int read_slot(void *shm_base, uint64_t target_gen, uint8_t *out,
-                     uint64_t *tid_out, uint64_t *ns_out) {
+                     uint64_t *tid_out, uint64_t *ns_out, uint64_t *flags_out) {
     volatile struct libcov_shm_header *hdr = shm_base;
     uint64_t gen_now = __atomic_load_n((uint64_t *)&hdr->gen_current,
                                        __ATOMIC_ACQUIRE);
@@ -89,6 +100,7 @@ static int read_slot(void *shm_base, uint64_t target_gen, uint8_t *out,
     memcpy(out, (uint8_t *)(s + 1), hdr->map_size);
     uint64_t tid = s->tid;
     uint64_t ns  = s->ns;
+    uint64_t fl  = s->flags;
 
     /* Seqlock reader: keep the memcpy loads above from being reordered
      * after the re-check (an acquire load only orders LATER accesses). */
@@ -98,11 +110,14 @@ static int read_slot(void *shm_base, uint64_t target_gen, uint8_t *out,
 
     if (tid_out) *tid_out = tid;
     if (ns_out)  *ns_out  = ns;
+    if (flags_out) *flags_out = fl;
     return 0;
 }
 
 /* Lost-coverage accounting, reported on exit. */
 static unsigned g_overruns, g_read_failures;
+/* Snapshots read, by kind (paired mode publishes a GAP between inputs). */
+static unsigned g_kind_init, g_kind_iter, g_kind_gap;
 static uint64_t g_lost_gens;
 
 static uint64_t wait_gen_advance(void *shm_base, uint64_t prev_gen,
@@ -128,11 +143,11 @@ static void drain_to(void *shm_base, uint64_t *prev_gen, uint64_t target_gen,
                      const char *label) {
     while (*prev_gen < target_gen) {
         uint64_t g = *prev_gen + 1;
-        uint64_t tid = 0, ns = 0;
+        uint64_t tid = 0, ns = 0, flags = 0;
         int attempts = 0;
         int rc;
         do {
-            rc = read_slot(shm_base, g, scratch, &tid, &ns);
+            rc = read_slot(shm_base, g, scratch, &tid, &ns, &flags);
             if (rc == 1) {
                 struct timespec sl = {0, 50000};
                 nanosleep(&sl, NULL);
@@ -171,9 +186,12 @@ static void drain_to(void *shm_base, uint64_t *prev_gen, uint64_t target_gen,
         unsigned hit = count_set(scratch, map_size);
         unsigned newly = count_new(scratch, cumulative, map_size);
         unsigned total = count_set(cumulative, map_size);
-        printf("gen=%-3lu (%s) tid=%lu ns=%lu hit=%u new=%u total=%u\n",
-               (unsigned long)g, label, (unsigned long)tid, (unsigned long)ns,
-               hit, newly, total);
+        if (flags == LIBCOV_SLOT_FLAG_INIT) g_kind_init++;
+        else if (flags == LIBCOV_SLOT_FLAG_ITER) g_kind_iter++;
+        else if (flags == LIBCOV_SLOT_FLAG_GAP) g_kind_gap++;
+        printf("gen=%-3lu (%s) kind=%s tid=%lu ns=%lu hit=%u new=%u total=%u\n",
+               (unsigned long)g, label, slot_kind(flags), (unsigned long)tid,
+               (unsigned long)ns, hit, newly, total);
         fflush(stdout);
         *prev_gen = g;
     }
@@ -356,13 +374,15 @@ int main(int argc, char **argv) {
     uint32_t dropped = __atomic_load_n((uint32_t *)&hdr->publish_dropped,
                                        __ATOMIC_ACQUIRE);
     printf("driver: target exited %d  total_edges=%u  consumed_gen=%lu  gen_init=%lu"
-           "  overruns=%u lost_gens=%lu read_failures=%u publish_dropped=%u\n",
+           "  overruns=%u lost_gens=%lu read_failures=%u publish_dropped=%u"
+           "  init=%u iter=%u gap=%u\n",
            WIFEXITED(st) ? WEXITSTATUS(st) : -WTERMSIG(st),
            count_set(cumulative, map_size),
            (unsigned long)consumed_gen,
            (unsigned long)__atomic_load_n((uint64_t *)&hdr->gen_init,
                                           __ATOMIC_ACQUIRE),
-           g_overruns, (unsigned long)g_lost_gens, g_read_failures, dropped);
+           g_overruns, (unsigned long)g_lost_gens, g_read_failures, dropped,
+           g_kind_init, g_kind_iter, g_kind_gap);
 
     free(scratch);
     free(cumulative);

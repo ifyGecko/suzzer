@@ -532,12 +532,12 @@ static void touched_drain(void) {
  * initialised inside the ring (see boundary_init below), so the
  * dedicated area goes unused under boundary mode. Drivers under
  * boundary mode read ring slots only -- that contract is unchanged. */
-static void publish_snapshot(uint64_t gen) {
+static void publish_snapshot(uint64_t gen, uint64_t flags) {
     struct libcov_ring_slot_hdr *s = slot_at(gen);
 
     s->tid   = cur_tid();
     s->ns    = now_ns();
-    s->flags = 0;
+    s->flags = flags;
 
     /* Stamp the slot with our gen as the final visibility signal. The
      * slot's bitmap data IS what writers have been emitting into all
@@ -597,7 +597,7 @@ static inline void slot_unlock(uint8_t *l) {
  * the shared bitmap for the init snapshot (a best-effort copy while peers
  * may still be emitting). Costs one map_size memcpy per iteration -- the
  * price of per-thread attribution; ST keeps the zero-copy pointer swap. */
-static void publish_copy(uint64_t gen, const uint8_t *src) {
+static void publish_copy(uint64_t gen, const uint8_t *src, uint64_t flags) {
     struct libcov_ring_slot_hdr *s = slot_at(gen);
     uint8_t *lock = &g_slot_lock[gen % g_ring_size];
 
@@ -614,7 +614,7 @@ static void publish_copy(uint64_t gen, const uint8_t *src) {
     __atomic_thread_fence(__ATOMIC_RELEASE);   /* see publish_snapshot */
     s->tid   = cur_tid();
     s->ns    = now_ns();
-    s->flags = 0;
+    s->flags = flags;
     memcpy(slot_bitmap(s), src, libcov_map_size);
     __atomic_store_n(&s->slot_gen, gen, __ATOMIC_RELEASE);
     slot_unlock(lock);
@@ -706,12 +706,13 @@ static void release_held_marker(struct patch_entry *cur) {
     __atomic_sub_fetch(&m->holders, 1, __ATOMIC_RELEASE);
 }
 
-static void maybe_record_init(uint64_t gen) {
+/* Returns 1 if `gen` became the init snapshot. */
+static int maybe_record_init(uint64_t gen) {
     /* If gen_init is still 0 the first time any thread hits a boundary,
      * stamp it. Use a one-shot CAS so the first writer wins. */
     uint64_t expected = 0;
-    __atomic_compare_exchange_n(&g_hdr->gen_init, &expected, gen,
-                                0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    return __atomic_compare_exchange_n(&g_hdr->gen_init, &expected, gen,
+                                       0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
 }
 
 void boundary_on_trap(uintptr_t pc, struct patch_entry *e) {
@@ -741,10 +742,15 @@ void boundary_on_trap(uintptr_t pc, struct patch_entry *e) {
      *     to 0 after each fire. Every BEGIN hit fires; depth_filter has no
      *     effect because we never see ENDs to balance the tree. */
     int is_boundary = 0;
+    /* What the snapshot holds (LIBCOV_SLOT_FLAG_*, boundary.h). A paired
+     * BEGIN at depth 0 closes the gap since the previous END; the first
+     * publish in the process is INIT whatever fired it. */
+    uint64_t kind = LIBCOV_SLOT_FLAG_ITER;
     if (m->kind == LIBCOV_BOUNDARY_KIND_BEGIN) {
         if (g_paired_mode) {
             uint32_t prev = g_depth++;
             if (!m->depth_filter || prev == 0) is_boundary = 1;
+            if (prev == 0) kind = LIBCOV_SLOT_FLAG_GAP;
         } else {
             is_boundary = 1;
         }
@@ -780,18 +786,17 @@ void boundary_on_trap(uintptr_t pc, struct patch_entry *e) {
             uint64_t gen = __atomic_add_fetch(&g_hdr->gen_current, 1,
                                               __ATOMIC_ACQ_REL);
             maybe_record_init(gen);
-            publish_copy(gen, libcov_bitmap);
+            publish_copy(gen, libcov_bitmap, LIBCOV_SLOT_FLAG_INIT);
         }
     } else {
         uint64_t gen = __atomic_add_fetch(&g_hdr->gen_current, 1, __ATOMIC_ACQ_REL);
-        publish_copy(gen, libcov_thread_bitmap);
+        publish_copy(gen, libcov_thread_bitmap, kind);
         memset(libcov_thread_bitmap, 0, libcov_map_size);
     }
     memset(libcov_prev_loc, 0, sizeof libcov_prev_loc);
 #else
     uint64_t gen = __atomic_add_fetch(&g_hdr->gen_current, 1, __ATOMIC_ACQ_REL);
-    maybe_record_init(gen);
-    publish_snapshot(gen);
+    publish_snapshot(gen, maybe_record_init(gen) ? LIBCOV_SLOT_FLAG_INIT : kind);
 #endif
     apply_rearm_policy(e);
 

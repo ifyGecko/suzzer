@@ -374,8 +374,17 @@ ring_offset                  RING * slot_stride        (per-iter snapshots)
 ```
 
 Each ring slot is preceded by a 32-byte header carrying `slot_gen`,
-`tid`, and a publish timestamp. Drivers read snapshots via a seqlock
-pattern:
+`tid`, a publish timestamp and `flags`, which say what the snapshot
+holds (exactly one bit is set; see "Marker semantics"):
+
+| Flag | Value | Snapshot |
+|---|---|---|
+| `LIBCOV_SLOT_FLAG_INIT` | 1 | startup up to the first boundary (`gen_init`) |
+| `LIBCOV_SLOT_FLAG_ITER` | 2 | one iteration (one input) |
+| `LIBCOV_SLOT_FLAG_GAP` | 4 | paired mode: the harness code between an `END` and the next `BEGIN` |
+
+A fuzzer that wants one snapshot per input keeps the `ITER` slots.
+Drivers read snapshots via a seqlock pattern:
 
 1. Read `hdr->gen_current` with acquire ordering -- this is the highest
    completed iteration.
@@ -413,6 +422,24 @@ Two modes inferred from the sidecar contents:
   is tracked per-iteration; `depth_filter=zero` markers fire only at
   depth 0 (skipping recursive sub-calls). Useful for nested request
   handlers.
+
+What each boundary publishes, as tagged in the slot `flags`:
+
+- The first boundary in the process publishes the startup coverage:
+  `INIT`.
+- Begin-only: every later `BEGIN` publishes the iteration it ends:
+  `ITER`. So N inputs give INIT + N ITER; in `fuzz_driver`'s stdin loop
+  the last one arrives at EOF, when the loop's final `BEGIN` fires.
+- Paired: an `END` publishes the `BEGIN..END` span: `ITER`. A `BEGIN`
+  at depth 0 publishes what ran since the previous `END` (reading the
+  next input, logging, bookkeeping): `GAP`. So N inputs give INIT, then
+  ITER and GAP alternating, N of each. A `GAP` is coverage too (nothing
+  is dropped) but belongs to no input; skip it to score inputs. With
+  `depth_filter=any`, a nested boundary publishes the segment since the
+  previous one as `ITER`.
+
+`fuzz_driver` and `ring_dump` print each snapshot's kind
+(`kind=init|iter|gap`), and `fuzz_driver`'s exit summary counts them.
 
 For begin-only markers, the marker function's body must include
 something that produces a multi-byte branch instruction (>= the arch's

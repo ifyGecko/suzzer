@@ -89,15 +89,21 @@ tol, iters, frac4, frac_emu = int(tol), int(iters), float(frac4), float(frac_emu
 a_path, b_path = f"{work}/a.out", f"{work}/b.out"
 
 def load(path):
-    gens, init = [], 0
+    gens, kinds, init = [], {}, 0
     for line in open(path):
-        m = re.match(r"gen=(\d+) tid=(\d+) idx=(.*)$", line)
+        m = re.match(r"gen=(\d+) tid=(\d+) kind=(\w+) idx=(.*)$", line)
         if m:
-            idx = set(int(x) for x in m.group(3).split(",") if x)
+            idx = set(int(x) for x in m.group(4).split(",") if x)
             gens.append((int(m.group(1)), int(m.group(2)), idx))
+            kinds[int(m.group(1))] = m.group(3)
         m = re.search(r"gen_init=(\d+)", line)
         if m:
             init = int(m.group(1))
+    # Slot kinds (begin-only sidecar): the init snapshot is tagged init,
+    # every other one iter.
+    for g, k in kinds.items():
+        if k != ("init" if g == init else "iter"):
+            sys.exit(f"FAIL {path}: gen {g} tagged {k} (gen_init={init})")
     # Drop the init snapshot: it holds pre-boundary (startup) coverage
     # from every thread by design.
     return [g for g in gens if g[0] != init]
