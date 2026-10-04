@@ -7,8 +7,10 @@
 # Two threading variants are built as separate LEGO bricks:
 #   THREADING=st (default) -- single-threaded, low overhead, the original PoC.
 #   THREADING=mt           -- multi-threaded safe: TLS prev_loc, atomic bitmap,
-#                              atomic per-site state machine,
-#                              /proc/self/mem writes + membarrier(SYNC_CORE).
+#                              per-site spinlock, code pages R|W|X once +
+#                              single-copy-atomic store (/proc/self/mem only
+#                              as W^X fallback), clear_cache +
+#                              membarrier(SYNC_CORE) or signal-broadcast sync.
 #
 # Usage:
 #   make                                 -- native ST build
@@ -20,11 +22,12 @@
 #
 # Output (one .so per (ARCH, THREADING) combo):
 #   build/<arch>/libcov_<threading>.so
-#   build/<arch>/target_simple
-#   build/<arch>/fuzz_driver
+#   build/<arch>/{target_simple,target_loop,target_orderable,target_dispatch,
+#                 target_markers,fuzz_driver}
 #
-# target_simple_mt (pthread stress) is built on demand by the MT validation
-# scripts via `make -C test target_simple_mt`.
+# Other test targets (mt: target_simple_mt/target_loop_mt/ring_dump;
+# multimod; o2pie; thumb; demalloc) are built by `make test` or explicitly
+# via `make -C test <goal> ARCH=.. CROSS=.. BUILD=..`.
 
 ifeq ($(ARCH),)
 ARCH := $(shell uname -m)
@@ -36,8 +39,7 @@ $(error THREADING must be 'st' or 'mt', got '$(THREADING)')
 endif
 
 # Map ARCH to backend source + cross-compiler prefix.
-# Backend source: src/arch_<BACKEND>.c (ST) or src/arch_<BACKEND>_mt.c (MT
-# if an arch-specific MT variant exists; else the same ST source).
+# Backend source: src/arch_<BACKEND>.c, the same file for ST and MT.
 ifeq ($(ARCH),x86_64)
   BACKEND := x86_64
   CROSS   :=
@@ -111,10 +113,9 @@ ifeq ($(THREADING),mt)
   HANDLER_SRC := src/handler_mt.c
   EXTRA_SRC   := src/membarrier.c
   ARCH_SRC    := src/arch_$(BACKEND).c
-  # The arch backend handles ST/MT differences internally via
-  # #ifdef LIBCOV_THREADING_MT (e.g. arch_x86_64.c writes UD2 head-only
-  # in MT, UD2+NOPs in ST). For fixed-width arches the natural 2- or
-  # 4-byte write is already single-copy-atomic, so no #ifdef is needed.
+  # The arch backend is the same source for ST and MT: x86_64 writes a
+  # 2-byte UD2 head in both, and fixed-width arches write one naturally
+  # aligned 2- or 4-byte word, which is already single-copy-atomic.
   #
   # MT prev_loc uses __thread; pthreads linkage is required because libc
   # only allocates the static TLS area when the binary or any DSO it loads
@@ -189,7 +190,8 @@ NATIVE_SUITES := run_validation run_validation_mt run_validation_boundary \
                  run_validation_generator_safety \
                  run_validation_o2pie run_validation_marker_emulation \
                  run_validation_reexec run_validation_modules \
-                 run_validation_patch_mode run_validation_paired
+                 run_validation_patch_mode run_validation_paired \
+                 run_validation_docs
 
 test:
 ifneq ($(ARCH),$(shell uname -m))

@@ -1,8 +1,8 @@
 /*
  * target_simple_mt.c -- pthread stress target for libcov MT validation.
  *
- * Reuses the noinline classify/loop_sum/cmdline helpers from target_simple
- * but runs them concurrently across N worker threads, each iterating their
+ * Has its own copies of target_simple-style noinline classify/loop_sum/
+ * cmdline helpers and runs them concurrently across N worker threads, each iterating their
  * own input the requested number of times. Designed to maximize the
  * probability of two threads hitting the same patched site simultaneously.
  *
@@ -11,7 +11,9 @@
  *
  * If the input list is shorter than <threads>, threads wrap around.
  *
- * Build with -no-pie -O0 so addresses match what target_simple uses.
+ * Built -no-pie -O0 like the other test targets. Patch lists for it must
+ * also --root the `worker` thread function: it is reached only through
+ * pthread_create's function pointer.
  */
 #include <stdio.h>
 #include <stdlib.h>

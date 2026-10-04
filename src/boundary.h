@@ -59,11 +59,12 @@ struct lcvb_record {
  *
  *   offset                       contents
  *   0                            struct libcov_shm_header (72 B after alignment)
- *   bitmap_offset                live bitmap, MAP_SIZE bytes
+ *   bitmap_offset                live bitmap, map_size bytes
  *   ring_offset                  RING slots; each slot is slot_stride bytes
  *
  * Driver reads gen_current with acquire ordering, picks slot
- * ring[(gen_current - 1) % ring_size], verifies slot_gen pre- and
+ * ring[gen % ring_size] for the generation it wants (readable while
+ * gen_current - gen < ring_size), and verifies slot_gen == gen pre- and
  * post-memcpy to detect torn reads. */
 
 #define LIBCOV_SHM_MAGIC        "LCVS"
@@ -84,7 +85,8 @@ struct libcov_shm_header {
     uint32_t map_size;
     uint32_t slot_stride;     /* bytes per ring slot (slot hdr + bitmap) */
     uint32_t flags;
-    uint64_t gen_current;     /* atomic: last fully-published gen */
+    uint64_t gen_current;     /* atomic: highest gen assigned; its slot may
+                               * not be stamped yet (readers check slot_gen) */
     uint64_t gen_init;        /* gen when init snapshot was captured (0 = none) */
     uint64_t bitmap_offset;   /* shm-base relative */
     uint64_t ring_offset;     /* shm-base relative */
@@ -140,6 +142,12 @@ enum libcov_rearm_policy {
     LIBCOV_REARM_ALL     = 1,
     LIBCOV_REARM_TOUCHED = 2,
 };
+
+/* Parse a LIBCOV_BOUNDARY_REARM value. Unset, empty, "none" and any
+ * unrecognised value mean LIBCOV_REARM_NONE (boundary_init logs a warning
+ * for the unrecognised case). libcov.c's oneshot+REARM=none refusal uses
+ * this too, so both agree on what "none" means. */
+enum libcov_rearm_policy boundary_parse_rearm(const char *s);
 
 /* Parse env vars and load the sidecar. Returns 1 if boundaries are active,
  * 0 if LIBCOV_BOUNDARY_LIST is unset (inert), -1 on error.

@@ -6,12 +6,11 @@
  * the tail is decoded, and disarm restores the 2-byte head so the
  * original instruction is intact when execution resumes.
  *
- * In MT this is also the only encoding that satisfies the single-copy-
- * atomic store contract from Intel SDM Vol 3 Sec 8.1.1 -- a naturally
- * aligned 2-byte store is atomic; longer stores are not. The generator's
- * --threading mt mode also skips sites that would straddle a 64-byte
- * cache line, where even 2-byte atomicity is not architecturally
- * guaranteed.
+ * In MT this is also what satisfies the single-copy-atomic store
+ * contract (Intel SDM Vol 3 Sec 8.1.1): a 2-byte store is atomic when
+ * aligned or, P6 onward, when it doesn't cross a cache line. patch_mt.c
+ * and the generator's --threading mt mode accept any site whose 2 bytes
+ * stay within one 64-byte line.
  *
  * All tunable values come from src/tunables_x86_64.h -- edit there or
  * pass -D flags.
@@ -25,10 +24,9 @@ const char    *libcov_arch_name     = LIBCOV_ARCH_X86_64_NAME;
 const uint8_t  libcov_min_patch_len = LIBCOV_ARCH_X86_64_MIN_PATCH_LEN;
 const uint8_t  libcov_max_patch_len = LIBCOV_ARCH_X86_64_MAX_PATCH_LEN;
 
-/* Pre-baked trap pattern in .rodata. Used by patch_mt.c (and ST, which
- * delegates to libcov_arch_write_illegal anyway) so the hot-path pwrite
- * can dereference a constant address instead of staging UD2 onto a
- * caller-supplied scratch buffer every arm/disarm. */
+/* Pre-baked trap pattern in .rodata. patch_mt.c stores it straight from
+ * here (libcov_arch_illegal_bytes); ST and the init self-test use it
+ * too. */
 static const unsigned char k_illegal[2] = {
     (unsigned char)LIBCOV_ARCH_X86_64_ILLEGAL_BYTE0,
     (unsigned char)LIBCOV_ARCH_X86_64_ILLEGAL_BYTE1,

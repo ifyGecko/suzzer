@@ -3,9 +3,10 @@
  *
  * Differences from patch_st.c:
  *
- *  (1) Per-entry atomic state machine on `e->patched` via cmpxchg, so
- *      concurrent arm/disarm requests on the same site serialize cleanly:
- *      only the winner does the byte-write; the loser no-ops.
+ *  (1) Per-entry spinlock (`e->lock`, cmpxchg 0->1) around the check of
+ *      `e->patched` and the write, so concurrent arm/disarm requests on
+ *      the same site serialize cleanly: only the first does the
+ *      byte-write; the next sees the new state and no-ops.
  *
  *  (2) Writes are a single naturally-sized atomic store. At init every
  *      page holding a patch site is mprotect'ed R|W|X once (never
@@ -195,9 +196,6 @@ static inline void fallback_unlock(void) {
     __atomic_store_n(&g_fallback_lock, 0, __ATOMIC_RELEASE);
 }
 
-/* Single write of `len` bytes at `addr`. The byte sequence is staged in a
- * caller-provided buffer first so the arch backend's write_illegal can
- * still target a normal pointer. Returns 0 on success. */
 /* x86 cache-line size used for the unaligned-store atomicity rule. 64 on
  * every x86_64 part; the generator uses the same constant. */
 #define LIBCOV_X86_CACHE_LINE 64
@@ -302,7 +300,7 @@ int patch_arm_unsynced(struct patch_entry *e) {
     entry_lock(e);
     int rv = 0;
     if (!e->patched) {
-        /* A3: pwrite straight out of .rodata-backed trap pattern, no stack
+        /* A3: write straight from the .rodata trap pattern, no stack
          * staging via libcov_arch_write_illegal(). */
         if (patch_write_inner(e, libcov_arch_illegal_bytes(e->len)) == 0) {
             e->patched = 1;
@@ -411,8 +409,8 @@ struct pc_cache_slot {
 static __thread struct pc_cache_slot g_pc_cache[LIBCOV_PC_CACHE_SIZE];
 
 static inline unsigned pc_cache_idx(uintptr_t pc) {
-    /* Fibonacci hash. Top LIBCOV_PC_CACHE_SIZE_LOG2 bits of the multiply
-     * give a low-collision distribution across the address space. */
+    /* Fibonacci hash. The top 4 bits (log2 LIBCOV_PC_CACHE_SIZE) of the
+     * multiply give a low-collision distribution across the address space. */
     return (unsigned)((pc * 0x9E3779B97F4A7C15ULL) >> 60) & LIBCOV_PC_CACHE_MASK;
 }
 
@@ -448,27 +446,4 @@ struct patch_entry *patch_lookup(uintptr_t addr) {
         else                     hi = mid;
     }
     return NULL;
-}
-
-size_t patch_rearm_set(struct patch_entry **set, size_t n) {
-    size_t armed = 0;
-    for (size_t i = 0; i < n; i++) {
-        struct patch_entry *e = set[i];
-        if (!e) continue;
-        if (__atomic_load_n(&e->patched, __ATOMIC_RELAXED)) continue;
-        if (patch_arm(e) == 0) armed++;
-    }
-    return armed;
-}
-
-size_t patch_rearm_all_disarmed(void) {
-    size_t n;
-    struct patch_entry *t = config_table_mut(&n);
-    if (!t) return 0;
-    size_t armed = 0;
-    for (size_t i = 0; i < n; i++) {
-        if (__atomic_load_n(&t[i].patched, __ATOMIC_RELAXED)) continue;
-        if (patch_arm(&t[i]) == 0) armed++;
-    }
-    return armed;
 }

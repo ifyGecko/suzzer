@@ -138,11 +138,6 @@ Files / cross-references
                                             file alongside gen_*.
   /home/user/suzzer/Design.md            -- tools/ section in repo
                                             layout.
-  /home/user/suzzer/fuzz_telnetd/DESIGN.md
-                                         -- section 3.4 (current
-                                            telnetd mutator design)
-                                            and section 6 item 3
-                                            (mutator brick realized).
 
 Vendor-friendliness
 -------------------

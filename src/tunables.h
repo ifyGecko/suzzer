@@ -46,8 +46,9 @@
 /* ------------------------------------------------------------------ */
 
 /* LIBCOV_MAP_SIZE_POW2
- *   log2 of the coverage bitmap byte length. The bitmap is
- *   (1 << LIBCOV_MAP_SIZE_POW2) bytes.
+ *   log2 of the coverage bitmap byte length under the legacy hashed-PC
+ *   model (LIBCOV_COVERAGE_MODEL_SITE=0) only; the default site-id model
+ *   auto-sizes the map from the patch count (LIBCOV_MAP_FUDGE below).
  *
  *   Default 16 (= 64 KiB). Matches AFL/AFL++ default; tooling that reads
  *   the bitmap usually assumes 64 KiB unless told otherwise via the
@@ -97,7 +98,7 @@
  *     map_size = next_pow2(n_sites * LIBCOV_MAP_FUDGE), clamped.
  *   The extra slots above n_sites give the N-gram fold room to spread so
  *   distinct (cur, history) tuples collide less. Only consulted when
- *   LIBCOV_COVERAGE_MODEL_SITE=1. Default 16 (grounded for N=3 in IDEAS.md).
+ *   LIBCOV_COVERAGE_MODEL_SITE=1. Default 16 (headroom for N=3 folds).
  *   For pure block coverage (N=1) the fudge only wastes (harmless) memory --
  *   a smaller value such as 2 is sufficient there.
  *
@@ -130,13 +131,16 @@
  *   sink_emit(). Sets the "shape" of coverage collection without
  *   touching the bitmap layout (size, hash, saturation, atomics).
  *
- *     N=1   block coverage  -- idx = hash(pc); prev-PC window unused.
+ *   cur = site_id (default site-id model) or hash(pc) (legacy model).
+ *
+ *     N=1   block coverage  -- idx = cur; prev-PC window unused.
  *                              Cheapest. Bucket means "block was hit".
- *     N=2   AFL-style edges -- idx = (hash(pc) ^ prev[0]) & MASK.
+ *     N=2   edges           -- idx = (cur ^ prev[0]) & MASK.
  *                              Default. Bit-for-bit identical to the
- *                              historical libcov emit path. Bucket
- *                              means "edge prev->cur was taken".
- *     N>=3  N-gram coverage -- idx = hash(pc) ^ prev[0] ^ ... ^ prev[N-2].
+ *                              historical libcov emit only under the
+ *                              legacy model. Bucket means "edge
+ *                              prev->cur was taken".
+ *     N>=3  N-gram coverage -- idx = cur ^ prev[0] ^ ... ^ prev[N-2].
  *                              Bucket means "the last N control
  *                              transfers in this thread were this exact
  *                              tuple". More context, more sensitive to

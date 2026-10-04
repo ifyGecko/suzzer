@@ -108,7 +108,8 @@ build_variant() {
 # so there is 4 bytes of padding between flags (u32 at [16:20]) and
 # gen_current (u64 needs 8-byte alignment, lands at [24:32]). Total
 # header size is 72 bytes after alignment. Fields after gen_current
-# follow naturally at offsets 32/40/48; reserved[16] at 56..72.
+# follow naturally at offsets 32/40/48; publish_dropped/owner_pid/
+# owner_start at 56/60/64, reserved[4] at 68..72.
 stats_from_shm() {
     python3 - "$1" <<'PYEOF'
 import struct, sys, os

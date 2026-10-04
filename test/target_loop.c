@@ -12,18 +12,21 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Iteration boundary marker. The body is shaped so the first basic block
- * ends in a multi-byte branch instruction -- gen_patchlist.py skips
- * 1-byte BB terminators (some arches' returns are short), so a straight-
- * line function ending in `ret` alone would never be patched and the
- * boundary would never fire. The runtime-impossible branch forces a
- * conditional jump that *is* patchable. The __builtin_trap() only gives
- * the impossible side a body the compiler keeps; it never executes (on
- * several arches it would be a SIGTRAP instruction, which libcov never
- * uses -- tests that need a real illegal instruction use test/sigill.h).
- * The boundary trap fires before the branch executes; once the handler
- * restores the bytes, the branch is taken to the unreachable side or
- * not, exactly as the original program would. */
+/* Iteration boundary marker. gen_boundary.py puts the marker where
+ * gen_patchlist.py would put this function's first-block site (a
+ * mid-block call if any, else the last instruction of >= 2 bytes). A
+ * body that compiled to a lone 1-byte `ret` would get no site at all.
+ * The runtime-impossible branch guarantees a 2-byte conditional jump
+ * there, which the branch-emulating backends execute in software
+ * (libcov_arch_emulate), so the marker stays armed. (MIPS markers sit on
+ * the entry instruction instead; see gen_boundary.py.) The
+ * __builtin_trap() only gives the impossible side a body the compiler
+ * keeps; it never executes (on several arches it would be a SIGTRAP
+ * instruction, which libcov never uses -- tests that need a real illegal
+ * instruction use test/sigill.h).
+ * The boundary trap fires before the branch executes; the handler then
+ * emulates it (or, with LIBCOV_BOUNDARY_EMULATE=0, restores the bytes),
+ * so the branch goes exactly the way the original program's would. */
 __attribute__((noinline, used)) void iter_begin(unsigned iter) {
     if (iter == 0xffffffffu) {
         __builtin_trap();

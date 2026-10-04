@@ -5,7 +5,8 @@
  * LIBCOV_THREADING_MT. This header switches the inline emit body and the
  * type of the prev-PC window accordingly:
  *
- *   ST: a single uint16_t window global; bitmap byte incremented directly.
+ *   ST: a global uint32_t window (libcov_prev_loc[LIBCOV_NGRAM_WIN]);
+ *       bitmap byte incremented directly (saturating at 255).
  *   MT: a per-thread (__thread) window; bitmap byte incremented via an
  *       atomic CAS loop that saturates at 255 without ever decrementing.
  *
@@ -14,9 +15,12 @@
  *
  * Coverage scheme (LIBCOV_NGRAM_N in tunables.h):
  *
- *   N=1   block coverage: idx = hash(pc). Window unused.
- *   N=2   AFL-style edges: idx = hash(pc) ^ prev[0]. Default; bit-for-bit
- *         identical to the historical libcov emit.
+ *   cur is site_id under the default site-id model, hash(pc) under the
+ *   legacy hashed-PC model (LIBCOV_COVERAGE_MODEL_SITE=0).
+ *
+ *   N=1   block coverage: idx = cur. Window unused.
+ *   N=2   edges: idx = cur ^ prev[0]. Default; bit-for-bit identical to
+ *         the historical libcov emit only under the hashed-PC model.
  *   N>=3  N-gram coverage: idx XORs in prev[0..N-2], encoding the last
  *         N control transfers in this thread. Bitmap layout (size, hash,
  *         saturation, atomics) is unchanged regardless of N.
@@ -29,7 +33,7 @@
  * Shm layout (created by sink_init):
  *
  *   offset 0                   struct libcov_shm_header (see boundary.h)
- *   offset bitmap_offset       live bitmap, LIBCOV_MAP_SIZE bytes
+ *   offset bitmap_offset       live bitmap, map_size bytes (hdr->map_size)
  *   offset ring_offset         RING slots, each slot_stride bytes
  *
  * The header is always present; the ring stays unused (zeroed, SHM_FLAG_ACTIVE
@@ -124,9 +128,9 @@ extern __thread uint8_t *libcov_thread_bitmap;
  * randomize_va_space=0 (which used to be common in fuzz farms) and
  * surfaces immediately on the default Linux setting (= 2).
  *
- * Slot 0 of libcov_module_bases is always the primary module (the first
- * --module argument to gen_patchlist.py); slots 1..N are auxiliary
- * libraries in declaration order. Slots >= module_count are 0. A 0 base
+ * Slot 0 of libcov_module_bases is the positional binary given to
+ * gen_patchlist.py (normally the main executable); slots 1..N are the
+ * --module libraries in command-line order. Slots >= module_count are 0. A 0 base
  * for a referenced slot means config_load couldn't resolve the module
  * and refused to finish loading, so this state never reaches the
  * handler. */

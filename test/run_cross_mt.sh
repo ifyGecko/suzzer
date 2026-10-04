@@ -34,19 +34,16 @@
 #         with SIGSEGV inside qemu's emulator.
 #
 #     On real hardware neither of these is a problem: the CPU re-fetches
-#     after the pwrite, membarrier(SYNC_CORE) flushes the I-pipeline on
+#     after the atomic store, membarrier(SYNC_CORE) flushes the I-pipeline on
 #     other cores, and there is no TCG layer to invalidate. MT correctness
 #     for these arches is therefore established by:
-#       (a) the build-and-load smoke test below,
+#       (a) build + link + patch-list generation below,
 #       (b) the per-arch atomic-write argument documented in patch_mt.c,
 #       (c) real-hardware testing -- see TODO.md for the real-hardware
 #           validation backlog item.
 #
-#     The smoke test runs target_simple_mt with ONE pthread for a tiny
-#     workload, just enough to confirm libcov_mt initializes and tears
-#     down cleanly under qemu. That covers the build, link, dlopen, and
-#     patch_arm_all paths without exercising the multi-thread re-arm race
-#     that qemu can't model.
+#     Nothing is run for these arches (qemu can't model the re-arm path
+#     at all), so libcov_mt's init path is not exercised there either.
 
 set -uo pipefail
 
@@ -196,7 +193,7 @@ print(c, th)")
         # qemu-user for these arches. Running target_simple_mt with
         # libcov_mt loaded would infinite-loop on the first trap because
         # qemu's TCG cache keeps replaying the cached trap translation
-        # after we pwrite the original bytes back -- the only way to
+        # after we store the original bytes back -- the only way to
         # invalidate TCG is mprotect with a perm change, which strips X
         # and SIGSEGVs peer guest fetches. On real hardware the CPU
         # naturally re-fetches and there is no TCG layer.

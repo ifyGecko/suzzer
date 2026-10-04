@@ -313,7 +313,7 @@ static int fd_is_eventfd(int fd) {
     return strcmp(target, "anon_inode:[eventfd]") == 0;
 }
 
-static enum libcov_rearm_policy parse_rearm(const char *s) {
+enum libcov_rearm_policy boundary_parse_rearm(const char *s) {
     if (!s || !*s)         return LIBCOV_REARM_NONE;
     if (!strcmp(s, "all"))     return LIBCOV_REARM_ALL;
     if (!strcmp(s, "touched")) return LIBCOV_REARM_TOUCHED;
@@ -345,7 +345,12 @@ int boundary_init(void) {
         return 0;
     }
 
-    g_rearm = parse_rearm(getenv("LIBCOV_BOUNDARY_REARM"));
+    const char *rearm_env = getenv("LIBCOV_BOUNDARY_REARM");
+    g_rearm = boundary_parse_rearm(rearm_env);
+    if (rearm_env && *rearm_env && g_rearm == LIBCOV_REARM_NONE &&
+        strcmp(rearm_env, "none") != 0)
+        libcov_logf("boundary: WARNING: unknown LIBCOV_BOUNDARY_REARM='%s', "
+                    "using none (valid: none, touched, all)", rearm_env);
 
     const char *grace_str = getenv("LIBCOV_BOUNDARY_INIT_GRACE");
     if (grace_str && *grace_str) g_init_grace_initial = (uint32_t)atoi(grace_str);
@@ -566,12 +571,9 @@ static void publish_snapshot(uint64_t gen, uint64_t flags) {
     memset(libcov_bitmap, 0, libcov_map_size);
 
     /* Clear the whole prev-PC window (N-gram coverage uses the last
-     * N-1 PCs as context; AFL-style at N=2 reduces to a single
-     * uint16_t) so cross-iteration context doesn't leak. Under MT,
-     * racing emits from peer threads may land in the wrong iteration's
-     * snapshot by a few edges; that jitter is bounded (each peer
-     * thread does one emit at most before noticing the boundary's
-     * clear) and acceptable for AFL-style fuzzing. */
+     * N-1 entries as context; one uint32_t at N=2) so cross-iteration
+     * context doesn't leak. (ST only: MT uses per-thread bitmaps and
+     * publish_copy.) */
     memset(libcov_prev_loc, 0, sizeof libcov_prev_loc);
 }
 #endif

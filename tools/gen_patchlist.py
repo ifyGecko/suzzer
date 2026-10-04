@@ -10,8 +10,9 @@ subprocess implementation re-ran `aaa` for every command and was
 wall-clock dominated by it on medium-sized binaries.
 
 Per-arch behavior:
-  x86_64, aarch64, arm (ARM mode), powerpc, riscv64: patch block terminators
-                                                     (last >= 2-byte insn)
+  x86_64, aarch64, arm (ARM mode), powerpc, riscv64: one site per block: the
+                                                     first mid-block call, else
+                                                     the last >= 2-byte insn
   arm (Thumb mode):                                  patch first 2 bytes only
   mips, mips64:                                      patch block ENTRIES
                                                      (avoids branch delay slots)
@@ -69,9 +70,11 @@ Selective instrumentation (--root / --cutoff / --max-depth):
       matches are an error.
 
   The call graph is built from rizin's `afij` callrefs: outgoing CALL
-  edges to functions inside the analyzed binary. PLT/import targets are
-  *not* in the function-offset set and so naturally act as implicit
-  cutoffs at the library boundary.
+  edges to functions rizin found in the analyzed binary, PLT stubs
+  (sym.imp.*) included. A stub's body is an indirect jmp, not a CALL, so
+  the BFS stops there: imports show up in --print-reachable but are never
+  followed into the library, and DEFAULT_EXCLUDE keeps them out of the
+  patch list.
 
   When --root is combined with --include-pat / --exclude-pat the result
   is the intersection: a function must be both reachable AND pass the
@@ -542,9 +545,9 @@ def build_call_graph(rz, all_fns):
     `offset` field (NOT positionally -- the iteration order isn't a
     documented contract).
 
-    Edges are restricted to in-binary function entries. PLT stubs,
-    imports, and any callee whose target is not in the analyzed
-    function set are dropped -- so the BFS implicitly stops at the
+    Edges are restricted to function entries in all_fns (rizin's full
+    function list, PLT stubs included); callees outside that set are
+    dropped. PLT stubs make no CALLs, so the BFS still stops at the
     library boundary.
 
     Earlier attempt used `aaa; afij @ X; ?e SEP; afij @ Y; ...` to

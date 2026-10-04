@@ -24,7 +24,8 @@ echo ">> regenerate patch list"
     --include-pat '^dbg\.(main|classify|loop_sum|cmdline)$'
 
 # The shm file starts with a 72-byte libcov_shm_header followed by the
-# 64 KB live bitmap and the snapshot ring. The legacy single-bitmap
+# live bitmap (hdr->map_size bytes, auto-sized) and the snapshot ring;
+# shm_bitmap.py reads the layout from the header. The legacy single-bitmap
 # checks below only care about the bitmap region. Use python to avoid
 # the SIGPIPE-vs-pipefail interaction of a tail|head pipeline.
 extract_bitmap() {

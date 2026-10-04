@@ -1,6 +1,7 @@
 /*
  * membarrier.h -- thin wrapper around the Linux membarrier(2) syscall used
- * only by the MT runtime (patch_mt.c). Splits cleanly into:
+ * only by the MT runtime (patch_mt.c, and libcov.c for init and the
+ * sync-signal interposers). Splits cleanly into:
  *
  *   membarrier_init()        -- once at init. Detects whether
  *                               PRIVATE_EXPEDITED_SYNC_CORE is available on

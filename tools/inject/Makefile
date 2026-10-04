@@ -9,7 +9,7 @@
 #                                                 runtime with a clear msg)
 #   tools/inject/build/<arch>/inject_procmem  -- ptrace-less injector
 #                                                (PHASE 7: build only;
-#                                                 returns ENOSYS at runtime
+#                                                 exits 64 at runtime
 #                                                 pending shellcode + sigframe
 #                                                 implementation)
 #

@@ -2,8 +2,8 @@
  * inject_procmem.c -- ptrace-LESS libcov injector.
  *
  * STATUS: PHASE 7 -- runtime functionality not yet implemented; only the
- * design framework + CLI compiles. Invoking it returns ENOSYS with a
- * clear message. Build target is wired up so the cross-compile matrix
+ * design framework + CLI compiles. Invoking it prints a clear message
+ * and exits 64. Build target is wired up so the cross-compile matrix
  * stays green and the implementation can land incrementally.
  *
  * Why a second injector?

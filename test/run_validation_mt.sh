@@ -56,7 +56,8 @@ bare_total=$(grep '^TOTAL=' $WORK/v_mt.bare)
 echo "   $bare_total"
 
 # The shm file starts with a 72-byte libcov_shm_header followed by the
-# 64 KB live bitmap and the snapshot ring. Tests below operate on the
+# live bitmap (hdr->map_size bytes, auto-sized) and the snapshot ring;
+# shm_bitmap.py reads the layout from the header. Tests below operate on the
 # live bitmap only. python avoids the SIGPIPE-vs-pipefail interaction
 # of a tail|head pipeline.
 extract_bitmap() {

@@ -22,8 +22,9 @@ static long g_pagesize = 0;
  *   mprotect: per write, R|W -> write -> R|X. Code pages are never
  *     writable and executable at once.
  *
- * MT does the same RWX-once (patch_mt.c); it has no per-write fallback
- * because that path isn't atomic for peer threads. */
+ * MT does the same RWX-once (patch_mt.c). If RWX is refused it falls
+ * back to pwrite(/proc/self/mem) or mprotect+memcpy, which are not atomic
+ * for peer threads, and warns at init. */
 static int g_direct = 0;
 
 static void ensure_pagesize(void) {
@@ -202,25 +203,3 @@ struct patch_entry *patch_lookup(uintptr_t addr) {
 int patch_arm_unsynced(struct patch_entry *e)    { return patch_arm(e); }
 int patch_disarm_unsynced(struct patch_entry *e) { return patch_disarm(e); }
 void patch_sync_batch_end(void) { }
-
-size_t patch_rearm_set(struct patch_entry **set, size_t n) {
-    size_t armed = 0;
-    for (size_t i = 0; i < n; i++) {
-        struct patch_entry *e = set[i];
-        if (!e || e->patched) continue;
-        if (patch_arm(e) == 0) armed++;
-    }
-    return armed;
-}
-
-size_t patch_rearm_all_disarmed(void) {
-    size_t n;
-    struct patch_entry *t = config_table_mut(&n);
-    if (!t) return 0;
-    size_t armed = 0;
-    for (size_t i = 0; i < n; i++) {
-        if (t[i].patched) continue;
-        if (patch_arm(&t[i]) == 0) armed++;
-    }
-    return armed;
-}

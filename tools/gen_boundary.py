@@ -8,8 +8,8 @@ this script lets you generate one from a small list of symbol names.
 
 Each named function is resolved to the site gen_patchlist.py would pick
 for its FIRST basic block, using the same strategy (--strategy, default
-the arch's): the last patchable (>= 2 byte) instruction under
-"terminator", the first instruction (second, if it is a delay slot) under
+the arch's): the instruction pick_terminator chooses under "terminator"
+(the first mid-block call, else the last >= 2-byte code instruction), the first instruction (second, if it is a delay slot) under
 "entry", which is the MIPS default. The marker then coincides with a
 patched site. Without that, the trap never fires and the boundary never
 publishes. Pass --patchlist to verify this against the actual patch list
@@ -43,7 +43,7 @@ sys.dont_write_bytecode = True  # no tools/__pycache__ from the import below
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gen_patchlist import (default_strategy, fix_elfv1_nop_entries,  # noqa: E402
                            op_class, pick_entry, pick_terminator)
-from rz_resolve import resolve_to_offset  # noqa: E402
+from rz_resolve import NotFound, resolve_to_offset  # noqa: E402
 
 
 def rizin(binary, cmds):
@@ -99,11 +99,13 @@ def resolve(name, all_fns, syms):
     against the analysed functions first (so gen_boundary and gen_patchlist
     resolve names identically, including prefix and suffix matching), then
     falls back to the symbol table for names rizin didn't analyse as
-    functions. Raises ValueError if unresolvable."""
+    functions. Only a not-found result falls back; an ambiguous match is an
+    error here too, as in gen_patchlist. Raises ValueError if unresolvable
+    or ambiguous."""
     try:
         off, _ = resolve_to_offset(name, all_fns)
         return off
-    except ValueError:
+    except NotFound:
         pass
     if name in syms:
         return syms[name]
@@ -129,11 +131,11 @@ def first_bb_site(binary, fn_addr, strategy, is_mips):
 
     For a boundary marker to actually fire (trap), it must point at a
     patched site -- so we pick the same address gen_patchlist would pick
-    for this function's first BB. Under "terminator", for a one-BB
-    function shaped like the canonical `iter_begin` shim that's the
-    function's terminator; for multi-BB functions it's the first branch
-    terminator. Under "entry" (MIPS) it's the function's first
-    instruction. Either way, "execution reached this address" means "the
+    for this function's first BB. Under "terminator" that is
+    pick_terminator() applied to the entry block: a mid-block call if any,
+    else the last >= 2-byte instruction -- not necessarily a branch.
+    Under "entry" (MIPS) it's the function's first instruction (second,
+    if it is a delay slot). Either way, "execution reached this address" means "the
     function was entered." """
     blocks = rizin_json(binary, ["aaa", f"afbj @ {fn_addr}"]) or []
     if not blocks:

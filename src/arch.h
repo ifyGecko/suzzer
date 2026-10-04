@@ -26,17 +26,17 @@ extern const uint8_t  libcov_max_patch_len;  /* largest patchable insn (bytes) *
  *  - Fixed-length-insn archs: len must equal the natural insn width
  *    (2 for THUMB, 4 for ARM/AArch64/MIPS/PPC/RISC-V), and the function
  *    writes exactly one trap instruction.
- *  - x86_64: len is the original instruction length (2..15). The function
- *    writes a 2-byte UD2 followed by single-byte NOPs as padding.
+ *  - x86_64: len is always 2. The function writes the 2-byte UD2 head;
+ *    the rest of the original instruction is never touched.
  *  - RISC-V mixed C/regular: len=2 writes c.unimp (0x0000); len=4 writes
  *    two c.unimps (= 4-byte 0x00000000), which is also illegal. */
 void libcov_arch_write_illegal(void *dst, uint8_t len);
 
 /* Return a pointer to a static-const buffer holding the trap-raising
  * sequence for `len` bytes. The buffer is at least `len` bytes long.
- * Used by patch_mt.c's hot path so the trap encoding can be pwrite'd
- * directly out of `.rodata` instead of being staged on the stack via
- * libcov_arch_write_illegal() on every arm/disarm cycle. */
+ * Used by patch_mt.c (its atomic store reads the encoding straight from
+ * .rodata instead of staging it via libcov_arch_write_illegal() on every
+ * arm/disarm) and by libcov.c's init-time trap self-test. */
 const void *libcov_arch_illegal_bytes(uint8_t len);
 
 /* PC of the trapped instruction (faulting address). */

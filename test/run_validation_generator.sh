@@ -10,6 +10,9 @@
 #      dispatch() and leaves the handlers behind it out of the slice.
 #   3. op_class / is_indirect_transfer recognise every rizin branch type
 #      variant, including the ones the old exact-match list missed.
+#   4. gen_boundary.py's resolve() rejects an ambiguous name like
+#      gen_patchlist does, instead of falling back to the symbol table;
+#      only a not-found name falls back.
 set -euo pipefail
 export PYTHONDONTWRITEBYTECODE=1   # we import tools/gen_patchlist.py
 
@@ -90,6 +93,26 @@ want = {"ucall", "rcall", "icall", "ircall", "uccall", "ujmp", "rjmp", "ijmp",
 if indirect != want:
     sys.exit(f"FAIL: indirect set {sorted(indirect)} != {sorted(want)}")
 print(f"   OK: {len(cases)} op types classified")
+EOF
+
+echo ">> 4. gen_boundary.py name resolution matches gen_patchlist"
+python3 - "$ROOT/tools" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+from gen_boundary import resolve
+fns = [{"offset": 0x1000, "name": "dbg.net.handle", "size": 16, "maxbound": 0x1010},
+       {"offset": 0x2000, "name": "dbg.ipc.handle", "size": 16, "maxbound": 0x2010}]
+try:
+    got = resolve("handle", fns, {"sym.handle": 0x9999})
+    sys.exit(f"FAIL: ambiguous 'handle' resolved to 0x{got:x} via the symbol table")
+except ValueError as e:
+    if "ambiguous" not in str(e):
+        sys.exit(f"FAIL: wrong error for an ambiguous name: {e}")
+if resolve("dbg.net.handle", fns, {}) != 0x1000:
+    sys.exit("FAIL: exact name did not resolve")
+if resolve("other", fns, {"sym.other": 0x3000}) != 0x3000:
+    sys.exit("FAIL: not-found name did not fall back to the symbol table")
+print("   OK: ambiguous name is an error; not-found falls back to symbols")
 EOF
 
 echo

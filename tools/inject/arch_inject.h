@@ -6,7 +6,9 @@
  *   - A tiny vtable; one struct per arch.
  *   - Zero `#ifdef ARCH` in the common code (inject_common.c, inject_ptrace.c,
  *     inject_procmem.c).
- *   - One arch_inject_<name>.c per backend, link-time selected by the build.
+ *   - One arch_inject_<name>.c per backend; all are linked in and
+ *     inject_arch_select() picks one at runtime from the target's ELF
+ *     e_machine.
  *   - Stubs for not-yet-implemented arches keep the build matrix green and
  *     give a clear runtime error from the same code path that the real
  *     backends take.

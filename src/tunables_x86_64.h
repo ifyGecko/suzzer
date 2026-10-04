@@ -9,9 +9,9 @@
  * never touched -- the trap fires at UD2 before the tail is decoded, and
  * disarm restores the head, so the original instruction is intact. This
  * matches the MT backend's single-store contract (Intel SDM Vol 3 Sec
- * 8.1.1: naturally-aligned 2-byte stores are single-copy-atomic) and the
- * generator's --threading mt mode further requires sites that don't
- * straddle a 64-byte cache line.
+ * 8.1.1: a 2-byte store is single-copy-atomic when it doesn't cross a
+ * cache line), and the generator's --threading mt mode requires sites
+ * that don't straddle a 64-byte cache line.
  */
 #ifndef LIBCOV_TUNABLES_X86_64_H
 #define LIBCOV_TUNABLES_X86_64_H

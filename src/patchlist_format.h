@@ -32,7 +32,7 @@
  * Record:
  *
  *   struct patchlist_record {
- *       uint64_t offset;       // from g_module_bases[module_idx]
+ *       uint64_t offset;       // from libcov_module_bases[module_idx]
  *       uint8_t  len;          // bytes to patch and restore (2 or 4)
  *       uint8_t  module_idx;   // index into the name table
  *       uint8_t  orig[4];      // first `len` bytes are meaningful
@@ -47,8 +47,8 @@
  * `orig[4]` is sized for the widest cross-arch case (4-byte fixed-width
  * ISAs). x86's UD2 patches store 2 meaningful bytes and ignore the tail.
  */
-#ifndef LIBCOV_CONFIG_H
-#define LIBCOV_CONFIG_H
+#ifndef LIBCOV_PATCHLIST_FORMAT_H
+#define LIBCOV_PATCHLIST_FORMAT_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -99,7 +99,7 @@ struct patchlist_record {
  *
  * `lock` is MT-only: a single-byte spinlock acquired around the byte-write
  * critical section in patch_mt.c, so an in-flight arm and an in-flight
- * disarm on the same entry can't interleave their syscalls and leave the
+ * disarm on the same entry can't interleave their writes and leave the
  * bytes inconsistent with `patched`. ST-mode ignores this field.
  *
  * `module_idx` is carried from the wire record so the trap handler can

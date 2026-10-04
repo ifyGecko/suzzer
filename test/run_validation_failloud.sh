@@ -3,7 +3,9 @@
 #
 #   1. LIBCOV_PATCHLIST unset: inert by default; LIBCOV_REQUIRE=1 aborts.
 #   2. MODE=oneshot + BOUNDARY_REARM=none + a boundary list: boundaries are
-#      refused with an ERROR (unless LIBCOV_ALLOW_ONESHOT_NOREARM=1).
+#      refused with an ERROR (unless LIBCOV_ALLOW_ONESHOT_NOREARM=1). An
+#      unrecognised REARM value (a typo) counts as none: refused under
+#      oneshot, and a WARNING under leapfrog.
 #   3. libcov_st.so in a multi-threaded target: WARNING.
 #   4. LIBCOV_TRAP_SIGNO that doesn't match the trap encoding: the init
 #      self-test catches it and libcov stays inert instead of the target
@@ -75,6 +77,20 @@ rc=0; run "$WORK/2c" "${common[@]}" LIBCOV_BOUNDARY_REARM=touched -- "$B/target_
 grep -q "boundary: active" "$WORK/2c" && ! grep -q "NOT enabled" "$WORK/2c" \
     || fail "oneshot+touched wrongly refused"
 echo "   OK: oneshot+touched unaffected"
+rc=0; run "$WORK/2d" "${common[@]}" LIBCOV_BOUNDARY_REARM=touchd -- "$B/target_loop" || rc=$?
+grep -q "boundaries NOT enabled" "$WORK/2d" && ! grep -q "boundary: active" "$WORK/2d" \
+    || fail "oneshot+REARM typo not refused: $(cat "$WORK/2d")"
+echo "   OK: oneshot+REARM=touchd (typo) refused like none"
+rc=0; run "$WORK/2e" "${common[@]}" LIBCOV_BOUNDARY_REARM=touchd LIBCOV_REQUIRE=1 \
+    -- "$B/target_loop" || rc=$?
+[[ $rc -eq 134 ]] || fail "oneshot+REARM typo with LIBCOV_REQUIRE=1: want 134, got rc=$rc"
+echo "   OK: ... and aborts under LIBCOV_REQUIRE=1"
+rc=0; run "$WORK/2f" "${common[@]/LIBCOV_MODE=oneshot/LIBCOV_MODE=leapfrog}" \
+    LIBCOV_BOUNDARY_REARM=touchd -- "$B/target_loop" || rc=$?
+grep -q "unknown LIBCOV_BOUNDARY_REARM='touchd'" "$WORK/2f" \
+    && grep -q "boundary: active.*rearm=none" "$WORK/2f" \
+    || fail "leapfrog+REARM typo: no WARNING / not none: $(cat "$WORK/2f")"
+echo "   OK: leapfrog+REARM=touchd warns and uses none"
 
 echo ">> 3. libcov_st.so in a multi-threaded target"
 # The warning is the point: without it this configuration may simply

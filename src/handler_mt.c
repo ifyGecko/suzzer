@@ -50,8 +50,8 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
     }
     /* Concurrent traps at the same site from multiple threads converge here.
      * The first one's patch_disarm wins the cmpxchg and does the byte write;
-     * losers no-op. Both paths record an edge in TLS prev_loc + the shared
-     * atomic bitmap.
+     * losers no-op. Both paths record an edge in TLS prev_loc + the thread's
+     * live bitmap (the shared atomic one until its first boundary).
      *
      * A1: we deliberately use the _unsynced patch variants throughout the
      * trap body and issue ONE patch_sync_batch_end() at the tail. That

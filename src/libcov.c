@@ -180,11 +180,12 @@ static void libcov_init(void) {
      * to enable boundaries unless explicitly allowed (a "first hit only"
      * novelty stream is a legitimate, if unusual, choice). */
     const char *blist = getenv("LIBCOV_BOUNDARY_LIST");
-    const char *rearm = getenv("LIBCOV_BOUNDARY_REARM");
-    int no_rearm = !rearm || !*rearm || !strcmp(rearm, "none");
+    int no_rearm = boundary_parse_rearm(getenv("LIBCOV_BOUNDARY_REARM")) ==
+                   LIBCOV_REARM_NONE;
     if (blist && *blist && mode == LIBCOV_MODE_ONESHOT && no_rearm &&
         !env_true("LIBCOV_ALLOW_ONESHOT_NOREARM")) {
-        init_fail("ERROR -- MODE=oneshot with BOUNDARY_REARM=none would leave "
+        init_fail("ERROR -- MODE=oneshot with BOUNDARY_REARM=none (unset, empty, "
+                  "'none' or unrecognised) would leave "
                   "per-iteration snapshots empty after warmup; boundaries NOT "
                   "enabled. Use LIBCOV_BOUNDARY_REARM=touched or =all, or "
                   "LIBCOV_MODE=leapfrog, or set LIBCOV_ALLOW_ONESHOT_NOREARM=1 "

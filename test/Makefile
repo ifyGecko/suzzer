@@ -19,11 +19,12 @@ all: $(BUILD)/target_simple $(BUILD)/target_loop $(BUILD)/target_orderable \
      $(BUILD)/target_dispatch $(BUILD)/target_markers $(BUILD)/fuzz_driver
 
 # pthread MT stress target + multi-worker boundary target and its ring
-# reader. Built on demand by the MT validation scripts.
+# reader. Built by top-level `make test` (and run_cross_mt.sh); the
+# native MT scripts expect them prebuilt.
 mt: $(BUILD)/target_simple_mt $(BUILD)/target_loop_mt $(BUILD)/ring_dump
 
-# Multi-module target + helper .so. Built on demand by
-# run_validation_multimod.sh which exercises LCV3's multi-module path.
+# Multi-module target + helper .so for LCV3's multi-module path. Built by
+# top-level `make test`; run_validation_multimod.sh expects it prebuilt.
 multimod: $(BUILD)/target_multimod $(BUILD)/libmultimod_helper.so
 
 # Boundary-aware loop target. Built by `all` since the driver only works

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Cross-arch end-to-end validation. For each supported ARCH:
-#   1. Build libcov.so + target_simple.
+#   1. Build libcov_st.so + target_simple.
 #   2. Generate a patch list with gen_patchlist.py.
-#   3. Run target_simple under qemu-user-static with LD_PRELOAD=libcov.so.
+#   3. Run target_simple under qemu-user-static (x86_64 natively) with
+#      LD_PRELOAD=libcov_st.so.
 #   4. Confirm target output and report bitmap statistics.
 #
 # Requires Debian-flavored cross toolchains and qemu-user-static binaries
-# (see top of repository README for the apt list).
+# (see HOWTO.md "Prerequisites" for the apt list).
 
 set -uo pipefail
 

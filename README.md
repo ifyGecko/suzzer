@@ -11,7 +11,7 @@ threading variants are built as separate LEGO bricks:
   init, then per-write cache maintenance plus `membarrier(SYNC_CORE)`
   for cross-CPU instruction visibility.
 
-Both variants share the same backends across 11 architectures. Pick the
+Both variants share the same 8 backends, which cover 11 architectures. Pick the
 brick that fits your target.
 
 ## Idea
@@ -21,8 +21,9 @@ trap-raising encoding. When the CPU traps, our `LD_PRELOAD`-injected
 signal handler:
 
 1. Reads the faulting PC from `ucontext`.
-2. Emits an AFL-style edge into a shared bitmap (auto-sized from the
-   patch count by default -- see [Coverage model](#coverage-model)).
+2. Emits an edge (by default built from the hit site's id and the previous
+   site's id) into a shared bitmap, auto-sized from the patch count -- see
+   [Coverage model](#coverage-model).
 3. Restores the original instruction so execution continues.
 
 No JIT, no embedded interpreter, no ptrace, no kernel module. Just libc +
@@ -47,8 +48,9 @@ per-backend tunables header (see [Tunables](#tunables)).
 | powerpc64 BE+LE   | all-zero (`0x00000000`)  | 4         | Was `tw 31,0,0` / SIGTRAP               |
 | riscv64           | c.unimp (`0x0000`)       | 2 or 4    | Mixed 2-byte (C) / 4-byte insns         |
 
-All backends validated end-to-end under `qemu-<arch>-static`:
-`test/run_cross.sh`.
+All backends are validated end-to-end (ST) under `qemu-<arch>-static` by
+`test/run_cross.sh`. MT runtime validation under qemu covers x86_64 and
+aarch64 only; see [Limitations](#limitations).
 
 ## Build
 
@@ -57,16 +59,21 @@ make                                    # native ST build
 make THREADING=mt                       # native MT build
 make ARCH=aarch64                       # cross-build ST for aarch64
 make ARCH=aarch64 THREADING=mt          # cross-build MT for aarch64
-make all-arch                           # ST for every supported backend
-make all-arch THREADING=mt              # MT for every supported backend
-make all-variants                       # ST and MT for every backend
+make all-arch                           # ST for all 11 architectures
+make all-arch THREADING=mt              # MT for all 11 architectures
+make all-variants                       # ST and MT for every architecture
 make test                               # build everything, run every native suite
+make tools                              # opt-in: build/<arch>/libdemalloc.so
 ```
 
-Outputs land in `build/<arch>/libcov_<threading>.so` (and
-`build/<arch>/target_simple` for the ST test target;
-`build/<arch>/target_simple_mt` for the pthread stress target via
-`make -C test ... mt`).
+Outputs land in `build/<arch>/libcov_<threading>.so`. Plain `make` (either
+`THREADING`) also builds the ST test targets: `target_simple`, `target_loop`,
+`target_orderable`, `target_dispatch`, `target_markers` and `fuzz_driver`.
+Everything else is built by the test Makefile:
+`make -C test ARCH=<arch> CROSS=<prefix> BUILD=$PWD/build/<arch> <goal>`,
+where `<goal>` is `mt` (`target_simple_mt`, `target_loop_mt`, `ring_dump`),
+`multimod`, `o2pie`, `thumb` or `demalloc`. `make print-vars` shows the
+resolved `ARCH`, `BACKEND`, `THREADING`, sources and library path.
 
 ## Tunables
 
@@ -76,11 +83,12 @@ either is fine — `-D` wins because the preprocessor sees it first:
 
 1. **Edit the value in the header**, next to the `#define`.
 2. **Pass `-D` on the build line**, e.g.
-   `make EXTRA_CFLAGS='-DLIBCOV_ARCH_MIPS_ILLEGAL=0xDEADBEEFu'`.
+   `make EXTRA_CFLAGS='-DLIBCOV_ARCH_MIPS_ILLEGAL=0xDEADBEEFu'` (mips64 uses
+   `LIBCOV_ARCH_MIPS64_ILLEGAL`).
 
 | Concern                                                     | Header                  |
 |-------------------------------------------------------------|-------------------------|
-| Trap signal, bitmap size, **N-gram width**, log buffer      | `src/tunables.h`        |
+| Trap signal, coverage model, bitmap sizing, **N-gram width**, log buffer | `src/tunables.h` |
 | x86_64 illegal encoding / widths                            | `src/tunables_x86_64.h` |
 | aarch64 illegal encoding / widths                           | `src/tunables_aarch64.h`|
 | arm + Thumb illegal encodings / widths                      | `src/tunables_arm.h`    |
@@ -126,16 +134,23 @@ make ARCH=aarch64
 LIBCOV_PATCHLIST=/tmp/t.lcv \
 LIBCOV_SHM_PATH=/tmp/cov \
 LIBCOV_MODE=leapfrog \
-LD_PRELOAD=./build/aarch64/libcov_st.so \
     qemu-aarch64-static -L /usr/aarch64-linux-gnu \
     -E LD_PRELOAD=$PWD/build/aarch64/libcov_st.so \
     build/aarch64/target_simple 42
 ```
 
+Under qemu-user, pass `LD_PRELOAD` to the guest with `-E` only. Setting it
+in the host environment as well would load an aarch64 `.so` into the host
+qemu process. For a native target, drop qemu and set
+`LD_PRELOAD=$PWD/build/<arch>/libcov_st.so` directly.
+
 The shm region (header + bitmap + snapshot ring) is written to `/tmp/cov`
-(or whatever path `LIBCOV_SHM_PATH` points at). An external fuzzer mmaps
+(or whatever path `LIBCOV_SHM_PATH` points at). `test/shm_bitmap.py
+stats|extract|gen <region> [out]` reads it. An external fuzzer mmaps
 the same file/SHM and reads hit-counts. **Read `map_size` and
-`bitmap_offset` from the header** -- the bitmap is not a fixed 64 KB.
+`bitmap_offset` from the header** -- the bitmap is not a fixed 64 KB. The
+header and bitmap use the *target's* byte order, so a big-endian device
+writes a header a little-endian host must byte-swap (`shm_bitmap.py` does).
 
 **Boundary mode and the live bitmap.** When boundaries are active
 (`LIBCOV_SHM_FLAG_ACTIVE` set), whether the live bitmap at `bitmap_offset`
@@ -152,7 +167,7 @@ cumulative map as before.
 Real-world fuzz targets rarely need every function in the binary
 instrumented; the interesting coverage lives in the input-parsing and
 state-machine code reached from the request handler. The generator
-supports hand-picking that region with three flags:
+supports hand-picking that region with these flags:
 
 ```
 --root SYM_OR_ADDR     # BFS seed: function name or address (repeatable)
@@ -162,15 +177,19 @@ supports hand-picking that region with three flags:
 ```
 
 The slice is built from rizin's static call graph (`afij` callrefs). PLT
-stubs and library imports are automatically out-of-graph and so act as
-implicit cutoffs at the library boundary. When `--root` is combined with
+stubs (`sym.imp.*`) are reached but go no further, so they act as implicit
+cutoffs at the library boundary. `--print-reachable` lists them, but the
+default exclusions keep them out of the patch list. When `--root` is combined with
 `--include-pat` / `--exclude-pat` the result is their **intersection**:
 a function must be both reachable from a root AND pass the regex filter
 to be instrumented.
 
 ### Resolution rules for SYM_OR_ADDR
 
-- `0x401234` / `401234` / `4198964` → address. If the address is inside a
+- `0x401234` (hex) or `4198964` (decimal) → address. **All-digit tokens
+  are decimal**: `401234` means 0x61f32. An unprefixed token with hex
+  letters (`cafe`) is tried as a name first and only then as hex. If the
+  address is inside a
   function but not at its entry, the enclosing function's entry is used
   (with a note printed to stderr). An address past the end of the
   function below it (a typo, or another module's address) is an error.
@@ -219,7 +238,10 @@ module you want instrumented its own root.
 
 - **Indirect calls** (function pointers, vtables, dispatch tables) are
   invisible to rizin's static analysis. Slices through them require
-  another `--root` at the callee. Every `--root` run prints how many
+  another `--root` at the callee. **This includes thread entry points**:
+  `pthread_create(…, worker, …)` passes a pointer, so a threaded target
+  needs `--root worker` (one per thread function) or its workers go
+  uninstrumented. Every `--root` run prints how many
   indirect calls and jumps the slice contains, and `--print-reachable`
   marks the functions that have them.
 - **ppc64 ELFv1 functions whose body starts with a `nop`** show up in
@@ -241,21 +263,21 @@ module you want instrumented its own root.
 | Var | Default | Meaning |
 |---|---|---|
 | `LIBCOV_PATCHLIST` | *(required)* | Path to LCV3 patch list. If unset, the library is inert. |
-| `LIBCOV_REQUIRE` | unset | `1`: abort the process if libcov ends up inert or any init step fails (unset patch list, unresolvable module, trap self-test failure, refused boundary config). Off by default because children that inherit `LD_PRELOAD` are usually meant to run inert. |
-| `LIBCOV_SHM_PATH` | `/libcov_<pid>` | Bitmap path. Leading `/` and no other slashes → `shm_open`; otherwise a filesystem path. Falls back to `$TMPDIR/<name>` if `shm_open` fails. `%p` expands to the pid (`%%` to `%`), giving each process of a forking/re-execing daemon its own region. See "Re-exec and fork+exec". |
-| `LIBCOV_ST_PATCH` | `auto` | `libcov_st.so` only. `auto`: make patched code pages `R|W|X` once at init, so arming/disarming is a plain store (no syscalls per trap, about 3x faster in leapfrog); falls back to `mprotect` if the kernel refuses `R|W|X`. `mprotect`: two `mprotect` calls per arm/disarm, code pages never writable and executable at once. |
-| `LIBCOV_MODE` | `leapfrog` | `oneshot` (each site fires once, fastest) or `leapfrog` (re-arm previous site each trap; gives hit counts). |
+| `LIBCOV_REQUIRE` | unset | Any non-empty value other than `0`: abort the process if libcov ends up inert or any init step fails (unset patch list, unresolvable module, trap self-test failure, refused boundary config). Off by default because children that inherit `LD_PRELOAD` are usually meant to run inert. |
+| `LIBCOV_SHM_PATH` | `/libcov_<pid>` | Bitmap path. Leading `/` and no other slashes → `shm_open`; otherwise a filesystem path. If `shm_open` fails, falls back to `$TMPDIR/<name>` (or `/tmp`); a filesystem path has no fallback. `%p` expands to the pid (`%%` to `%`), giving each process of a forking/re-execing daemon its own region. See "Re-exec and fork+exec". |
+| `LIBCOV_ST_PATCH` | `auto` | `libcov_st.so` only. `auto`: make patched code pages `R|W|X` once at init, so arming/disarming is a plain store (no syscalls per trap, about 3x faster in leapfrog); falls back to `mprotect` if the kernel refuses `R|W|X`; unknown values mean `auto`. `mprotect`: two `mprotect` calls per arm/disarm, code pages never writable and executable at once. |
+| `LIBCOV_MODE` | `leapfrog` | `oneshot` (each site fires once, fastest) or `leapfrog` (re-arm previous site each trap; gives approximate hit counts). Any value other than exactly `oneshot`, typos included, silently means leapfrog. |
 | `LIBCOV_MODULE` | the main executable | Module name for boundary-mode sidecar resolution only. The patch list itself carries its own module name table (LCV3) so this only affects `LIBCOV_BOUNDARY_LIST` lookups. A bare name or an absolute path, as for `LIBCOV_MODULE_RENAME`. |
 | `LIBCOV_MODULE_RENAME` | unset | `old=new[,old=new…]`: resolve patch-list module `old` as `new`. For a binary run under another name than it was generated from (`target=target.stripped`), or, with an absolute path as `new`, to pick one of several mapped files with the same basename. |
 | `LIBCOV_LOG` | unset (stderr) | Diagnostic log. Never written from the signal handler; after init, only while the fd still refers to the same non-socket file (see Hardening). |
 | `LIBCOV_BOUNDARY_LIST` | unset | Path to LCVB1 iteration-boundary sidecar. Iteration framing is inert if unset. |
-| `LIBCOV_BOUNDARY_REARM` | `none` | `none` / `all` / `touched`. What to re-arm at each boundary fire. |
-| `LIBCOV_BOUNDARY_RING` | `8` | Number of snapshot slots (2..16), each one `map_size` bytes. Driver lag tolerance = `RING - 1` iterations. |
-| `LIBCOV_BOUNDARY_INIT_GRACE` | `0` | Drop the first N boundary fires (process-wide, across all threads) before publishing (skip init noise). |
-| `LIBCOV_BOUNDARY_NOTIFY_FD` | unset | Inherited **eventfd**; libcov writes 8 bytes after each snapshot. Anything else (e.g. a pipe, which could block or SIGPIPE the target inside the trap handler) is ignored with a warning. Counter polling works without it. |
+| `LIBCOV_BOUNDARY_REARM` | `none` | `none` / `all` / `touched`. What to re-arm at each boundary fire. Any other value means `none` and logs a WARNING (and counts as `none` for the oneshot refusal). |
+| `LIBCOV_BOUNDARY_RING` | `8` | Number of snapshot slots, clamped to 2..16 (a non-numeric value gives 2), each one `map_size` bytes. Driver lag tolerance = `RING - 1` iterations. |
+| `LIBCOV_BOUNDARY_INIT_GRACE` | `0` | Don't publish the first N boundary fires (process-wide, across all threads, counted after depth filtering). Their coverage is not discarded; it is merged into the first published snapshot, flagged `INIT`. |
+| `LIBCOV_BOUNDARY_NOTIFY_FD` | unset | Inherited **eventfd** (fd > 0); libcov writes a `uint64` 1 after each snapshot. Anything else (e.g. a pipe, which could block or SIGPIPE the target inside the trap handler) is ignored with a warning. Counter polling works without it. |
 | `LIBCOV_BOUNDARY_EMULATE` | `1` | `0`: never emulate boundary markers; always use disarm + deferred re-arm (see Threading). |
-| `LIBCOV_SYNC_FALLBACK` | `auto` | `libcov_mt.so` only. Cross-core sync when the kernel lacks `membarrier(PRIVATE_EXPEDITED_SYNC_CORE)`: `auto` broadcasts `LIBCOV_SYNC_SIGNO` (default `SIGRTMAX-2`, `src/tunables.h`) to every peer thread after each patch batch; `tgkill` forces that even when SYNC_CORE works; `off` relies on cache maintenance alone. The broadcast is slow (about 10x on a 16-thread stress) and can make non-restarting syscalls return `EINTR`; see Design.md §17.2.5. |
-| `LIBCOV_ALLOW_ONESHOT_NOREARM` | unset | `1`: allow `MODE=oneshot` with `BOUNDARY_REARM=none` (first-hit-only snapshots). Otherwise that combination is refused and boundaries stay off. |
+| `LIBCOV_SYNC_FALLBACK` | `auto` | `libcov_mt.so` only. Cross-core sync when the kernel lacks `membarrier(PRIVATE_EXPEDITED_SYNC_CORE)`: `auto` broadcasts `LIBCOV_SYNC_SIGNO` (default `SIGRTMAX-2`, `src/tunables.h`) to every peer thread after each patch batch; `tgkill` forces that even when SYNC_CORE works; `off` relies on cache maintenance alone; unknown values mean `auto`. The broadcast is slow (roughly 7-10x on a 16-thread stress) and can make non-restarting syscalls return `EINTR`; see Design.md §17.2.5. |
+| `LIBCOV_ALLOW_ONESHOT_NOREARM` | unset | Any non-empty value other than `0`: allow `MODE=oneshot` with `BOUNDARY_REARM=none` (first-hit-only snapshots). Otherwise that combination is refused and boundaries stay off. |
 
 ## Coverage model
 
@@ -321,6 +343,8 @@ Two orthogonal axes:
   single-threaded targets only (see Leapfrog below).
 - `leapfrog` -- On trap at X, restore X *and* re-arm the previously
   restored site. Lets the bitmap accumulate hit counts on hot edges
+  (approximate: a block that loops straight back to itself stays restored,
+  so it counts once per alternation, not once per execution)
   and gives full per-iter edge sets when used with the boundary
   mechanism. Higher overhead.
   - Under `libcov_st.so`: safe only for single-threaded targets.
@@ -351,7 +375,7 @@ Recommended pairings:
 |---|---|---|
 | `leapfrog` | `none` | Default for boundary mode. Per-iter bitmaps with full edge sets. |
 | `oneshot` | `all` or `touched` | Many traps per iteration, cheaper than leapfrog's per-trap cost. |
-| `oneshot` | `none` | **Anti-pattern** when boundaries are active -- per-iter bitmaps go empty after warmup. libcov refuses it (logs an ERROR, boundaries stay off) unless `LIBCOV_ALLOW_ONESHOT_NOREARM=1`. |
+| `oneshot` | `none` | **Anti-pattern** when boundaries are active -- per-iter bitmaps go empty after warmup. libcov refuses it (logs an ERROR, boundaries stay off, plain coverage keeps running; aborts under `LIBCOV_REQUIRE`) unless `LIBCOV_ALLOW_ONESHOT_NOREARM=1`. |
 | `leapfrog` | `all` / `touched` | Redundant; leapfrog already re-arms. Allowed but no benefit. |
 
 ## Iteration boundaries
@@ -386,8 +410,9 @@ holds (exactly one bit is set; see "Marker semantics"):
 A fuzzer that wants one snapshot per input keeps the `ITER` slots.
 Drivers read snapshots via a seqlock pattern:
 
-1. Read `hdr->gen_current` with acquire ordering -- this is the highest
-   completed iteration.
+1. Read `hdr->gen_current` with acquire ordering -- the highest generation
+   *assigned*. It is bumped before the slot is stamped, so the newest
+   generation may not be readable yet; step 3 handles that.
 2. Pick slot = `ring[target_gen % ring_size]`.
 3. Read `slot->slot_gen` with acquire ordering. If != `target_gen` the
    slot's content belongs to a different generation; retry.
@@ -400,11 +425,16 @@ Drivers read snapshots via a seqlock pattern:
    generation still readable (`gen_current - ring_size + 2`: under ST
    the writer is already filling the slot after `gen_current`) and
    report it.
+7. Under MT a generation can be dropped and never stamped (counted in
+   `hdr->publish_dropped`). Bound the step-3 retries and treat it as lost.
 
 `fuzz_driver` counts overruns and lost generations, prints them in its
 exit summary together with `publish_dropped` (MT publishes libcov had
-to drop because a newer generation held the slot), and exits 3 if any
-coverage was lost. `FUZZ_DRIVER_BURST=1` feeds every input before
+to drop because a newer generation held the slot), and exits 3 on any
+ring overrun or failed read. Its exit code is not the target's. It feeds
+stdin one line per input (lines over 1023 bytes are split), discards the
+target's stdout, and uses its own region `/tmp/libcov_driver_<pid>`.
+`ring_dump` always exits 0; check its `OVERRUN`/`MISSING` lines instead. `FUZZ_DRIVER_BURST=1` feeds every input before
 reading anything, which makes an overrun of a small ring reproducible.
 
 `test/fuzz_driver.c` implements this in `read_slot`. There's no way to
@@ -441,14 +471,14 @@ What each boundary publishes, as tagged in the slot `flags`:
 `fuzz_driver` and `ring_dump` print each snapshot's kind
 (`kind=init|iter|gap`), and `fuzz_driver`'s exit summary counts them.
 
-For begin-only markers, the marker function's body must include
-something that produces a multi-byte branch instruction (>= the arch's
-trap-encoding length). `gen_patchlist.py` patches basic-block
-terminators, and a straight-line function ending in a single short
-return won't get patched -- so the boundary would never fire.
-`test/target_loop.c` shows the canonical pattern: an unreachable
-conditional branch inside `iter_begin` forces a 2-byte `jcc` that
-gen_patchlist picks up.
+On x86, a marker function's first basic block must contain at least one
+instruction of 2 or more bytes. It doesn't have to be a branch:
+`gen_patchlist.py` uses the block's mid-block call if there is one, else
+its last eligible (>= 2-byte) instruction. A first block made only of
+1-byte instructions (a bare `ret` at -O2) gets no site, so the boundary
+would never fire. `test/target_loop.c` shows one safeguard: an unreachable
+conditional inside `iter_begin` adds a 2-byte `jcc`. Fixed-width
+architectures don't have this problem.
 
 ### Where init coverage goes
 
@@ -621,6 +651,12 @@ under `entry` (the MIPS default, which skips branch delay slots).
 Pass `--patchlist <lcv>` to have it verify each marker really is a patched
 site (filters, slicing and MT alignment can all exclude it).
 
+Usage: `gen_boundary.py <binary> <out.lcvb> SYM[:begin|end[:any|zero]] ...
+[--patchlist LCV] [--strategy auto|entry|terminator] [--force] [-v]`.
+Markers can only be in the main executable: records carry no module index,
+and there is no `--module`. A `:zero` marker without any `end` marker is
+refused unless `--force`.
+
 ## Shm header layout
 
 `struct libcov_shm_header` (defined in `src/boundary.h`):
@@ -633,7 +669,7 @@ uint32_t map_size;        // live bitmap bytes (power of two)
 uint32_t slot_stride;     // sizeof(ring_slot_hdr) + map_size
 uint32_t flags;           // bit0 = boundaries active, bit1 = MT-variant libcov,
                           // bit2 = live bitmap not maintained (read the ring)
-uint64_t gen_current;     // atomic; last fully-published iteration
+uint64_t gen_current;     // atomic; highest generation assigned (see seqlock step 1)
 uint64_t gen_init;        // gen at which init snapshot was captured
 uint64_t bitmap_offset;   // shm-base relative
 uint64_t ring_offset;     // shm-base relative
@@ -643,9 +679,10 @@ uint32_t owner_start;     // its start time (/proc/<pid>/stat field 22, low 32 b
 uint8_t  reserved[4];
 ```
 
-After natural alignment the struct is 72 bytes. Drivers should read
-`bitmap_offset` / `ring_offset` from the header rather than hard-coding
-offsets.
+The struct is 72 bytes on every target (`_Static_assert` in
+`src/boundary.h`). Fields are written in the target's byte order. Drivers
+should read `map_size`, `bitmap_offset` and `ring_offset` from the header
+rather than hard-coding them.
 
 ## ASLR
 
@@ -714,8 +751,11 @@ ST builds, non-atomic bitmap increments).
   code pages briefly non-executable) and its leapfrog state isn't
   thread-safe, so peer threads can crash in any mode.
 - Init-time byte validation: every patch record's `orig[]` is compared
-  against the actual bytes at the target address; mismatches abort with a
-  clear log line so stale patch lists are caught immediately.
+  against the actual bytes at the target address. A mismatching site is
+  skipped and logged (`patch: stale entry at 0x… (bytes mismatch)`), and
+  the summary line reports `stale=N`. Init goes inert only if nothing at
+  all could be armed. A non-zero `stale=` almost always means the patch
+  list came from a different build than the one running.
 
 ## Limitations
 
@@ -726,7 +766,7 @@ ST builds, non-atomic bitmap increments).
   TCG keeps replaying its cached translation of the trap encoding after
   we restore the original bytes, infinite-looping the handler. On real
   hardware neither problem exists: the CPU re-fetches and there is no
-  TCG layer. MT correctness for the other 9 backends is established by
+  TCG layer. MT correctness for the other 9 architectures is established by
   build-and-link smoke + the per-arch atomic-write argument in
   `src/patch_mt.c`; real-hardware validation is a TODO.
 - **Cross-modifying code is outside the ISA guarantees.** Sites trap
@@ -745,7 +785,7 @@ ST builds, non-atomic bitmap increments).
   `RWX` once at init and then patch with plain stores. If the kernel
   refuses (SELinux `execmem`, PaX `MPROTECT`), `libcov_st.so` falls back
   to two `mprotect` calls per arm/disarm (transient `RW`, never `RWX`;
-  about 3x slower in leapfrog), and `libcov_mt.so` to non-atomic
+  about 3x slower in leapfrog, measured on x86_64), and `libcov_mt.so` to non-atomic
   `pwrite(/proc/self/mem)` with a WARNING (torn instructions become
   possible under concurrency). `LIBCOV_ST_PATCH=mprotect` forces the ST
   fallback. `test/wx_deny` reproduces such a kernel with seccomp.
@@ -797,7 +837,15 @@ test/
   target_simple_mt.c          pthread stress target for MT validation
   target_loop.c               stdin-driven loop target with iter_begin marker
   target_loop_mt.c            multi-worker boundary target (per-thread paths)
-  target_dispatch.c           generator target (function-pointer dispatch, exiting callee)
+  target_dispatch.c           generator target (function-pointer dispatch via ops_table
+                              to op_add/op_mul/op_neg; exiting callee maybe_exit)
+  target_orderable.c          ordering-sensitive target for validating block/edge/N-gram schemes
+  target_paired.c             BEGIN/END (paired-marker) target
+  target_reexec.c             re-exec / fork+exec target
+  target_demalloc.c           heap-bug target for libdemalloc
+  sigill.h                    raises a real (non-libcov) SIGILL for signal tests
+  wx_deny.c                   seccomp wrapper that simulates a W^X kernel
+  unit_mips_emulate.c         unit test for the MIPS marker emulator
   target_markers.c            marker functions covering every emulated branch form
   target_multimod.c           multi-module target (links libmultimod_helper.so)
   libmultimod_helper.c/.h     helper shared library for multi-module test
@@ -823,9 +871,23 @@ test/
                               offset and byte order vary)
   run_validation_failloud.sh  misconfigurations fail loudly (REQUIRE, oneshot+none,
                               ST in MT target, trap self-test, empty patch list)
+  run_validation_coverage_options.sh  N-gram widths, site model, RING, INIT_GRACE,
+                              LOG, TRAP_SIGNO, slicing
+  run_validation_generator_safety.sh  data-in-text / Thumb IT filters, --fail-on-overlap
+  run_validation_reexec.sh    re-exec and fork+exec region safety, %p
+  run_validation_modules.sh   symlinked/renamed/deleted/duplicate modules, MODULE_RENAME
+  run_validation_patch_mode.sh  LIBCOV_ST_PATCH auto/mprotect, W^X via wx_deny, MT pwrite
+  run_validation_paired.sh    BEGIN/END markers, init/iter/gap counts
+  run_validation_docs.sh      runs HOWTO.md recipes 1-3/6 and the README slicing
+                              example straight from the docs (x86_64 only)
+  run_validation_demalloc.sh  libdemalloc (not part of `make test`)
+  run_cross_signals.sh        cross-arch signal regression under qemu [arch...]
   run_cross.sh                all-arch ST validation under qemu-user-static
   run_cross_mt.sh             all-arch MT validation (full run for x86_64+aarch64;
                               build-only for the other 9 due to qemu-user TCG limits)
+  shm_bitmap.py usage         stats <region> | extract <region> <outfile> | gen <region>
+                              (extract needs a real file; `-` is not stdout. Reads
+                              only the live bitmap, which is empty in ST boundary mode)
 tools/
   gen_patchlist.py    rizin-based LCV3 generator; per-arch strategy
                       (terminator -- or the block's first call, so blocks
@@ -836,28 +898,44 @@ tools/
   gen_boundary.py     rizin-based LCVB1 sidecar generator; resolves symbol
                       names to their first-BB site (terminator, or entry
                       on MIPS)
+  rz_resolve.py       shared SYM_OR_ADDR resolver used by both generators
   mutate.py           generic AFL++-style mutation engine (library + CLI):
                       stdlib-only, weighted havoc + splice, AFL-format
                       dictionaries, user-defined StructuredInsert
                       factories, pre/post hooks, opt-in trace hash;
-                      `python3 tools/mutate.py --selftest` to verify
+                      `python3 tools/mutate.py --selftest` to verify;
+                      CLI: --seed F --out DIR [--count N --dict D ...]
+  libdemalloc.c       opt-in LD_PRELOAD heap-bug catcher ("poor man's ASan":
+                      guard pages, canary, bounded UAF/double-free
+                      quarantine); `make tools` -> build/<arch>/libdemalloc.so
+  inject/             standalone injector that loads libcov into an
+                      already-running PID (inject_ptrace: works on x86_64,
+                      aarch64 builds but is not runtime-validated, other
+                      arches are stubs; inject_procmem is a stub). Separate
+                      build: `make -C tools/inject`. See tools/inject/README.md
+HOWTO.md              step-by-step operational guide (build -> generate -> run -> read)
 TODO.md               deferred design work (daemons, transport, etc.)
 ```
 
 ## Validation
 
-`make test` builds both library variants and every test target, then runs
-every native suite below and prints a PASS/FAIL summary (logs of failing
-suites are kept). Suites use a fresh `mktemp -d` each, so they can run in
-parallel. To run one by hand:
+`make test` builds both library variants and every test target (`all mt
+multimod o2pie`), then runs all 17 native suites (the list is
+`NATIVE_SUITES` in the Makefile) one after another, and prints a PASS/FAIL
+summary (logs of failing suites are kept). It refuses to run when `ARCH`
+isn't the host arch. Each suite uses its own `mktemp -d`, so you can run
+suites concurrently by hand, but `make test` itself is sequential.
+
+To run one by hand, build the prerequisites first; most suites exit with
+"missing …" after plain `make`:
 
 ```
+make && make THREADING=mt && make -C test all mt multimod o2pie
+
 # Native (x86_64) ST regression:
-make
 ./test/run_validation.sh
 
-# Native (x86_64) MT regression + 16-thread/2000-iter stress:
-make THREADING=mt
+# Native (x86_64) MT regression + 16-thread/2000-iter stress (+ a tgkill pass):
 ./test/run_validation_mt.sh
 
 # Native (x86_64) boundary mode (long-running target_loop + ring reader):
@@ -883,11 +961,15 @@ make THREADING=mt
 # checks the non-emulated fallback):
 ./test/run_validation_marker_emulation.sh
 
-# All backends, ST, under qemu-user-static:
+# Also in `make test`: coverage_options, generator_safety, reexec, modules,
+# patch_mode, paired (see Files above):
+./test/run_validation_paired.sh   # etc.
+
+# All 11 architectures + arm-thumb, ST, under qemu-user-static:
 ./test/run_cross.sh        # PASS=12  FAIL=0  SKIP=0
 
-# All backends, MT, under qemu-user-static:
-./test/run_cross_mt.sh     # FULL_PASS=2 BUILD_ONLY=9 FAIL=0 SKIP=0
+# All 11 architectures, MT, under qemu-user-static:
+./test/run_cross_mt.sh     # FULL_PASS=2  BUILD_ONLY=9  FAIL=0  SKIP=0
 ```
 
 ST per-backend checks: bitmap determinism, input differentiation
@@ -902,8 +984,9 @@ target build, and patch-list generation; runtime validation requires
 real hardware -- see `src/patch_mt.c` for the per-arch atomic-write
 argument and `TODO.md` for the real-hardware backlog.
 
-Boundary-mode checks: per-iteration snapshots arrive in the ring (one
-per input + init slot + EOF-flush slot), `gen_init` is recorded, the
+Boundary-mode checks: per-iteration snapshots arrive in the ring (N
+inputs give N+1 gens: the init slot, then one per input, the last of which
+is published at EOF), `gen_init` is recorded, the
 seqlock reader never reports torn reads or overruns at this rate,
 per-iteration bitmaps differ across inputs (confirming libcov really
 clears the live bitmap between iterations), and all three viable
@@ -911,8 +994,10 @@ clears the live bitmap between iterations), and all three viable
 
 ## What's next
 
-See [TODO.md](TODO.md) for the design backlog. Short version: this PoC
-proves the trampoline mechanism across architectures. The next phase
-makes it useful against long-running network daemons (iteration boundary
-detection, multi-module patch lists, fork-per-connection, multi-thread,
-remote coverage transport via a separate relay binary).
+See [TODO.md](TODO.md) for the design backlog. Iteration boundaries,
+multi-module patch lists, multi-threading and re-exec handling are
+already implemented (above). Still open: daemon lifecycle work,
+fork-per-connection (`suzzer-forkserver`), runtime-selectable N-gram
+width, and remote coverage transport via a separate relay binary
+(`suzzer-relay`). There is no network transport today; see HOWTO.md §9
+for remote-collection patterns that work now.
