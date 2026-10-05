@@ -821,6 +821,8 @@ src/
   sink_shm.c          shm region (header + bitmap + ring); prev_loc def
   boundary.h/.c       LCVB1 parser; marker lookup; snapshot publish; re-arm;
                       per-thread depth + live bitmaps under MT
+  ring_reader.h       header-only client-side ring reader (attach + seqlock +
+                      overrun accounting); shared by fuzz_driver/ring_dump/relay
   membarrier.h/.c     MT-only; PRIVATE_EXPEDITED_SYNC_CORE, or a signal broadcast
                       to every peer thread on kernels without it
   arch.h              backend interface (extern symbols, no #ifdefs)
@@ -849,6 +851,7 @@ test/
   target_markers.c            marker functions covering every emulated branch form
   target_multimod.c           multi-module target (links libmultimod_helper.so)
   libmultimod_helper.c/.h     helper shared library for multi-module test
+  target_netd.c               single-process TCP daemon for the remote template
   fuzz_driver.c               boundary-aware driver (seqlock reader)
   ring_dump.c                 passive ring reader for self-iterating targets
   run_validation.sh           native ST regression test (single-shot)
@@ -878,6 +881,8 @@ test/
   run_validation_modules.sh   symlinked/renamed/deleted/duplicate modules, MODULE_RENAME
   run_validation_patch_mode.sh  LIBCOV_ST_PATCH auto/mprotect, W^X via wx_deny, MT pwrite
   run_validation_paired.sh    BEGIN/END markers, init/iter/gap counts
+  run_validation_relay.sh     remote fuzzing template end to end on loopback
+                              (suzzer-relay + suzzer_brain.py + target_netd)
   run_validation_docs.sh      runs HOWTO.md recipes 1-3/6 and the README slicing
                               example straight from the docs (x86_64 only)
   run_validation_demalloc.sh  libdemalloc (not part of `make test`)
@@ -908,6 +913,10 @@ tools/
   libdemalloc.c       opt-in LD_PRELOAD heap-bug catcher ("poor man's ASan":
                       guard pages, canary, bounded UAF/double-free
                       quarantine); `make tools` -> build/<arch>/libdemalloc.so
+  suzzer-relay.c      on-device coverage relay for remote (over-IP) fuzzing;
+  relay_proto.h       `make -C tools relay`. Wire protocol in relay_proto.h.
+  suzzer_brain.py     off-device reference fuzzing brain (mutate + score +
+                      save crashes); pairs with suzzer-relay. See HOWTO §14.1
   inject/             standalone injector that loads libcov into an
                       already-running PID (inject_ptrace: works on x86_64,
                       aarch64 builds but is not runtime-validated, other
@@ -920,7 +929,7 @@ TODO.md               deferred design work (daemons, transport, etc.)
 ## Validation
 
 `make test` builds both library variants and every test target (`all mt
-multimod o2pie`), then runs all 17 native suites (the list is
+multimod o2pie`), then runs all 18 native suites (the list is
 `NATIVE_SUITES` in the Makefile) one after another, and prints a PASS/FAIL
 summary (logs of failing suites are kept). It refuses to run when `ARCH`
 isn't the host arch. Each suite uses its own `mktemp -d`, so you can run

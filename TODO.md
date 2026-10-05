@@ -19,6 +19,17 @@ Priorities:
 Every fix has a regression check. `test/run_validation_signals.sh` and
 the MT stress test fail against the pre-fix code.
 
+- **Remote (over-IP) fuzzing template** (2026-10). `tools/suzzer-relay.c`
+  (on-device TCP relay: spawns the target under libcov with an eventfd notify,
+  reads the ring with the new shared `src/ring_reader.h`, delivers inputs to
+  the daemon's port, forwards one COVERAGE/CRASH per input) +
+  `tools/suzzer_brain.py` (off-device loop over `tools/mutate.py`) +
+  `tools/relay_proto.h` + template daemon `test/target_netd.c`. The relay
+  decodes the shm header on the device, so the brain never parses a foreign
+  ABI. `test/run_validation_relay.sh` runs the whole path on loopback (HELLO,
+  per-seed new coverage, a planted crash). `fuzz_driver` was refactored onto
+  `ring_reader.h` with identical output. Design.md §24, HOWTO §14.1. Scope:
+  single-process daemons, plain TCP; fork-per-connection is still open.
 - **MT torn instruction writes** (`src/patch_mt.c`). The old primary
   path, `pwrite(/proc/self/mem)`, uses the kernel's memcpy, which stores
   2-4 byte lengths byte by byte. A peer CPU could fetch half UD2 and half
@@ -434,10 +445,14 @@ the MT stress test fail against the pre-fix code.
 - Hybrid publish (an edge map plus an N-gram map) when a consumer needs it.
 
 ### Tooling
-- `suzzer-relay`: an on-device bitmap server (TCP, serial, …).
-- `suzzer-driver`: a real fuzz loop to replace `test/fuzz_driver.c`.
+- `suzzer-relay` / `suzzer-driver`: **delivered as a template** (see the
+  fixed list) -- `tools/suzzer-relay.c` (on-device TCP relay) and
+  `tools/suzzer_brain.py` (off-device fuzz loop), `test/run_validation_relay.sh`.
+  Remaining follow-ups: fork-per-connection daemons (shared region; ties to
+  the P1 fork item and the daemon backlog), other transports (serial), TLS,
+  multi-device, and a one-shot/process-per-input delivery mode.
 - `suzzer-forkserver`: AFL++-compatible, for short-lived targets; keep
-  it out of core.
+  it out of core. Still open.
 
 ### Architectures
 - i386 (UD2, `REG_EIP`), mips r6 / nanoMIPS validation, aarch64_be,

@@ -13,7 +13,7 @@ CFLAGS  ?= -O0 -g -Wall -Wextra
 DEPFLAGS := -MMD -MP
 CFLAGS   += $(DEPFLAGS)
 
-.PHONY: all clean mt loop demalloc multimod o2pie
+.PHONY: all clean mt loop demalloc multimod o2pie netd
 
 all: $(BUILD)/target_simple $(BUILD)/target_loop $(BUILD)/target_orderable \
      $(BUILD)/target_dispatch $(BUILD)/target_markers $(BUILD)/fuzz_driver
@@ -36,6 +36,10 @@ loop: $(BUILD)/target_loop
 # run_validation_demalloc.sh; not pulled by `all` because libdemalloc
 # itself is opt-in.
 demalloc: $(BUILD)/target_demalloc
+
+# Template network daemon for the remote-fuzzing suite
+# (run_validation_relay.sh). Built on demand by that suite, not by `all`.
+netd: $(BUILD)/target_netd
 
 # -no-pie keeps test addresses static for easy patch-list generation.
 # -fno-stack-protector trims function prologue noise.
@@ -99,9 +103,13 @@ thumb: $(BUILD)/target_simple_thumb $(BUILD)/target_markers_thumb
 # can't synthesize 64-bit atomics natively (32-bit arches: mips, mipsel,
 # powerpc). On 64-bit arches __atomic_load_8 is inline and the library
 # stays unlinked.
-$(BUILD)/fuzz_driver: fuzz_driver.c ../src/boundary.h ../src/sink.h
+$(BUILD)/fuzz_driver: fuzz_driver.c ../src/ring_reader.h ../src/boundary.h
 	$(CC) -O2 -g -Wall -Wextra $(DEPFLAGS) -I../src -o $@ fuzz_driver.c \
 	    -Wl,--as-needed -latomic
+
+# Single-process TCP daemon target for the remote-fuzzing template.
+$(BUILD)/target_netd: target_netd.c
+	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -o $@ $<
 
 $(BUILD)/target_simple_mt: target_simple_mt.c
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -pthread -o $@ $<
@@ -143,5 +151,6 @@ clean:
 	       $(BUILD)/target_simple_mt $(BUILD)/target_loop \
 	       $(BUILD)/target_loop_mt $(BUILD)/ring_dump \
 	       $(BUILD)/target_demalloc $(BUILD)/fuzz_driver \
+	       $(BUILD)/target_netd \
 	       $(BUILD)/target_multimod $(BUILD)/libmultimod_helper.so \
 	       $(BUILD)/*.d

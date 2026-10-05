@@ -333,6 +333,8 @@ src/
   boundary.c, boundary.h
                         LCVB1 sidecar, marker detection, snapshot ring
                         publish, re-arm policies, per-thread bitmaps (§21)
+  ring_reader.h         header-only client-side ring reader (attach, seqlock,
+                        overrun accounting); for consumers, not the library (§24)
   membarrier.h, membarrier.c
                         MT-only; PRIVATE_EXPEDITED_SYNC_CORE wrapper with
                         init-time detection + signal-broadcast fallback
@@ -367,17 +369,21 @@ tools/
                         the file's module docstring for the full API
   libdemalloc.c, Makefile
                         opt-in LD_PRELOAD heap-bug catcher (`make tools`)
+  suzzer-relay.c, relay_proto.h
+                        on-device coverage relay for remote fuzzing; `make -C
+                        tools relay` (§24)
+  suzzer_brain.py       off-device reference fuzzing brain (§24)
   inject/               standalone live-process injector (own Makefile,
                         README and Design.md)
 
 test/
   target_*.c            ground-truth targets (simple, simple_mt, loop,
                         loop_mt, dispatch, markers, multimod, orderable,
-                        paired, reexec, signals, demalloc)
+                        paired, reexec, signals, demalloc, netd)
   fuzz_driver.c         boundary-aware driver (seqlock ring reader)
   ring_dump.c           passive ring reader for self-iterating targets
   shm_bitmap.py         header-aware live-bitmap reader
-  run_validation*.sh    native suites (17 run by `make test` via run_all.sh)
+  run_validation*.sh    native suites (18 run by `make test` via run_all.sh)
   run_cross*.sh         cross-arch suites under qemu-user-static
   wx_deny.c, sigill.h, unit_mips_emulate.c, libmultimod_helper.c
                         test helpers
@@ -1170,7 +1176,7 @@ make ARCH=aarch64         # cross-build for aarch64
 make all-arch             # every ARCH (11 architectures, 8 backends)
 make all-variants         # ST and MT for every ARCH
 make native               # library only, no test targets
-make test                 # build both variants + all test targets, run 17 native suites
+make test                 # build both variants + all test targets, run 18 native suites
 make tools                # opt-in libdemalloc.so
 make print-vars           # resolved ARCH/BACKEND/THREADING/SRC/LIB
 make clean                # rm -rf build
@@ -1258,13 +1264,14 @@ For the host arch, runs four checks:
 4. **Output unchanged**: target stdout under libcov equals target stdout
    without libcov.
 
-`make test` runs 17 native suites one after another through
+`make test` runs 18 native suites one after another through
 `test/run_all.sh` (the `NATIVE_SUITES` list in the Makefile):
 
 - run_validation, _mt, _boundary, _boundary_mt, _multimod, _signals
 - _coverage_options, _failloud, _generator, _generator_safety, _o2pie
 - _marker_emulation, _reexec, _modules, _patch_mode, _paired
 - _docs (runs HOWTO.md/README.md recipes extracted from the docs)
+- _relay (remote fuzzing template end to end on loopback; §24)
 
 Not in `make test`: `run_cross.sh`, `run_cross_mt.sh`,
 `run_cross_signals.sh`, `run_validation_demalloc.sh`. HOWTO.md §11
@@ -1639,8 +1646,10 @@ These are inherent to the present scope, not bugs:
    only where a sidecar can name a marker function in the main
    executable. Without one, the bitmap is cumulative and the driver must
    scope per process.
-3. **No remote transport.** Coverage is local-only (shared memory). A
-   relay binary is planned (see TODO.md).
+3. **No in-library remote transport.** libcov itself writes only to local
+   shared memory. Over-IP collection is an out-of-process template
+   (`tools/suzzer-relay` + `tools/suzzer_brain.py`, §24), not a library
+   feature; a fork-per-connection daemon is still out of scope there.
 4. **Raw signal syscalls bypass interception.** `sigaction`, `signal`,
    `sigprocmask`, `pthread_sigmask` and glibc's older wrappers
    (`bsd_signal`, `ssignal`, `sysv_signal`/`__sysv_signal`, `sigset`,
@@ -1782,6 +1791,8 @@ hit a marker keep emitting into the shared bitmap at `bitmap_offset`.
 - `tools/inject/`: a standalone injector that loads libcov into an
   already-running PID through ptrace (working on x86_64, build-only stubs
   elsewhere). It has its own Makefile, README.md and Design.md.
+- `tools/suzzer-relay` + `tools/suzzer_brain.py`: the remote fuzzing
+  template (§24).
 
 ---
 
@@ -1795,6 +1806,69 @@ hit a marker keep emitting into the shared bitmap at `bitmap_offset`.
   conventions for rizin function names.
 - `test/run_cross.sh` — canonical "is everything still working across
   architectures" command; `make test` for the native suites.
+
+---
+
+## 24. Remote coverage transport (`tools/suzzer-relay`, `tools/suzzer_brain.py`)
+
+libcov writes only to a local shm region (§9, §20–§21). Over-IP fuzzing is an
+out-of-process template, not a library feature: a small C relay on the device
+and a Python brain off-device, one TCP connection between them. HOWTO.md §14.1
+is the operator's guide; this is the design.
+
+**Components.**
+- `src/ring_reader.h` — header-only client-side ring reader (attach, seqlock
+  `rr_read_slot`, overrun-accounting `rr_drain_to`), shared by `fuzz_driver`,
+  `ring_dump` and the relay so the seqlock lives in one place.
+- `tools/suzzer-relay.c` (device) — spawns the target under libcov with an
+  **eventfd** on `LIBCOV_BOUNDARY_NOTIFY_FD`, attaches to the ring, and
+  bridges to the brain.
+- `tools/relay_proto.h` — the wire framing (shared reference for both ends).
+- `tools/suzzer_brain.py` (off-device) — mutates with `tools/mutate.py`,
+  folds returned bitmaps into a cumulative map, keeps new-coverage inputs,
+  saves crashes.
+- `test/target_netd.c` — a single-process TCP template daemon with paired
+  `req_begin`/`req_end` markers around its handler.
+
+**Protocol.** One persistent TCP connection; the relay dials the brain,
+sends a 4-byte magic, then both exchange `[u32 len][u8 type][payload]` frames
+(`SZR_HELLO`, `SZR_INPUT`, `SZR_COVERAGE`, `SZR_CRASH`, `SZR_BYE`). All
+header integers are network byte order.
+
+**Why the brain never parses a foreign header.** The relay decodes the shm
+header *on the device* (native byte order) and sends a `COVERAGE` frame
+carrying an already-decoded `map_size` plus the raw `uint8` counter bitmap.
+Counter bytes are order-independent, so a big-endian or 32-bit device needs no
+special handling on the brain — unlike the shared-filesystem / ssh patterns
+(HOWTO §9 A/B), which ship the raw header and must byte-swap it.
+
+**Lockstep.** One input is in flight at a time, and every `INPUT` gets exactly
+one reply:
+1. Brain sends `INPUT(id, bytes)`.
+2. Relay connects to the daemon's own port, writes the bytes, half-closes and
+   drains the reply. For a paired-marker daemon the reply EOF arrives *after*
+   `req_end` has fired the boundary, so by then the eventfd is already
+   signalled — the relay wakes on it, reads the ring, and replies.
+3. Relay sends `COVERAGE(id, gen, kind, map_size, bitmap)` — the request's
+   `ITER` snapshot (it drains and drops the between-request `GAP`/startup
+   `INIT` gens). If the daemon died, it sends `CRASH(id, reason, status)` and
+   restarts the daemon (and re-attaches, since the region resets under a new
+   owner, §20).
+
+The brain scores only `ITER` frames (new nonzero bytes vs. its cumulative
+map), enqueues inputs that found coverage, and writes `CRASH` inputs to
+`out/crashes/`.
+
+**Scope and limitations.** Single-process daemon (one process handles requests
+in a loop); plain TCP, no auth; one input in flight. A fork-per-connection
+daemon shares one region across children (§19 limitation, TODO.md
+fork-per-connection) and is not handled. A one-shot / process-per-input target
+would instead have the relay re-spawn per input and read the cumulative
+`bitmap_offset` after `waitpid` — a future variant.
+
+`test/run_validation_relay.sh` runs relay + brain + `target_netd` on loopback:
+HELLO negotiated, distinct seeds reach distinct coverage, a planted crash is
+reported and saved.
 
 ---
 

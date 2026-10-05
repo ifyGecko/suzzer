@@ -625,14 +625,15 @@ still works without it.
 **What exists today:** libcov writes coverage to a **shared-memory region or a
 file** (`LIBCOV_SHM_PATH`) and optionally signals an **eventfd**
 (`LIBCOV_BOUNDARY_NOTIFY_FD`). Any reader that can reach that region reads
-coverage. There is **no built-in network transport**: `suzzer-relay` (an
-on-device TCP/serial bitmap server) is on the backlog in
-[TODO.md](TODO.md#L437), **not implemented**. So "remote" means one of the
-patterns below, built from the shared-region primitive.
+coverage. There is no *in-library* network transport, but there **is a shipped
+over-IP template**: the on-device relay [`tools/suzzer-relay.c`](tools/suzzer-relay.c)
+and the off-device reference brain [`tools/suzzer_brain.py`](tools/suzzer_brain.py),
+talking TCP (Pattern C below; driven in §14.1, protocol in Design.md §24).
 
 The usual split: the **target runs on a device** (embedded board, VM, remote
 host); the **fuzzer brain runs elsewhere** and needs the bitmap. Pick a
-transport by how tightly coupled the two are.
+transport by how tightly coupled the two are — Pattern C (the relay) is the
+push-based default; A/B/D are lighter-weight alternatives.
 
 ### Pattern A — Shared filesystem (simplest; NFS / 9p / virtio-fs)
 
@@ -671,25 +672,36 @@ compute `stats` on the device instead, ship the stdlib-only `shm_bitmap.py`
 along with a Python install. For a long-running target in ST boundary mode,
 the live bitmap is empty (§8 caveat), so you need Pattern C.
 
-### Pattern C — On-device reader ships bitmaps (tightest; you build a tiny relay)
+### Pattern C — On-device relay pushes snapshots (tightest; a shipped template)
 
-When the network link is the only channel and you want per-iteration
-snapshots pushed as they happen, run a small reader **on the device** that
-uses the eventfd notify and writes each snapshot to a socket. This is the
-`suzzer-relay` role; until it ships, build a minimal one by adapting
-[`test/ring_dump.c`](test/ring_dump.c) (it already attaches to the ring and
-reads snapshots). The shape:
+When the network link is the only channel and you want coverage pushed as it
+happens, run [`tools/suzzer-relay.c`](tools/suzzer-relay.c) on the device and
+the reference brain [`tools/suzzer_brain.py`](tools/suzzer_brain.py)
+off-device. This is the worked template; see §14.1 for how to drive it and
+Design.md §24 for the protocol. The shape:
 
-1. Device: start the target with `LIBCOV_BOUNDARY_LIST` and
-   `LIBCOV_BOUNDARY_NOTIFY_FD=<eventfd>`.
-2. Device-side relay: block on the eventfd, run the seqlock read (§8), write
-   `{gen, kind, map_size, bitmap}` to a TCP socket.
-3. Brain: connect, receive framed snapshots, score, send back the next input
-   (over a second channel — e.g. the target's stdin forwarded over the net).
+1. **Device:** `suzzer-relay` spawns the target daemon under libcov (it sets
+   `LD_PRELOAD`, the patch list, the boundary list, and an **eventfd** on
+   `LIBCOV_BOUNDARY_NOTIFY_FD`), attaches to the shm ring, and dials the
+   brain over TCP.
+2. For each input the brain sends, the relay delivers it to the daemon's own
+   port, wakes on the eventfd, does the seqlock read (§8), and sends back one
+   `COVERAGE` frame (the request's `ITER` snapshot) — or a `CRASH` frame if
+   the daemon died, after which it restarts the daemon.
+3. **Brain:** mutates with [`tools/mutate.py`](tools/mutate.py), folds each
+   returned bitmap into a cumulative map, keeps inputs that found new
+   coverage, and saves crashes.
 
-Keep the framing explicit (include `map_size` and a byte-order marker in each
-frame) so the brain never assumes the device's ABI. **Do not** send the target
-a notify fd that is a pipe — use an eventfd (see §8).
+The relay parses the shm header **on the device**, so each frame carries a
+decoded `map_size` plus the raw `uint8` bitmap — the brain never parses a
+foreign-ABI header, which sidesteps the byte-order pitfalls of Patterns A/B.
+**Do not** hand the target a notify fd that is a pipe — it must be an eventfd
+(the relay uses one; see §8).
+
+This template targets a **single-process** daemon (one process handles
+requests in a loop). A fork-per-connection daemon shares one coverage region
+across children (ST non-atomic increments, interleaved snapshots); that case
+is the next step, not yet handled (see [TODO.md](TODO.md)).
 
 ### Pattern D — qemu-user on the brain host (no real device at all)
 
@@ -704,7 +716,7 @@ the cross test suites do.
 |---|---|
 | Device and brain share storage (VM + virtio-fs, board + NFS) | **A** |
 | Device reachable by SSH, modest iteration rate | **B** |
-| High iteration rate, push-based, only a network socket | **C** (build relay from `ring_dump`) |
+| High iteration rate, push-based, only a network socket | **C** (`suzzer-relay` + the brain, §14.1) |
 | No device yet / CI / bring-up | **D** (qemu-user) |
 
 ### Remote correctness checklist
@@ -758,7 +770,7 @@ make test
 ```
 
 Builds both library variants and every test target (`all mt multimod
-o2pie`), runs all 17 **native** suites one after another, and prints a
+o2pie`), runs all 18 **native** suites one after another, and prints a
 PASS/FAIL summary (failing-suite logs are kept). It refuses to run when
 `ARCH` is not the host arch. Each suite uses its own `mktemp -d`, so you can
 safely run suites concurrently by hand; `make test` itself is sequential.
@@ -787,6 +799,7 @@ make && make THREADING=mt && make -C test all mt multimod o2pie
 ./test/run_validation_patch_mode.sh           # LIBCOV_ST_PATCH auto/mprotect, W^X simulation
 ./test/run_validation_paired.sh               # BEGIN/END markers, init/iter/gap counts
 ./test/run_validation_docs.sh                 # runs this guide's Recipes 1-3, 6 + README example
+./test/run_validation_relay.sh                # remote fuzzing template, end to end on loopback
 ```
 
 > **Editing this guide?** `run_validation_docs.sh` extracts the code blocks
@@ -948,7 +961,60 @@ ssh dev 'cat /dev/shm/cov' > /tmp/dev_cov.raw
 ## 14. Optional tooling
 
 None of this is needed for basic coverage collection, and none of it is
-built by `make`.
+built by `make` (the relay has its own goal).
+
+<a name="14-1-remote"></a>
+### 14.1 Remote fuzzing: `suzzer-relay` + the brain
+
+The on-device relay [`tools/suzzer-relay.c`](tools/suzzer-relay.c) and the
+off-device reference brain [`tools/suzzer_brain.py`](tools/suzzer_brain.py)
+are the worked template for Pattern C (§9). The relay spawns a **single-process
+network daemon** under libcov, reads the snapshot ring on the device, and
+bridges one TCP connection to the brain; the brain mutates, scores novelty and
+saves crashes. [`test/target_netd.c`](test/target_netd.c) is a template daemon
+(paired `req_begin`/`req_end` markers around its request handler).
+
+Build the relay (cross-compiles like any other backend tool):
+
+```bash
+make -C tools relay ARCH=x86_64 BUILD=$PWD/build/x86_64
+make -C test  netd  ARCH=x86_64 BUILD=$PWD/build/x86_64
+```
+
+Generate a patch list and a **paired** boundary sidecar whose markers wrap the
+request handler:
+
+```bash
+./tools/gen_patchlist.py build/x86_64/target_netd /tmp/n.lcv --root main
+./tools/gen_boundary.py  build/x86_64/target_netd /tmp/n.lcvb \
+    req_begin:begin req_end:end --patchlist /tmp/n.lcv
+```
+
+Run the brain off-device (here, another terminal) and the relay on the device.
+The brain listens; the relay dials in. The brain prints the port it bound:
+
+```bash
+# Brain (off-device). Listens on 0 = an ephemeral port; use a fixed one in practice.
+python3 tools/suzzer_brain.py --listen 0.0.0.0:7000 --seeds ./seeds --out ./out
+
+# Relay (on the device). It spawns target_netd, which writes its own port to
+# the --port-file; the relay delivers each input to 127.0.0.1:<that port>.
+./build/x86_64/suzzer-relay \
+    --brain BRAIN_HOST:7000 --port-file /tmp/netd.port \
+    --libcov $PWD/build/x86_64/libcov_st.so \
+    --patchlist /tmp/n.lcv --boundary /tmp/n.lcvb --shm /tmp/relaycov \
+    -- $PWD/build/x86_64/target_netd /tmp/netd.port
+```
+
+The brain writes crashing inputs to `./out/crashes/` and logs each input that
+reached new coverage. One `INPUT` gets exactly one `COVERAGE` or `CRASH` reply
+(lockstep). To point it at your own daemon, give the relay your binary and a
+boundary sidecar for your handler's entry/exit, and make sure the daemon binds
+a port it writes to `--port-file` (or adapt the relay's delivery to your
+transport). `test/run_validation_relay.sh` runs this whole path on loopback.
+
+**Scope:** single-process daemon, plain TCP (no auth), one input in flight.
+Fork-per-connection daemons and encryption are out of scope (see TODO.md).
 
 - **Mutation engine — [`tools/mutate.py`](tools/mutate.py).** An AFL++-style
   havoc mutator, used as a CLI or imported as a library
