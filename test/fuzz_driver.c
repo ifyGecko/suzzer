@@ -116,6 +116,12 @@ int main(int argc, char **argv) {
         return 1;
     }
     volatile struct libcov_shm_header *hdr = shm_base;
+    {
+        char sch[64];
+        printf("driver: scheme %s\n",
+               rr_scheme(__atomic_load_n((uint32_t *)&hdr->flags, __ATOMIC_ACQUIRE),
+                         sch, sizeof sch));
+    }
 
     uint8_t *scratch    = malloc(map_size);
     uint8_t *cumulative = calloc(1, map_size);

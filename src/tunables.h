@@ -98,14 +98,23 @@
  *     map_size = next_pow2(n_sites * LIBCOV_MAP_FUDGE), clamped.
  *   The extra slots above n_sites give the N-gram fold room to spread so
  *   distinct (cur, history) tuples collide less. Only consulted when
- *   LIBCOV_COVERAGE_MODEL_SITE=1. Default 16 (headroom for N=3 folds).
- *   For pure block coverage (N=1) the fudge only wastes (harmless) memory --
- *   a smaller value such as 2 is sufficient there.
+ *   LIBCOV_COVERAGE_MODEL_SITE=1.
  *
- *   Override at build: -DLIBCOV_MAP_FUDGE=8
+ *   Default: scales with LIBCOV_NGRAM_N, since each extra history position
+ *   multiplies the number of distinct tuples a site can take part in:
+ *     N=1 -> 2   (block coverage is collision-free at any size >= n_sites;
+ *                 more headroom only wastes memory)
+ *     N=2 -> 16  (the historical default)
+ *     N>=3 -> 16 << (N-2), i.e. doubling per position (N=4 -> 64,
+ *                 N=8 -> 1024)
+ *   LIBCOV_MAP_MAX_POW2 still caps the result. Init logs the fudge, the
+ *   buckets per site and an expected collision rate.
+ *
+ *   Override at build (replaces the N-scaled default): -DLIBCOV_MAP_FUDGE=8
  */
 #ifndef LIBCOV_MAP_FUDGE
-#define LIBCOV_MAP_FUDGE 16u
+#define LIBCOV_MAP_FUDGE \
+    (LIBCOV_NGRAM_N <= 1 ? 2u : (16u << (LIBCOV_NGRAM_N - 2)))
 #endif
 
 /* LIBCOV_MAP_MIN_POW2 / LIBCOV_MAP_MAX_POW2

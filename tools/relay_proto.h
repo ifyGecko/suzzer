@@ -31,7 +31,10 @@ enum szr_frame_type {
 
 /* HELLO payload (network byte order):
  *   u16 proto_version
- *   u16 flags          bit0 = target is MT, bit1 = ST boundary mode
+ *   u16 flags          bit0 = target is MT, bit1 = ST boundary mode,
+ *                      bit2 = bits 3..4 and 8..11 are valid (coverage scheme),
+ *                      bit3 = hashed-PC model (clear: site-id),
+ *                      bit4 = N-gram rotation, bits 8..11 = N-gram N
  *   u32 map_size       coverage bitmap length (bytes)
  *   u16 ring_size
  *   u16 arch_len
@@ -39,6 +42,10 @@ enum szr_frame_type {
  */
 #define SZR_HELLO_FLAG_MT          0x1u
 #define SZR_HELLO_FLAG_LIVE_EMPTY  0x2u
+#define SZR_HELLO_FLAG_SCHEME      0x4u
+#define SZR_HELLO_FLAG_MODEL_PC    0x8u
+#define SZR_HELLO_FLAG_ROTATE      0x10u
+#define SZR_HELLO_NGRAM_SHIFT      8
 
 /* INPUT payload:
  *   u64 id             brain-chosen, echoed back in COVERAGE/CRASH

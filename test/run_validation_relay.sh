@@ -90,7 +90,9 @@ echo "----- brain.log -----"; cat "$WORK/brain.log"; echo "---------------------
 
 # 1. HELLO negotiated.
 grep -q "HELLO proto=" "$WORK/brain.log" || fail "no HELLO negotiated"
-echo "   OK: HELLO negotiated over TCP"
+grep -q "HELLO .* scheme=n=2 model=site rotate=0" "$WORK/brain.log" \
+    || fail "HELLO did not carry the default coverage scheme"
+echo "   OK: HELLO negotiated over TCP (scheme n=2 model=site rotate=0)"
 
 # 2. Each distinct seed reached new coverage (coverage discriminates inputs).
 for s in Ahello Bzork 'Cworld!'; do

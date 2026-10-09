@@ -532,7 +532,8 @@ the value in the header or by passing `-D` flags at build time; the
 - `LIBCOV_TRAP_SIGNO` (default `SIGILL`).
 - `LIBCOV_COVERAGE_MODEL_SITE` (default 1 = site-id model; 0 = legacy
   hashed-PC model). See §9.
-- `LIBCOV_MAP_FUDGE` (16), `LIBCOV_MAP_MIN_POW2` (12), `LIBCOV_MAP_MAX_POW2`
+- `LIBCOV_MAP_FUDGE` (scales with N: 2 at N=1, 16 at N=2, `16 << (N-2)`
+  above), `LIBCOV_MAP_MIN_POW2` (12), `LIBCOV_MAP_MAX_POW2`
   (24): site-id map sizing, `next_pow2(n_sites * FUDGE)` clamped to
   `[1<<MIN, 1<<MAX]` and never below `next_pow2(n_sites)`.
 - `LIBCOV_MAP_SIZE_POW2` (default 16): fixed map size, **hashed-PC model
@@ -744,7 +745,7 @@ in the constructor.
 
 - One `uint8_t` per bucket, saturating at 255 (AFL-style hit counts).
 - Size: under the default site-id model,
-  `next_pow2(n_sites * LIBCOV_MAP_FUDGE)` (FUDGE 16), clamped to
+  `next_pow2(n_sites * LIBCOV_MAP_FUDGE)` (FUDGE 16 at the default N=2), clamped to
   `[1<<LIBCOV_MAP_MIN_POW2, 1<<LIBCOV_MAP_MAX_POW2]` = [4 KiB, 16 MiB] but
   never below `next_pow2(n_sites)`. Under the legacy hashed-PC model it
   is a fixed `1 << LIBCOV_MAP_SIZE_POW2` (64 KiB). The runtime value is in
@@ -787,8 +788,10 @@ sink_emit(pc, midx, site_id):
 
 Under the site-id model the current site contributes its *raw* id, and
 only the history is spread across the map, so collisions arise only in
-the fold step. N=1 is collision-free by construction; at N>=2, raise
-`LIBCOV_MAP_FUDGE` for path-sensitive work. Under the hashed-PC model,
+the fold step. N=1 is collision-free by construction; at N>=2 the
+default `LIBCOV_MAP_FUDGE` doubles per history position, and init logs
+an expected collision share (`1 - e^{-(k-1)/map_size}` for k distinct
+N-grams, at k = n_sites and 8 * n_sites). Under the hashed-PC model,
 N=2 is AFL's exact math, and the `cur >> 1` shift when inserting into
 `prev[0]` is what makes A->B and B->A index to different buckets. The
 site-id model doesn't need the shift, because raw-current vs.

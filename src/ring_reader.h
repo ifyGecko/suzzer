@@ -104,6 +104,20 @@ static inline int rr_attach(const char *path, int require_active, unsigned timeo
     }
 }
 
+/* "n=<N> model=site|pc rotate=0|1" from the header's scheme bits, or
+ * "unknown" for a region written by a libcov that predates them. */
+static inline const char *rr_scheme(uint32_t flags, char *buf, size_t n) {
+    if (!(flags & LIBCOV_SHM_FLAG_SCHEME)) {
+        snprintf(buf, n, "unknown");
+    } else {
+        snprintf(buf, n, "n=%u model=%s rotate=%d",
+                 (unsigned)LIBCOV_SHM_NGRAM(flags),
+                 (flags & LIBCOV_SHM_FLAG_MODEL_PC) ? "pc" : "site",
+                 (flags & LIBCOV_SHM_FLAG_ROTATE) ? 1 : 0);
+    }
+    return buf;
+}
+
 static inline unsigned rr_count_set(const uint8_t *map, size_t map_size) {
     unsigned c = 0;
     for (size_t i = 0; i < map_size; i++) if (map[i]) c++;

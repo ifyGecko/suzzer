@@ -4,6 +4,8 @@
     shm_bitmap.py extract <shm> <out>   write the live bitmap to <out>
     shm_bitmap.py stats   <shm>         print "<nonzero> <sum> <max>"
     shm_bitmap.py gen     <shm>         print the header's gen_current
+    shm_bitmap.py scheme  <shm>         print "n=<N> model=site|pc rotate=0|1"
+                                        ("unknown" for regions from older builds)
 
 The bitmap is not a fixed 64 KB at offset 72: the site-id model sizes it
 from the patch count, and the header's size and byte order follow the
@@ -37,6 +39,24 @@ def gen_current(data):
     return struct.unpack_from(byte_order(data) + "Q", data, 24)[0]
 
 
+# Header flag bits (src/boundary.h): SCHEME says the rest are valid.
+FLAG_SCHEME, FLAG_MODEL_PC, FLAG_ROTATE = 1 << 3, 1 << 4, 1 << 5
+NGRAM_SHIFT, NGRAM_MASK = 8, 0xf << 8
+
+
+def scheme(data):
+    # flags: u32 @ 16, before any 8-byte field.
+    if data[:4] != b"LCVS":
+        sys.exit("shm_bitmap: no LCVS header")
+    flags = struct.unpack_from(byte_order(data) + "I", data, 16)[0]
+    if not flags & FLAG_SCHEME:
+        return "unknown"
+    return "n=%d model=%s rotate=%d" % (
+        (flags & NGRAM_MASK) >> NGRAM_SHIFT,
+        "pc" if flags & FLAG_MODEL_PC else "site",
+        1 if flags & FLAG_ROTATE else 0)
+
+
 def live_bitmap(data):
     if data[:4] != b"LCVS":
         return data
@@ -49,12 +69,15 @@ def live_bitmap(data):
 
 
 def main():
-    if len(sys.argv) < 3 or sys.argv[1] not in ("extract", "stats", "gen"):
+    if len(sys.argv) < 3 or sys.argv[1] not in ("extract", "stats", "gen", "scheme"):
         sys.exit(__doc__)
     with open(sys.argv[2], "rb") as f:
         data = f.read()
     if sys.argv[1] == "gen":
         print(gen_current(data))
+        return
+    if sys.argv[1] == "scheme":
+        print(scheme(data))
         return
     bm = live_bitmap(data)
     if sys.argv[1] == "extract":

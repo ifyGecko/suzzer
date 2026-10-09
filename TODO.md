@@ -339,6 +339,22 @@ the MT stress test fail against the pre-fix code.
   and that iterations vary with the input; `run_validation_boundary_mt.sh`
   checks begin-only tagging under 2-8 workers.
 
+- **Coverage scheme in the shm header** (2026-10). `sink_init` stamps
+  `LIBCOV_NGRAM_N`, the coverage model and `LIBCOV_NGRAM_ROTATE` into
+  spare `hdr->flags` bits (`LIBCOV_SHM_FLAG_SCHEME` marks them valid, so
+  regions from older builds read as unknown). `shm_bitmap.py scheme`,
+  `fuzz_driver` (`driver: scheme ...`) and the relay HELLO report them.
+  `run_validation_coverage_options.sh` (T16b) checks five build variants;
+  `run_validation_relay.sh` checks the HELLO.
+
+- **Site-id collisions at N>=2** (2026-10, Review M2). The default
+  `LIBCOV_MAP_FUDGE` now scales with `LIBCOV_NGRAM_N` (2 at N=1, 16 at
+  N=2, doubling per extra position; still capped by `MAX_POW2`, and
+  `-DLIBCOV_MAP_FUDGE` still overrides). Init logs the fudge and an
+  expected collision share (`1 - e^{-(k-1)/m}` at k = n_sites and
+  8 * n_sites). `run_validation_coverage_options.sh` (T16c) checks the
+  map size per N, the override and the log line.
+
 ---
 
 ## P0
@@ -377,10 +393,6 @@ the MT stress test fail against the pre-fix code.
   single-site hot loop counts once until some other site traps. Document
   it, or add a per-thread "re-arm self after N instructions"
   (single-step is too costly; accept it).
-- [ ] **Site-id collisions at N>=2.** The zero-collision guarantee holds
-  only at N=1. Init now logs N and the buckets per site; still open:
-  auto-scaling `LIBCOV_MAP_FUDGE` with N, and an actual expected
-  collision-rate estimate. (Review M2)
 - [ ] **`REARM=all` is O(n_sites) inside the signal handler.** It causes
   jitter. Overruns are now visible (see the fixed list); the handler
   cost itself is unchanged -- a per-page or batched re-arm would cut it.
@@ -441,7 +453,6 @@ the MT stress test fail against the pre-fix code.
 
 ### N-gram
 - Runtime-selectable N (compile-time N becomes the maximum).
-- Tag N and the coverage model in the shm header's spare flag bits.
 - Hybrid publish (an edge map plus an N-gram map) when a consumer needs it.
 
 ### Tooling

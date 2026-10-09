@@ -233,7 +233,8 @@ make ARCH=mips EXTRA_CFLAGS='-DLIBCOV_ARCH_MIPS_ILLEGAL=0xDEADBEEFu'
 Knob locations: project-wide (`trap signal`, coverage model, bitmap sizing,
 N-gram width, log buffer) in [`src/tunables.h`](src/tunables.h). Under the
 default site-id model the bitmap is sized from the patch count
-(`LIBCOV_MAP_FUDGE`, `LIBCOV_MAP_MIN_POW2`/`MAX_POW2`); `LIBCOV_MAP_SIZE_POW2`
+(`LIBCOV_MAP_FUDGE`, which defaults higher for larger N-gram widths;
+`LIBCOV_MAP_MIN_POW2`/`MAX_POW2`); `LIBCOV_MAP_SIZE_POW2`
 only applies to the legacy PC-hash model. Per-backend illegal encodings live
 in `src/tunables_<arch>.h`. **Keep the trap mechanism SIGILL + illegal
 instructions** — only change *which* illegal encoding, never switch to
@@ -524,7 +525,12 @@ See §10 and README "Re-exec and fork+exec" for the attach/reset rules.
 ./test/shm_bitmap.py extract /tmp/cov /tmp/bitmap.bin
 # current generation (boundary mode):
 ./test/shm_bitmap.py gen /tmp/cov
+# coverage scheme the library was built with, e.g. "n=2 model=site rotate=0":
+./test/shm_bitmap.py scheme /tmp/cov
 ```
+
+Only compare or merge bitmaps whose `scheme` matches: an N=1 map and an N=4
+map index buckets differently.
 
 `stats` prints three bare numbers: `<nonzero> <sum> <max>`. `extract` always
 needs an output **file** path; `-` is not stdout, it creates a file named

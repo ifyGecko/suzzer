@@ -146,7 +146,7 @@ qemu process. For a native target, drop qemu and set
 
 The shm region (header + bitmap + snapshot ring) is written to `/tmp/cov`
 (or whatever path `LIBCOV_SHM_PATH` points at). `test/shm_bitmap.py
-stats|extract|gen <region> [out]` reads it. An external fuzzer mmaps
+stats|extract|gen|scheme <region> [out]` reads it. An external fuzzer mmaps
 the same file/SHM and reads hit-counts. **Read `map_size` and
 `bitmap_offset` from the header** -- the bitmap is not a fixed 64 KB. The
 header and bitmap use the *target's* byte order, so a big-endian device
@@ -289,8 +289,11 @@ a bucket index:
   `next_pow2(n_sites * LIBCOV_MAP_FUDGE)` (clamped by
   `LIBCOV_MAP_MIN_POW2`/`MAX_POW2`, never below `next_pow2(n_sites)`),
   so at N=1 there are zero collisions. At N>=2 the history is folded in
-  and collisions become possible again (bump `LIBCOV_MAP_FUDGE` for
-  path-sensitive work).
+  and collisions become possible again. The default `LIBCOV_MAP_FUDGE`
+  scales with `LIBCOV_NGRAM_N` (2 at N=1, 16 at N=2, doubling per extra
+  position: 64 at N=4, 1024 at N=8); `-DLIBCOV_MAP_FUDGE=` replaces it.
+  Init logs the fudge, the buckets per site and an expected collision
+  rate (`expected share of N-grams in a shared bucket: ...`).
 - `0` -- legacy **hashed-PC**: `hash(pc - module_base)` into a fixed
   `1 << LIBCOV_MAP_SIZE_POW2` (64 KB) map.
 
@@ -668,7 +671,9 @@ uint16_t ring_size;
 uint32_t map_size;        // live bitmap bytes (power of two)
 uint32_t slot_stride;     // sizeof(ring_slot_hdr) + map_size
 uint32_t flags;           // bit0 = boundaries active, bit1 = MT-variant libcov,
-                          // bit2 = live bitmap not maintained (read the ring)
+                          // bit2 = live bitmap not maintained (read the ring),
+                          // bit3 = scheme bits valid, bit4 = hashed-PC model,
+                          // bit5 = N-gram rotation, bits 8..11 = LIBCOV_NGRAM_N
 uint64_t gen_current;     // atomic; highest generation assigned (see seqlock step 1)
 uint64_t gen_init;        // gen at which init snapshot was captured
 uint64_t bitmap_offset;   // shm-base relative
@@ -678,6 +683,13 @@ uint32_t owner_pid;       // process that created the region
 uint32_t owner_start;     // its start time (/proc/<pid>/stat field 22, low 32 bits)
 uint8_t  reserved[4];
 ```
+
+Bits 3..5 and 8..11 record the coverage scheme the library was built with
+(`LIBCOV_NGRAM_N`, `LIBCOV_COVERAGE_MODEL_SITE`, `LIBCOV_NGRAM_ROTATE`), so a
+reader can refuse to merge maps built differently; `test/shm_bitmap.py
+scheme <region>` prints them (`unknown` for regions from builds before the
+bits existed), `fuzz_driver` prints a `driver: scheme ...` line, and
+`suzzer-relay` forwards them in its HELLO.
 
 The struct is 72 bytes on every target (`_Static_assert` in
 `src/boundary.h`). Fields are written in the target's byte order. Drivers
@@ -891,6 +903,7 @@ test/
   run_cross_mt.sh             all-arch MT validation (full run for x86_64+aarch64;
                               build-only for the other 9 due to qemu-user TCG limits)
   shm_bitmap.py usage         stats <region> | extract <region> <outfile> | gen <region>
+                              | scheme <region>
                               (extract needs a real file; `-` is not stdout. Reads
                               only the live bitmap, which is empty in ST boundary mode)
 tools/

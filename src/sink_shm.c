@@ -141,6 +141,19 @@ static int expand_path(const char *in, char *out, size_t n) {
     return 0;
 }
 
+/* LIBCOV_SHM_FLAG_SCHEME and friends: how this build forms bucket indices. */
+static uint32_t scheme_flags(void) {
+    uint32_t f = LIBCOV_SHM_FLAG_SCHEME |
+                 ((uint32_t)LIBCOV_NGRAM_N << LIBCOV_SHM_NGRAM_SHIFT);
+#if !LIBCOV_COVERAGE_MODEL_SITE
+    f |= LIBCOV_SHM_FLAG_MODEL_PC;
+#endif
+#if LIBCOV_NGRAM_ROTATE
+    f |= LIBCOV_SHM_FLAG_ROTATE;
+#endif
+    return f;
+}
+
 static void unlock_close(int fd) {
     flock(fd, LOCK_UN);
     close(fd);
@@ -305,7 +318,7 @@ int sink_init(const char *path, unsigned ring_size, size_t map_size) {
     hdr->ring_size     = (uint16_t)ring_size;
     hdr->map_size      = (uint32_t)map_size;
     hdr->slot_stride   = (uint32_t)slot_stride;
-    hdr->flags         = 0;        /* SHM_FLAG_ACTIVE set later by boundary_init */
+    hdr->flags         = scheme_flags();  /* SHM_FLAG_ACTIVE set later by boundary_init */
     hdr->gen_current   = 0;
     hdr->gen_init      = 0;
     hdr->bitmap_offset = bitmap_off;

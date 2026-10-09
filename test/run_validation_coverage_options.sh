@@ -21,6 +21,8 @@
 #     - LIBCOV_NGRAM_N=4 (4-gram)        -- reorder-input bitmaps DIFFER
 #     - LIBCOV_COVERAGE_MODEL_SITE=0     -- shm map_size = 64 KiB (legacy)
 #     - LIBCOV_COVERAGE_MODEL_SITE=1     -- shm map_size auto-sized to patches
+#     - shm header scheme bits           -- N, model, rotate match the build
+#     - LIBCOV_MAP_FUDGE default         -- map headroom scales with N
 #
 #   generator options:
 #     - --root + --max-depth   -- sliced patchlist contains fewer records
@@ -520,6 +522,68 @@ if [[ "$s_map_size" -eq 262144 && "$s_edges" -gt 0 ]]; then
 else
     fail "hashed-PC + POW2=18: map_size=$s_map_size edges=$s_edges (want 262144 & >0)"
 fi
+
+# ----------------------------------------------------------------------
+section "T16b: shm header tags the coverage scheme each build used"
+# sink_init stamps LIBCOV_SHM_FLAG_SCHEME + N + model + rotate into
+# hdr->flags; shm_bitmap.py scheme decodes them.
+for pair in "t4:n=2 model=site rotate=0" \
+            "t11_fwd:n=1 model=site rotate=0" \
+            "t13_x:n=4 model=site rotate=0" \
+            "t14_x:n=4 model=site rotate=1" \
+            "t15:n=2 model=pc rotate=0"; do
+    f="${pair%%:*}" want="${pair#*:}"
+    got="$("$ROOT/test/shm_bitmap.py" scheme "$SCRATCH/$f.shm")"
+    if [[ "$got" == "$want" ]]; then
+        pass "$f.shm scheme: $got"
+    else
+        fail "$f.shm scheme: got '$got', want '$want'"
+    fi
+done
+
+# ----------------------------------------------------------------------
+section "T16c: site-id map headroom (LIBCOV_MAP_FUDGE) scales with N"
+# MIN_POW2=6 lowers the 4 KiB floor so the fudge term is visible on a
+# small target. Expected: map = max(1<<6, next_pow2(n), next_pow2(n*fudge))
+# with default fudge 2 at N=1, 16 at N=2, 64 at N=4; -DLIBCOV_MAP_FUDGE wins.
+expect_map() {  # <n_sites> <fudge>
+    python3 -c '
+import sys
+n, f = int(sys.argv[1]), int(sys.argv[2])
+p2 = lambda v: 1 << (max(v, 1) - 1).bit_length()
+print(max(64, p2(n), min(1 << 24, p2(n * f))))' "$1" "$2"
+}
+prev_map=0
+for spec in "fudge_n1:-DLIBCOV_NGRAM_N=1:2" \
+            "fudge_n2::16" \
+            "fudge_n4:-DLIBCOV_NGRAM_N=4:64" \
+            "fudge_n4_ovr:-DLIBCOV_NGRAM_N=4 -DLIBCOV_MAP_FUDGE=4:4"; do
+    IFS=: read -r tag flags fudge <<<"$spec"
+    VB="$(build_variant "$tag" "-DLIBCOV_MAP_MIN_POW2=6 $flags")"
+    VLCV="$SCRATCH/$tag.lcv"
+    gen_lcv "$VB/target_simple" "$VLCV" --threading "$THREADING" \
+        || { fail "gen $tag"; continue; }
+    n=$(lcv_record_count "$VLCV")
+    rm -f "$SCRATCH/$tag.shm"
+    LIBCOV_PATCHLIST="$VLCV" LIBCOV_SHM_PATH="$SCRATCH/$tag.shm" \
+        LIBCOV_LOG="$SCRATCH/$tag.log" LD_PRELOAD="$VB/libcov_${THREADING}.so" \
+        "$VB/target_simple" 42 >/dev/null 2>&1 || true
+    parse_stats "$SCRATCH/$tag.shm"
+    want=$(expect_map "$n" "$fudge")
+    if [[ "$s_map_size" -eq "$want" ]] && grep -q "fudge=$fudge map_size=$want" "$SCRATCH/$tag.log"; then
+        pass "$tag: n_sites=$n fudge=$fudge map_size=$s_map_size"
+    else
+        fail "$tag: n_sites=$n map_size=$s_map_size (want $want, fudge $fudge); log: $(grep 'coverage model' "$SCRATCH/$tag.log")"
+    fi
+    if [[ "$tag" == fudge_n2 || "$tag" == fudge_n4 ]]; then
+        [[ "$s_map_size" -gt "$prev_map" ]] && pass "$tag map grows with N ($prev_map -> $s_map_size)" \
+            || fail "$tag map did not grow with N ($prev_map -> $s_map_size)"
+        grep -q "expected share of N-grams in a shared bucket: [0-9.]*% if $n distinct" "$SCRATCH/$tag.log" \
+            && pass "$tag logs a collision estimate" \
+            || fail "$tag: no collision estimate in the init log"
+    fi
+    [[ "$tag" == fudge_n4_ovr ]] || prev_map=$s_map_size
+done
 
 # ======================================================================
 # Boundary-mode env-var validation. Re-uses target_loop + fuzz_driver from

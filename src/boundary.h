@@ -77,6 +77,18 @@ struct lcvb_record {
  * (bitmap_offset accumulates non-worker/pre-first-boundary coverage) and with
  * boundaries off (bitmap_offset is the cumulative map). */
 #define LIBCOV_SHM_FLAG_LIVE_EMPTY (1u << 2)
+/* Coverage scheme the region's bucket indices were built with, stamped at
+ * sink_init so a reader can tell maps from differently built libraries
+ * apart. SCHEME says the bits below are valid (regions from older builds
+ * leave it clear); MODEL_PC means the hashed-PC model (clear = site-id);
+ * ROTATE mirrors LIBCOV_NGRAM_ROTATE; bits 8..11 hold LIBCOV_NGRAM_N. */
+#define LIBCOV_SHM_FLAG_SCHEME     (1u << 3)
+#define LIBCOV_SHM_FLAG_MODEL_PC   (1u << 4)
+#define LIBCOV_SHM_FLAG_ROTATE     (1u << 5)
+#define LIBCOV_SHM_NGRAM_SHIFT     8
+#define LIBCOV_SHM_NGRAM_MASK      (0xfu << LIBCOV_SHM_NGRAM_SHIFT)
+#define LIBCOV_SHM_NGRAM(flags) \
+    (((flags) & LIBCOV_SHM_NGRAM_MASK) >> LIBCOV_SHM_NGRAM_SHIFT)
 
 struct libcov_shm_header {
     char     magic[4];

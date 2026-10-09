@@ -108,8 +108,14 @@ def main():
         sys.exit("brain: expected HELLO, got type %d" % ftype)
     ver, flags, map_size, ring_size, arch_len = struct.unpack(">HHIHH", payload[:12])
     arch = payload[12:12 + arch_len].decode("ascii", "replace")
-    log("HELLO proto=%d arch=%s map_size=%d ring=%d flags=0x%x"
-        % (ver, arch, map_size, ring_size, flags))
+    if flags & 0x4:   # SZR_HELLO_FLAG_SCHEME (relay_proto.h)
+        scheme = "n=%d model=%s rotate=%d" % (
+            (flags >> 8) & 0xf, "pc" if flags & 0x8 else "site",
+            1 if flags & 0x10 else 0)
+    else:
+        scheme = "unknown"
+    log("HELLO proto=%d arch=%s map_size=%d ring=%d flags=0x%x scheme=%s"
+        % (ver, arch, map_size, ring_size, flags, scheme))
 
     cumulative = bytearray(map_size)
     rng = random.Random(args.seed_rng)

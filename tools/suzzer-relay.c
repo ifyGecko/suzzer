@@ -315,6 +315,12 @@ int main(int argc, char **argv) {
     uint16_t wire_flags = 0;
     if (hflags & LIBCOV_SHM_FLAG_MT)         wire_flags |= SZR_HELLO_FLAG_MT;
     if (hflags & LIBCOV_SHM_FLAG_LIVE_EMPTY) wire_flags |= SZR_HELLO_FLAG_LIVE_EMPTY;
+    if (hflags & LIBCOV_SHM_FLAG_SCHEME) {
+        wire_flags |= SZR_HELLO_FLAG_SCHEME;
+        if (hflags & LIBCOV_SHM_FLAG_MODEL_PC) wire_flags |= SZR_HELLO_FLAG_MODEL_PC;
+        if (hflags & LIBCOV_SHM_FLAG_ROTATE)   wire_flags |= SZR_HELLO_FLAG_ROTATE;
+        wire_flags |= (uint16_t)(LIBCOV_SHM_NGRAM(hflags) << SZR_HELLO_NGRAM_SHIFT);
+    }
     put_u16(hello + 2, wire_flags);
     put_u32(hello + 4, (uint32_t)map_size);
     put_u16(hello + 8, (uint16_t)hdr->ring_size);

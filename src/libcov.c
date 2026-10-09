@@ -103,6 +103,25 @@ static size_t compute_map_size(size_t n_sites) {
 #endif
 }
 
+#if LIBCOV_COVERAGE_MODEL_SITE
+/* exp(-x) for x >= 0 without libm: halve x into Taylor range, square back. */
+static double neg_exp(double x) {
+    int k = 0;
+    while (x > 0.5) { x /= 2; k++; }
+    double r = 1 - x + x * x / 2 - x * x * x / 6 + x * x * x * x / 24;
+    while (k--) r *= r;
+    return r;
+}
+
+/* Expected fraction of k distinct N-grams, hashed uniformly into m buckets,
+ * that share their bucket with at least one other: 1 - e^{-(k-1)/m}. The
+ * site-id fold isn't a perfect hash, so this is an estimate, not a bound. */
+static double collision_share(size_t k, size_t m) {
+    if (k < 2 || m == 0) return 0.0;
+    return 1.0 - neg_exp((double)(k - 1) / (double)m);
+}
+#endif
+
 __attribute__((constructor(101)))
 static void libcov_init(void) {
     libcov_log_init();
@@ -128,16 +147,22 @@ static void libcov_init(void) {
     size_t n_sites = 0;
     config_table(&n_sites);
     size_t map_size = compute_map_size(n_sites);
-    libcov_logf("init: coverage model=%s ngram_n=%d n_sites=%zu map_size=%zu",
-                LIBCOV_COVERAGE_MODEL_SITE ? "site" : "hash", (int)LIBCOV_NGRAM_N,
-                n_sites, map_size);
 #if LIBCOV_COVERAGE_MODEL_SITE
+    libcov_logf("init: coverage model=site ngram_n=%d n_sites=%zu fudge=%u map_size=%zu",
+                (int)LIBCOV_NGRAM_N, n_sites, (unsigned)LIBCOV_MAP_FUDGE, map_size);
     /* Only N=1 is collision-free: at N>=2 each bucket hashes a site with
      * its predecessors, so distinct N-grams can share one. */
-    if (LIBCOV_NGRAM_N >= 2)
-        libcov_logf("init: ngram_n=%d: collisions possible, %zu bucket(s) per site "
-                    "(raise LIBCOV_MAP_FUDGE for more)", (int)LIBCOV_NGRAM_N,
-                    n_sites ? map_size / n_sites : map_size);
+    if (LIBCOV_NGRAM_N >= 2 && n_sites) {
+        libcov_logf("init: ngram_n=%d: collisions possible, %zu bucket(s) per site; "
+                    "expected share of N-grams in a shared bucket: %.1f%% if %zu "
+                    "distinct are hit, %.1f%% if %zu (raise LIBCOV_MAP_FUDGE to lower)",
+                    (int)LIBCOV_NGRAM_N, map_size / n_sites,
+                    100.0 * collision_share(n_sites, map_size), n_sites,
+                    100.0 * collision_share(8 * n_sites, map_size), 8 * n_sites);
+    }
+#else
+    libcov_logf("init: coverage model=hash ngram_n=%d n_sites=%zu map_size=%zu",
+                (int)LIBCOV_NGRAM_N, n_sites, map_size);
 #endif
     if (sink_init(getenv("LIBCOV_SHM_PATH"), parse_ring_size(), map_size) != 0) {
         init_fail("sink_init failed, library inert");
