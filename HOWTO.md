@@ -435,7 +435,8 @@ LD_PRELOAD=$PWD/build/x86_64/libcov_st.so \
 ```
 
 The coverage region (header + bitmap + ring) appears at `/tmp/cov`. A path
-with more than one `/` is an ordinary file; see §10. Read it with
+with a non-leading `/` is an ordinary file; a bare name such as `cov` or
+`/cov` is a POSIX shm object at `/dev/shm/cov` (see §10). Read it with
 `test/shm_bitmap.py` (next section).
 
 ### Cross arch under qemu-user
@@ -541,8 +542,10 @@ needs an output **file** path; `-` is not stdout, it creates a file named
 > the live bitmap stays all zero, and the header sets
 > `LIBCOV_SHM_FLAG_LIVE_EMPTY`. So `stats` reports `0 0 0` even when
 > everything works. Use `fuzz_driver`/`ring_dump` (or the seqlock read below)
-> instead. See README.md (search for `LIVE_EMPTY`). **Copy its header parsing into your own reader** rather than
-hard-coding offsets.
+> instead. See README.md (search for `LIVE_EMPTY`).
+
+When writing your own reader, copy `shm_bitmap.py`'s header parsing rather
+than hard-coding offsets.
 
 ### One-shot workflow (no boundaries)
 
@@ -745,16 +748,16 @@ the cross test suites do.
 |---|---|---|
 | `LIBCOV_PATCHLIST` | *(required)* | Path to the LCV3 patch list. Unset → library is inert. |
 | `LIBCOV_REQUIRE` | unset | Any non-empty value other than `0`: abort the process if libcov ends up inert or any init step fails. Use in controlled harnesses. |
-| `LIBCOV_SHM_PATH` | `/libcov_<pid>` | Coverage region path. Leading `/` and no other slashes → `shm_open`; else a filesystem path. `%p`→pid, `%%`→`%`. If `shm_open` fails, falls back to `$TMPDIR/<name>` (or `/tmp`). A filesystem path has no fallback. |
-| `LIBCOV_MODE` | `leapfrog` | `oneshot` (each site fires once, fastest) or `leapfrog` (re-arm previous site each trap; approximate hit counts — a block that loops back to itself directly counts once per alternation). **Any value other than exactly `oneshot`, typos included, silently means leapfrog.** |
+| `LIBCOV_SHM_PATH` | `/libcov_<pid>` | Coverage region path. No `/` other than an optional leading one (`/cov` or `cov`) → `shm_open`, i.e. the file `/dev/shm/cov`; anything with a non-leading `/` (`/tmp/cov`, `./cov`) is an ordinary file. Init logs the resolved location. `%p`→pid, `%%`→`%`. If `shm_open` fails, falls back to `$TMPDIR/<name>` (or `/tmp`). A filesystem path has no fallback. |
+| `LIBCOV_MODE` | `leapfrog` | `oneshot` (each site fires once, fastest) or `leapfrog` (re-arm previous site each trap; approximate hit counts — a block that loops back to itself directly counts once per alternation). **Any value other than exactly `oneshot` means leapfrog**; a typo (neither `oneshot` nor `leapfrog`) also logs a WARNING. |
 | `LIBCOV_ST_PATCH` | `auto` | ST only. `auto`: code pages made `R|W|X` once (patch = plain store, ~3× faster in leapfrog); `mprotect`: two mprotects per arm/disarm, never `RWX`. `auto` drops to per-write mprotect by itself if the kernel refuses RWX. Unknown values → `auto`. |
 | `LIBCOV_MODULE` | main exe | Module name for **boundary sidecar** resolution only (the LCV3 list carries its own module table). |
 | `LIBCOV_MODULE_RENAME` | unset | `old=new[,old=new…]`: resolve patch-list module `old` as `new`. For renamed/stripped copies, or `new=/abs/path` to disambiguate duplicate basenames. |
-| `LIBCOV_LOG` | unset (stderr) | Diagnostic log path. Never written from the signal handler. |
+| `LIBCOV_LOG` | unset (stderr) | Diagnostic log path. Never written from the signal handler. If it can't be opened (e.g. missing directory), a one-line notice goes to stderr and logging stays on stderr. |
 | `LIBCOV_BOUNDARY_LIST` | unset | Path to the LCVB1 boundary sidecar. Boundaries inert if unset. |
 | `LIBCOV_BOUNDARY_REARM` | `none` | `none` / `all` / `touched` — what to re-arm at each boundary (see §3 Q4). Any other value (a typo) means `none`, with a WARNING; with `MODE=oneshot` that triggers the refusal. |
 | `LIBCOV_BOUNDARY_RING` | `8` | Ring snapshot slots, clamped to 2–16; a non-numeric value gives 2. Reader lag tolerance = `RING − 1` iters. |
-| `LIBCOV_BOUNDARY_INIT_GRACE` | `0` | Don't publish the first N boundary fires (process-wide, counted after depth filtering). Their coverage is **not discarded**; it is merged into the first published snapshot, which is flagged `INIT`. |
+| `LIBCOV_BOUNDARY_INIT_GRACE` | `0` | Don't publish the first N boundary fires (process-wide, counted after depth filtering). Their coverage is **not discarded**; it is merged into the first published snapshot, which is flagged `INIT`. Negative/non-numeric → WARNING, treated as `0`. |
 | `LIBCOV_BOUNDARY_NOTIFY_FD` | unset | Inherited **eventfd** (fd > 0); libcov writes a `uint64` 1 after each snapshot. Anything else is ignored with a warning. |
 | `LIBCOV_BOUNDARY_EMULATE` | `1` | `0`: never emulate markers; always disarm + deferred re-arm. |
 | `LIBCOV_SYNC_FALLBACK` | `auto` | MT only. Cross-core sync: `auto` (use `membarrier(SYNC_CORE)`; if the kernel lacks it, broadcast a signal to peers after each batch), `tgkill` (always broadcast, skipping membarrier even when it works), `off` (no broadcast fallback; cache maintenance only). Unknown values → `auto`. Broadcast is roughly 7–10× slower on a 16-thread stress and can `EINTR` non-restarting syscalls. |
@@ -762,7 +765,10 @@ the cross test suites do.
 
 Driver-side (test tools, not libcov): `FUZZ_DRIVER_BURST=1` feeds all inputs
 before reading (forces ring overrun for testing). Test-suite knobs:
-`THREADS_STRESS`, `ITERS_STRESS`, `ITERS_STRESS_TGKILL`.
+`THREADS_STRESS`, `ITERS_STRESS`, `ITERS_STRESS_TGKILL`; `SUITE_TIMEOUT`
+(seconds per suite in `make test`, default 900; a hang prints `TIMEOUT` and
+counts as a failure); `RUN_TIMEOUT` (seconds per target/driver/qemu run in the
+cross, signals, paired, boundary and marker-emulation suites, default 60).
 
 ---
 
@@ -780,6 +786,11 @@ o2pie`), runs all 18 **native** suites one after another, and prints a
 PASS/FAIL summary (failing-suite logs are kept). It refuses to run when
 `ARCH` is not the host arch. Each suite uses its own `mktemp -d`, so you can
 safely run suites concurrently by hand; `make test` itself is sequential.
+Each suite is bounded by `SUITE_TIMEOUT` (default 900 s; the whole run takes
+under a minute on a modern x86_64). A failing suite keeps its temp directory
+and prints `logs kept in <dir>`; `run_all.sh` keeps its log too. A suite that
+finds neither `libcov_st.so` nor `libcov_mt.so` fails with "nothing ran"
+instead of passing vacuously.
 
 ### Run a single suite by hand
 
@@ -825,6 +836,10 @@ Tune the MT stress with `THREADS_STRESS=` / `ITERS_STRESS=`.
 ./test/run_cross.sh      # 11 arches + arm-thumb, ST → expect: PASS=12  FAIL=0  SKIP=0
 ./test/run_cross_mt.sh   # 11 arches, MT            → expect: FULL_PASS=2  BUILD_ONLY=9  FAIL=0  SKIP=0
 ```
+
+A missing cross `gcc` or `qemu-<arch>-static` counts as **SKIP**, not FAIL,
+so on a host without cross toolchains expect `SKIP=` > 0 and exit 0; only
+`FAIL=` > 0 is a real failure.
 
 > **Known limit:** full MT *runtime* validation under qemu-user works only for
 > **x86_64 and aarch64** (qemu's TCG translation cache mishandles the
@@ -996,12 +1011,19 @@ request handler:
     req_begin:begin req_end:end --patchlist /tmp/n.lcv
 ```
 
-Run the brain off-device (here, another terminal) and the relay on the device.
-The brain listens; the relay dials in. The brain prints the port it bound:
+Run the brain off-device and the relay on the device. The brain listens; the
+relay dials in. **The brain runs in the foreground and blocks**, so start it
+in another terminal or in the background, then start the relay within its
+`--accept-timeout` (default 15 s). It prints the port it bound (pass port
+`0` for an ephemeral one), runs every seed once plus `--iters` (default 200)
+mutated inputs, then exits. A missing or empty `--seeds` directory falls back
+to built-in seeds with a warning. `--io-timeout` (default 60 s) bounds the
+wait for each relay reply.
 
 ```bash
-# Brain (off-device). Listens on 0 = an ephemeral port; use a fixed one in practice.
-python3 tools/suzzer_brain.py --listen 0.0.0.0:7000 --seeds ./seeds --out ./out
+# Brain (off-device), backgrounded so the relay can be started next.
+mkdir -p ./seeds && printf 'hello' > ./seeds/s1
+python3 tools/suzzer_brain.py --listen 0.0.0.0:7000 --seeds ./seeds --out ./out &
 
 # Relay (on the device). It spawns target_netd, which writes its own port to
 # the --port-file; the relay delivers each input to 127.0.0.1:<that port>.
@@ -1014,7 +1036,9 @@ python3 tools/suzzer_brain.py --listen 0.0.0.0:7000 --seeds ./seeds --out ./out
 
 The brain writes crashing inputs to `./out/crashes/` and logs each input that
 reached new coverage. One `INPUT` gets exactly one `COVERAGE` or `CRASH` reply
-(lockstep). To point it at your own daemon, give the relay your binary and a
+(lockstep); the relay also answers a malformed `INPUT` with a `CRASH` frame
+(reason 4, saved by the brain as `crash_<id>_r4_s0`) rather than dropping it, so the brain never waits forever. `--shm` follows the
+same naming rule as `LIBCOV_SHM_PATH` (§10). To point it at your own daemon, give the relay your binary and a
 boundary sidecar for your handler's entry/exit, and make sure the daemon binds
 a port it writes to `--port-file` (or adapt the relay's delivery to your
 transport). `test/run_validation_relay.sh` runs this whole path on loopback.
@@ -1022,10 +1046,12 @@ transport). `test/run_validation_relay.sh` runs this whole path on loopback.
 **Scope:** single-process daemon, plain TCP (no auth), one input in flight.
 Fork-per-connection daemons and encryption are out of scope (see TODO.md).
 
+### 14.2 Other tools
+
 - **Mutation engine — [`tools/mutate.py`](tools/mutate.py).** An AFL++-style
   havoc mutator, used as a CLI or imported as a library
-  (`from tools.mutate import Engine, Dictionary, StructuredInsert`). It is not
-  executable, so run it with `python3`:
+  (`from tools.mutate import Engine, Dictionary, StructuredInsert`). Run it
+  with `python3`:
   ```bash
   python3 tools/mutate.py --seed seed.bin --out /tmp/mutants --count 100 [--dict x.dict]
   ```
@@ -1038,7 +1064,11 @@ Fork-per-connection daemons and encryption are out of scope (see TODO.md).
   `make tools [ARCH=…]`, which writes `build/<arch>/libdemalloc.so`. Tune it
   at compile time, e.g.
   `make tools EXTRA_CFLAGS='-DLIBDEM_QUARANTINE_SLOTS=128'`. Load it
-  alongside libcov in `LD_PRELOAD`. Tested by
+  alongside libcov in `LD_PRELOAD`. Pointers are placed flush against the
+  guard page to catch overflows, so by default they are **not 16-byte
+  aligned**; for SSE code or strict-alignment CPUs build with
+  `EXTRA_CFLAGS='-DLIBDEM_ALIGN_ALLOCATIONS=1'` (see the header of
+  `tools/libdemalloc.c` for the per-arch default). Tested by
   `test/run_validation_demalloc.sh`.
 - **Attach to a running process — [`tools/inject/`](tools/inject/README.md).**
   For daemons that can't be restarted under `LD_PRELOAD`. `inject_ptrace`
@@ -1047,13 +1077,15 @@ Fork-per-connection daemons and encryption are out of scope (see TODO.md).
   `make -C tools/inject [ARCH=…]`.
   **Status:** works on x86_64; aarch64 builds but has no runtime validation
   yet; every other arch is a build-only stub that refuses to attach.
-  `inject_procmem` is a stub (ENOSYS). See its README for details.
+  `inject_procmem` is a stub (ENOSYS). Exit status: `0` injected and the
+  coverage region exists, `1` attach/dlopen failed, `2` usage error, `3`
+  dlopen worked but libcov looks **inert** (no region; re-run with `-L
+  <log>` and `-e LIBCOV_REQUIRE=1`). See its README for details.
 
 ---
 
 *For design internals see [Design.md](Design.md). Note that parts of it
 predate the site-id coverage model; where it disagrees with this guide or
 README (e.g. a fixed 64 KB bitmap), the code, README and this guide are
-current. The deferred-work backlog (daemon lifecycle, `suzzer-relay`
-network transport, `suzzer-forkserver`, runtime-selectable N-gram) is in
-[TODO.md](TODO.md).*
+current. The deferred-work backlog (daemon lifecycle, fork-per-connection
+`suzzer-forkserver`, runtime-selectable N-gram) is in [TODO.md](TODO.md).*

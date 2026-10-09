@@ -113,6 +113,45 @@ Debug:
   -h                this help.
 ```
 
+`<pid>` must be a positive decimal process id and `--scratch-size` a
+byte count (decimal, `0x` hex or leading-`0` octal, minimum 256);
+anything else (e.g. `12x`, `-1`, `4k`) is rejected with exit status 2.
+
+### Exit status
+
+| Status | Meaning |
+|--------|---------|
+| 0 | Injected, and libcov's coverage region exists with the `LCVS` magic. |
+| 1 | Attach, symbol resolution, remote `setenv` or remote `dlopen` failed. |
+| 2 | Usage error: bad option, pid, `--scratch-size` or library path. |
+| 3 | `dlopen` succeeded but libcov appears **inert**: no coverage region with the `LCVS` magic was found. |
+
+A loaded library is not the same as a working one. libcov's constructor
+runs inside the remote `dlopen`, and on any init failure (no
+`LIBCOV_PATCHLIST`, unreadable/ST-vs-MT-mismatched patch list, shm
+creation failure, ...) it logs and returns without arming anything.
+After `dlopen`, `inject_ptrace` therefore looks for the coverage region
+where libcov would have created it, using libcov's own `LIBCOV_SHM_PATH`
+rules: the `-S`/`-e` value (or the target's own environment), else the
+default `/libcov_<pid>`; `%p` expands to the pid; a name with no `/`
+other than an optional leading one is a POSIX shm object
+(`/dev/shm/NAME`, falling back to `$TMPDIR/NAME` or `/tmp/NAME`);
+anything else is a filesystem path. Paths are tried through
+`/proc/<pid>/root` first, then as seen by the injector. If no region
+carrying the `LCVS` magic is found it still prints the `injected ...`
+line, then:
+
+```
+inject: WARNING: libcov appears inert in pid <pid>: no coverage region with LCVS magic at <path>
+inject:   re-run with -L <logfile> to see libcov's init log, and -e LIBCOV_REQUIRE=1 to make libcov abort instead of running inert; exiting with status 3
+```
+
+The check only proves the region was created (the first step of a
+working init), not that patches were armed; the `-L` log is the
+authoritative record. A stale region left at the same path by an earlier
+run also satisfies it, so remove old regions (or use a fresh `-S` name)
+when you rely on exit status 0.
+
 ## ST vs MT patch lists
 
 libcov enforces the LCV3 threading hint at init: handing an ST-generated
@@ -211,6 +250,13 @@ These are caveats inherent to the trust boundary, not bugs:
     at attach time; if it ever collides (extremely rare on real
     targets) the injector scans down by page and picks the first
     unmapped one.
+11. **Signals during the remote call**: anything other than the
+    return-trap SIGSEGV that stops the target while `setenv`/`dlopen`
+    runs is forwarded back to it (up to 256 times per call). This is
+    required: libcov's constructor runs a trap self-test that executes
+    an illegal instruction and expects its own SIGILL handler to catch
+    it. A SIGSEGV that is not at the sentinel is still treated as a
+    fault inside the called function and fails the injection.
 
 ## Files
 

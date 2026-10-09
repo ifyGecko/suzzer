@@ -134,10 +134,9 @@ CLI
 Files / cross-references
 ------------------------
 
-  /home/user/suzzer/README.md            -- tools/ section lists this
-                                            file alongside gen_*.
-  /home/user/suzzer/Design.md            -- tools/ section in repo
-                                            layout.
+  README.md (repo root)    -- tools/ section lists this file
+                              alongside gen_*.
+  Design.md (repo root)    -- tools/ section in repo layout.
 
 Vendor-friendliness
 -------------------

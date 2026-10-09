@@ -21,7 +21,14 @@ for f in "$B/libcov_st.so" "$B/libcov_mt.so" "$B/target_simple_o2pie" \
 done
 
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# Kept (and its path printed) when the suite fails: the generator and
+# target logs in it are how you debug.
+keep_work_on_failure() {
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then rm -rf "$WORK"; else echo "logs kept in $WORK" >&2; fi
+    return $rc
+}
+trap keep_work_on_failure EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 for t in target_simple_o2pie target_dispatch_o2pie; do

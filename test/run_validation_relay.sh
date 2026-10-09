@@ -35,11 +35,14 @@ make -C "$ROOT/tools" ARCH="$ARCH" BUILD="$B" relay >/dev/null 2>&1 \
 WORK=$(mktemp -d)
 BRAIN_PID=""; RELAY_PID=""
 cleanup() {
+    local rc=$?
     [[ -n "$RELAY_PID" ]] && kill "$RELAY_PID" 2>/dev/null || true
     [[ -n "$BRAIN_PID" ]] && kill "$BRAIN_PID" 2>/dev/null || true
     # Reap any target the relay left behind.
     pkill -P "${RELAY_PID:-0}" 2>/dev/null || true
-    rm -rf "$WORK"
+    # Kept (and its path printed) when the suite fails.
+    if [[ $rc -eq 0 ]]; then rm -rf "$WORK"; else echo "logs kept in $WORK" >&2; fi
+    return $rc
 }
 trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }

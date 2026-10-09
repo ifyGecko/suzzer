@@ -1042,15 +1042,27 @@ inject_call(struct inject_session *s, uintptr_t func,
     }
     if (pt_setregs(s->pid, &regs) < 0) return -1;
 
+    /* Run until the return-trap SIGSEGV. The called function may itself
+     * raise and handle signals -- notably libcov's constructor, whose trap
+     * self-test executes an illegal instruction and expects its own SIGILL
+     * handler to catch it. Under ptrace every such signal first stops the
+     * tracee, so forward anything that isn't SIGSEGV back to the target
+     * (bounded, so a signal storm can't hang the injector). */
     int status = pt_cont_and_wait(s->pid, 0);
-    if (status < 0) return -1;
-
-    if (!WIFSTOPPED(status)) {
-        LOG_ERR("remote call: target didn't stop (status=0x%x); pid may have died",
-                status);
-        return -1;
+    int sig = 0;
+    for (int forwarded = 0; ; forwarded++) {
+        if (status < 0) return -1;
+        if (!WIFSTOPPED(status)) {
+            LOG_ERR("remote call: target didn't stop (status=0x%x); pid may have died",
+                    status);
+            return -1;
+        }
+        sig = WSTOPSIG(status);
+        if (sig == SIGSEGV || forwarded >= 256) break;
+        LOG_DBG("remote call: forwarding signal %d to target", sig);
+        /* A stray SIGSTOP (e.g. from attach) is swallowed, not re-sent. */
+        status = pt_cont_and_wait(s->pid, sig == SIGSTOP ? 0 : sig);
     }
-    int sig = WSTOPSIG(status);
     if (sig != SIGSEGV) {
         /* Possibly the function we called itself raised a signal, or
          * the target had a pending non-trap signal queued. Log loudly. */

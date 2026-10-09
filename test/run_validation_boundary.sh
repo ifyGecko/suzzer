@@ -16,13 +16,33 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Per-run scratch dir: fixed /tmp paths made parallel runs collide.
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# Kept (and its path printed) when the suite fails: the generator and
+# target logs in it are how you debug.
+keep_work_on_failure() {
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then rm -rf "$WORK"; else echo "logs kept in $WORK" >&2; fi
+    return $rc
+}
+trap keep_work_on_failure EXIT
 ARCH="${ARCH:-$(uname -m)}"
 LIB="$ROOT/build/$ARCH/libcov_st.so"
 TARGET="$ROOT/build/$ARCH/target_loop"
 DRIVER="$ROOT/build/$ARCH/fuzz_driver"
 LCV="$WORK/target_loop.lcv"
 LCVB="$WORK/target_loop.lcvb"
+# Every driver run is bounded; rc 124 = timed out.
+RUN_TIMEOUT="${RUN_TIMEOUT:-60}"
+DRV=(timeout "$RUN_TIMEOUT" "$DRIVER")
+# driver_failed <rc> <what> <out>: report a nonzero driver exit and its output.
+driver_failed() {
+    if [[ $1 -eq 124 ]]; then
+        echo "FAIL: $2: driver timed out after ${RUN_TIMEOUT}s (RUN_TIMEOUT)" >&2
+    else
+        echo "FAIL: $2: driver exited rc=$1" >&2
+    fi
+    tail -20 "$3" >&2
+    exit 1
+}
 
 if [[ "$(cat /proc/sys/kernel/randomize_va_space)" != "0" ]]; then
     echo "WARN: ASLR is on; PoC assumes ASLR off for deterministic addresses" >&2
@@ -35,11 +55,13 @@ fi
 echo ">> regenerate patch list for target_loop"
 "$ROOT/tools/gen_patchlist.py" "$TARGET" "$LCV" \
     --include-pat '^dbg\.(main|classify|loop_sum|cmdline|process_one|iter_begin)$' \
-    >/dev/null 2>$WORK/v_b.gen.log
+    >/dev/null 2>$WORK/v_b.gen.log \
+    || { echo "FAIL: gen_patchlist (log: $WORK/v_b.gen.log)" >&2; exit 1; }
 
 echo ">> generate boundary sidecar (iter_begin = begin marker)"
 "$ROOT/tools/gen_boundary.py" "$TARGET" "$LCVB" iter_begin:begin \
-    >/dev/null 2>$WORK/v_b.bnd.log
+    >/dev/null 2>$WORK/v_b.bnd.log \
+    || { echo "FAIL: gen_boundary (log: $WORK/v_b.bnd.log)" >&2; exit 1; }
 
 echo ">> a begin-only sidecar with depth_filter=zero is refused unless --force"
 if "$ROOT/tools/gen_boundary.py" "$TARGET" "$WORK/zero.lcvb" iter_begin:begin:zero \
@@ -59,7 +81,9 @@ OUT="$WORK/driver.out"
 INPUTS=$'42\n99\n-3\nabc\nhello\n'
 
 echo ">> run driver against target_loop"
-printf '%s' "$INPUTS" | "$DRIVER" "$LIB" "$LCV" "$LCVB" "$TARGET" > "$OUT" 2>&1
+rc=0
+printf '%s' "$INPUTS" | "${DRV[@]}" "$LIB" "$LCV" "$LCVB" "$TARGET" > "$OUT" 2>&1 || rc=$?
+[[ $rc -eq 0 ]] || driver_failed "$rc" "driver run" "$OUT"
 
 echo "----- driver output -----"
 cat "$OUT"
@@ -117,10 +141,11 @@ echo ">> overrun accounting: burst all inputs, then read (FUZZ_DRIVER_BURST=1)"
 burst() {  # <ring> <out>; prints the driver's exit status
     local rc=0
     printf '%s' "$INPUTS" | FUZZ_DRIVER_BURST=1 LIBCOV_BOUNDARY_RING="$1" \
-        "$DRIVER" "$LIB" "$LCV" "$LCVB" "$TARGET" > "$2" 2>&1 || rc=$?
+        "${DRV[@]}" "$LIB" "$LCV" "$LCVB" "$TARGET" > "$2" 2>&1 || rc=$?
     echo "$rc"
 }
 rc=$(burst 2 "$WORK/burst2.out")
+[[ $rc -ne 124 ]] || driver_failed 124 "ring=2 burst" "$WORK/burst2.out"
 lost=$(sed -n 's/.* lost_gens=\([0-9]*\).*/\1/p' "$WORK/burst2.out")
 if [[ "$rc" != 3 ]] || ! grep -q '^OVERRUN: ' "$WORK/burst2.out" \
         || [[ -z "$lost" || "$lost" -lt 1 ]]; then
@@ -132,6 +157,7 @@ grep -q '^gen=.*(burst)' "$WORK/burst2.out" \
     || { echo "FAIL: ring=2 burst read nothing after the overrun" >&2; exit 1; }
 echo "   OK: ring=2: overrun counted (lost_gens=$lost), exit 3, newest gen still read"
 rc=$(burst 16 "$WORK/burst16.out")
+[[ $rc -ne 124 ]] || driver_failed 124 "ring=16 burst" "$WORK/burst16.out"
 g16=$(grep -c '^gen=' "$WORK/burst16.out" || true)
 if [[ "$rc" != 0 || "$g16" -lt 6 ]] || grep -q '^OVERRUN' "$WORK/burst16.out"; then
     echo "FAIL: ring=16 burst: rc=$rc gens=$g16 (want rc=0, >=6 gens, no overrun)" >&2
@@ -143,11 +169,12 @@ echo
 echo ">> sanity-check the (MODE, REARM) matrix"
 check_combo() {
     local mode="$1" rearm="$2" want_min="$3"
-    local out
+    local out rc=0
     out="$WORK/combo.out"
     LIBCOV_MODE="$mode" LIBCOV_BOUNDARY_REARM="$rearm" \
-        "$DRIVER" "$LIB" "$LCV" "$LCVB" "$TARGET" \
-        < <(printf '42\n99\n-3\n') > "$out" 2>&1
+        "${DRV[@]}" "$LIB" "$LCV" "$LCVB" "$TARGET" \
+        < <(printf '42\n99\n-3\n') > "$out" 2>&1 || rc=$?
+    [[ $rc -eq 0 ]] || driver_failed "$rc" "MODE=$mode REARM=$rearm" "$out"
     local g
     g=$(grep -c '^gen=' "$out" || true)
     if [[ "$g" -lt "$want_min" ]]; then

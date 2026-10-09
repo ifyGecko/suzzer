@@ -72,8 +72,26 @@ for f in "${need[@]}"; do
 done
 
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# Kept (and its path printed) when the suite fails: the generator and
+# target logs in it are how you debug.
+keep_work_on_failure() {
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then rm -rf "$WORK"; else echo "logs kept in $WORK" >&2; fi
+    return $rc
+}
+trap keep_work_on_failure EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
+
+# run_bounded <out> <what> <cmd...>: run under RUN_TIMEOUT (seconds), stdout
+# to <out>; a nonzero exit or a timeout (rc 124) fails the suite.
+RUN_TIMEOUT="${RUN_TIMEOUT:-60}"
+run_bounded() {
+    local out=$1 what=$2 rc=0; shift 2
+    timeout "$RUN_TIMEOUT" "$@" > "$out" || rc=$?
+    [[ $rc -eq 0 ]] && return 0
+    [[ $rc -eq 124 ]] && fail "$what: timed out after ${RUN_TIMEOUT}s (RUN_TIMEOUT)"
+    fail "$what: rc=$rc"
+}
 
 ${HOSTCC:-gcc} -O2 -Wall -Wextra -o "$WORK/unit_mips_emulate" "$ROOT/test/unit_mips_emulate.c" \
     || fail "build unit_mips_emulate"
@@ -81,11 +99,13 @@ ${HOSTCC:-gcc} -O2 -Wall -Wextra -o "$WORK/unit_mips_emulate" "$ROOT/test/unit_m
 
 for tgt in "${TARGETS[@]}"; do
 T="$B/$tgt"
-"${RUN[@]}" "$T" "$N" > "$WORK/bare.out"
+run_bounded "$WORK/bare.out" "$tgt bare run" "${RUN[@]}" "$T" "$N"
 
 for th in "${THREADINGS[@]}"; do
     "$ROOT/tools/gen_patchlist.py" "$T" "$WORK/$th.lcv" --threading "$th" \
-        --include-pat '^dbg\.(main|rec|m_short|m_near|m_bit|m_zero)$' >/dev/null 2>&1
+        --include-pat '^dbg\.(main|rec|m_short|m_near|m_bit|m_zero)$' \
+        >/dev/null 2>"$WORK/$th.gen.log" \
+        || fail "gen_patchlist ($tgt, $th): $(tail -3 "$WORK/$th.gen.log")"
     specs=(); for m in "${MARKERS[@]}"; do specs+=("$m:begin"); done
     "$ROOT/tools/gen_boundary.py" "$T" "$WORK/$th.lcvb" "${specs[@]}" \
         --patchlist "$WORK/$th.lcv" >/dev/null 2>"$WORK/$th.bnd.log" \
@@ -103,9 +123,11 @@ for th in "${THREADINGS[@]}"; do
                  LIBCOV_BOUNDARY_EMULATE=$emu LIBCOV_LOG="$WORK/$tag.$mode.log")
             if [[ ${#RUN[@]} -gt 0 ]]; then
                 qenv=(); for kv in "${env[@]}"; do qenv+=(-E "$kv"); done
-                "${RUN[@]}" "${qenv[@]}" "$T" "$N" > "$WORK/$tag.$mode.out"
+                run_bounded "$WORK/$tag.$mode.out" "$tgt $th emulate=$emu $mode" \
+                    "${RUN[@]}" "${qenv[@]}" "$T" "$N"
             else
-                env "${env[@]}" "$T" "$N" > "$WORK/$tag.$mode.out"
+                run_bounded "$WORK/$tag.$mode.out" "$tgt $th emulate=$emu $mode" \
+                    env "${env[@]}" "$T" "$N"
             fi
             cmp -s "$WORK/bare.out" "$WORK/$tag.$mode.out" \
                 || fail "$tgt $th emulate=$emu $mode: branch trace differs from bare run:

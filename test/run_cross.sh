@@ -7,7 +7,11 @@
 #   4. Confirm target output and report bitmap statistics.
 #
 # Requires Debian-flavored cross toolchains and qemu-user-static binaries
-# (see HOWTO.md "Prerequisites" for the apt list).
+# (see HOWTO.md "Prerequisites" for the apt list). An arch whose cross gcc
+# or qemu binary is missing is SKIPped, not failed.
+#
+# RUN_TIMEOUT (seconds, default 60) bounds every target/qemu run; a run
+# that hits it is a FAIL ("timed out").
 
 set -uo pipefail
 
@@ -36,6 +40,15 @@ declare -A QEMU=(
   [powerpc64]=qemu-ppc64-static    [powerpc64le]=qemu-ppc64le-static
   [riscv64]=qemu-riscv64-static
 )
+declare -A CROSS=(
+  [x86_64]=                        [aarch64]=aarch64-linux-gnu-
+  [arm]=arm-linux-gnueabihf-
+  [mips]=mips-linux-gnu-           [mipsel]=mipsel-linux-gnu-
+  [mips64]=mips64-linux-gnuabi64-  [mips64el]=mips64el-linux-gnuabi64-
+  [powerpc]=powerpc-linux-gnu-
+  [powerpc64]=powerpc64-linux-gnu- [powerpc64le]=powerpc64le-linux-gnu-
+  [riscv64]=riscv64-linux-gnu-
+)
 declare -A SYSROOT=(
   [aarch64]=/usr/aarch64-linux-gnu
   [arm]=/usr/arm-linux-gnueabihf
@@ -49,6 +62,10 @@ declare -A SYSROOT=(
   [riscv64]=/usr/riscv64-linux-gnu
 )
 
+RUN_TIMEOUT="${RUN_TIMEOUT:-60}"
+
+# Both runners are bounded by RUN_TIMEOUT (rc 124 = timed out). env sets
+# LD_PRELOAD after timeout(1) has started, so libcov never loads into it.
 run_target() {
     # args: <build_arch> <libcov.so path> <target args...>
     local arch=$1; shift
@@ -56,9 +73,9 @@ run_target() {
     local q=${QEMU[$arch]:-}
     local sr=${SYSROOT[$arch]:-}
     if [[ -z "$q" ]]; then
-        LD_PRELOAD="$lib" "$@"
+        timeout "$RUN_TIMEOUT" env LD_PRELOAD="$lib" "$@"
     else
-        "$q" -L "$sr" -E LD_PRELOAD="$lib" "$@"
+        timeout "$RUN_TIMEOUT" "$q" -L "$sr" -E LD_PRELOAD="$lib" "$@"
     fi
 }
 
@@ -67,10 +84,19 @@ run_target_clean() {
     local q=${QEMU[$arch]:-}
     local sr=${SYSROOT[$arch]:-}
     if [[ -z "$q" ]]; then
-        "$@"
+        timeout "$RUN_TIMEOUT" "$@"
     else
-        "$q" -L "$sr" "$@"
+        timeout "$RUN_TIMEOUT" "$q" -L "$sr" "$@"
     fi
+}
+
+# timed_out <rc> <what>: on rc 124 report the timeout, count a FAIL, and
+# return 0 so the caller can `continue`.
+timed_out() {
+    (( $1 == 124 )) || return 1
+    echo "FAIL $2 timed out after ${RUN_TIMEOUT}s (RUN_TIMEOUT)"
+    FAIL=$((FAIL+1)); FAILED+=("$arch:${2// /_}_timeout")
+    return 0
 }
 
 # Live-bitmap statistics, "<nonzero> <sum>". test/shm_bitmap.py reads the
@@ -90,6 +116,16 @@ mkdir -p build
 for arch in "${ARCHES[@]}"; do
     echo
     echo "================= $arch ================="
+
+    # Missing toolchain / emulator: SKIP, not FAIL.
+    tc_arch=$arch; [[ $arch == arm-thumb ]] && tc_arch=arm
+    tc_gcc="${CROSS[$tc_arch]:-}gcc"; tc_q=${QEMU[$tc_arch]:-}
+    if ! command -v "$tc_gcc" >/dev/null; then
+        echo "SKIP ($tc_gcc not found)"; SKIP=$((SKIP+1)); continue
+    fi
+    if [[ -n $tc_q ]] && ! command -v "$tc_q" >/dev/null; then
+        echo "SKIP ($tc_q not found)"; SKIP=$((SKIP+1)); continue
+    fi
 
     # arm-thumb reuses arm libcov + a thumb-mode target binary.
     if [[ "$arch" == "arm-thumb" ]]; then
@@ -139,12 +175,14 @@ with open('$LCV','rb') as f:
     LIBCOV_PATCHLIST="$LCV" LIBCOV_SHM_PATH="$SHM" LIBCOV_LOG="$LOG" \
         LIBCOV_MODE=oneshot \
         run_target "$build_arch" "$libcov_so" "$target_bin" 42 > "$OUT.a" 2>&1
+    timed_out $? "oneshot run (42)" && continue
     python3 "$ROOT/test/shm_bitmap.py" extract "$SHM" "$SHM.a"
 
     rm -f "$SHM"
     LIBCOV_PATCHLIST="$LCV" LIBCOV_SHM_PATH="$SHM" LIBCOV_LOG=/dev/null \
         LIBCOV_MODE=oneshot \
         run_target "$build_arch" "$libcov_so" "$target_bin" 42 > "$OUT.b" 2>&1
+    timed_out $? "oneshot rerun (42)" && continue
     python3 "$ROOT/test/shm_bitmap.py" extract "$SHM" "$SHM.b"
 
     if ! cmp -s "$SHM.a" "$SHM.b"; then
@@ -157,6 +195,7 @@ with open('$LCV','rb') as f:
     LIBCOV_PATCHLIST="$LCV" LIBCOV_SHM_PATH="$SHM" LIBCOV_LOG=/dev/null \
         LIBCOV_MODE=oneshot \
         run_target "$build_arch" "$libcov_so" "$target_bin" -3 > "$OUT.neg" 2>&1
+    timed_out $? "oneshot run (-3)" && continue
     python3 "$ROOT/test/shm_bitmap.py" extract "$SHM" "$SHM.neg"
     if cmp -s "$SHM.a" "$SHM.neg"; then
         echo "FAIL bitmaps identical for input=42 vs -3"
@@ -168,6 +207,7 @@ with open('$LCV','rb') as f:
     LIBCOV_PATCHLIST="$LCV" LIBCOV_SHM_PATH="$SHM" LIBCOV_LOG=/dev/null \
         LIBCOV_MODE=leapfrog \
         run_target "$build_arch" "$libcov_so" "$target_bin" 99 > "$OUT.lf" 2>&1
+    timed_out $? "leapfrog run" && continue
     maxhits=$(python3 "$ROOT/test/shm_bitmap.py" stats "$SHM" | cut -d' ' -f3)
     if (( maxhits < 2 )); then
         echo "FAIL leapfrog never recorded multi-hit (max=$maxhits)"
@@ -176,6 +216,7 @@ with open('$LCV','rb') as f:
 
     # Target output unchanged under libcov.
     run_target_clean "$build_arch" "$target_bin" 42 > "$OUT.bare"
+    timed_out $? "bare run" && continue
     if ! diff -q "$OUT.a" "$OUT.bare" >/dev/null; then
         echo "FAIL target output differs with libcov vs without"
         diff "$OUT.a" "$OUT.bare" | head -10
@@ -191,6 +232,10 @@ done
 echo
 echo "============ SUMMARY ============"
 echo "PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP"
+if (( PASS == 0 && FAIL == 0 && SKIP > 0 )); then
+    echo "NOTE: every arch was skipped -- nothing was tested. Install the cross"
+    echo "      toolchains and qemu-user-static (HOWTO.md \"Prerequisites\")."
+fi
 if [[ ${#FAILED[@]} -gt 0 ]]; then
     printf '  %s\n' "${FAILED[@]}"
     exit 1

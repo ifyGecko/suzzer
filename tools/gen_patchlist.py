@@ -123,6 +123,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import struct
 import sys
 
@@ -175,12 +176,25 @@ def open_rizin(binary):
     # open the file, so check up front.
     if not os.path.isfile(binary) or not os.access(binary, os.R_OK):
         sys.exit(f"error: cannot read binary {binary!r}")
+    if shutil.which("rizin") is None:
+        sys.exit("error: rizin not found on PATH (needed to analyse the binary; "
+                 "see HOWTO.md \"Prerequisites\")")
     try:
         rz = rzpipe.open(binary)
     except Exception as e:
         sys.exit(f"error: failed to open {binary} with rizin: {e}")
     # Silence ANSI/colour from cmd() output; cmdj() is unaffected.
     rz.cmd("e scr.color=0")
+    # A non-ELF (or anything rizin can't load) has no "bin" info; without
+    # this check it surfaces much later as "no patch sites selected".
+    b = (rz.cmdj("ij") or {}).get("bin") or {}
+    if not b.get("arch"):
+        try:
+            rz.quit()
+        except Exception:
+            pass
+        sys.exit(f"error: {binary}: not an ELF, or rizin could not analyse it "
+                 f"(no 'bin' info from 'ij')")
     rz.cmd("aaa")
     return rz
 

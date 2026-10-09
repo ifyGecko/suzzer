@@ -21,6 +21,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
@@ -43,10 +44,63 @@ struct rr_stats {
 typedef void (*rr_slot_cb)(uint64_t gen, const uint8_t *bitmap, size_t map_size,
                            uint64_t tid, uint64_t ns, uint64_t flags, void *user);
 
+/* Does `path` name a POSIX shm object rather than a filesystem path? Same
+ * rule as libcov's sink (src/sink_shm.c): no '/' other than an optional
+ * leading one ("cov", "/cov") -> shm; anything else ("/tmp/cov",
+ * "./cov") -> plain file. */
+static inline int rr_path_is_shm_name(const char *path) {
+    for (const char *p = path + (path[0] == '/'); *p; p++)
+        if (*p == '/') return 0;
+    return 1;
+}
+
+/* Resolve the on-disk location(s) libcov may have used for `path`.
+ * which = 0: the primary location -- `path` itself for a filesystem path,
+ *            /dev/shm/NAME for a shm name (what shm_open() opens on Linux
+ *            with glibc/musl; opened directly so readers need no -lrt).
+ * which = 1: the shm-name fallback libcov uses when shm_open fails,
+ *            $TMPDIR/NAME or /tmp/NAME; NULL for filesystem paths.
+ * Returns buf (or path itself), or NULL if there is no such candidate. */
+static inline const char *rr_shm_candidate(const char *path, int which,
+                                           char *buf, size_t n) {
+    if (!rr_path_is_shm_name(path)) return which == 0 ? path : NULL;
+    const char *bare = (path[0] == '/') ? path + 1 : path;
+    if (which == 0) {
+        snprintf(buf, n, "/dev/shm/%s", bare);
+    } else if (which == 1) {
+        const char *tmpdir = getenv("TMPDIR");
+        if (!tmpdir || !*tmpdir) tmpdir = "/tmp";
+        snprintf(buf, n, "%s/%s", tmpdir, bare);
+    } else {
+        return NULL;
+    }
+    return buf;
+}
+
+/* Remove a stale region at every location libcov may use for `path`. */
+static inline void rr_unlink_shm(const char *path) {
+    char buf[512];
+    for (int w = 0; w < 2; w++) {
+        const char *p = rr_shm_candidate(path, w, buf, sizeof buf);
+        if (p) unlink(p);
+    }
+}
+
 /* Map an existing shm region read-only. 0 on success. Not-yet-created is a
- * normal transient failure (-1); the caller polls. */
+ * normal transient failure (-1); the caller polls. `path` follows libcov's
+ * LIBCOV_SHM_PATH rule (see rr_shm_candidate): a bare/leading-slash name is
+ * looked up in /dev/shm, then in the $TMPDIR (or /tmp) fallback; anything
+ * else is opened as a filesystem path, exactly as before. */
 static inline int rr_open_shm(const char *path, void **base_out, size_t *size_out) {
-    int fd = open(path, O_RDWR);
+    char buf[512];
+    int fd = -1;
+    for (int w = 0; w < 2 && fd < 0; w++) {
+        const char *p = rr_shm_candidate(path, w, buf, sizeof buf);
+        if (!p) break;
+        /* Like libcov's shm_open/fallback, don't follow symlinks for the
+         * derived locations; a user-given filesystem path is opened as-is. */
+        fd = open(p, O_RDWR | (p == path ? 0 : O_NOFOLLOW | O_CLOEXEC));
+    }
     if (fd < 0) return -1;
     struct stat st;
     if (fstat(fd, &st) < 0) { close(fd); return -1; }

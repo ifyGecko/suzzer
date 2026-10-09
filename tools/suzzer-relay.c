@@ -236,7 +236,10 @@ static void usage(const char *a0) {
       "usage: %s --brain HOST:PORT --port-file PATH --libcov SO\n"
       "          --patchlist LCV --boundary LCVB [--shm PATH] -- TARGET [args...]\n"
       "  Spawns TARGET under libcov, bridges coverage to the brain over TCP.\n"
-      "  TARGET must bind 127.0.0.1 and write its port to PATH (see target_netd.c).\n",
+      "  TARGET must bind 127.0.0.1 and write its port to PATH (see target_netd.c).\n"
+      "  --shm follows LIBCOV_SHM_PATH rules: a bare or leading-slash name\n"
+      "  (cov, /cov) is a shm object (/dev/shm/cov, $TMPDIR or /tmp fallback);\n"
+      "  anything else is a file path. Default: /tmp/libcov_relay_<pid>.\n",
       a0);
 }
 
@@ -277,34 +280,43 @@ int main(int argc, char **argv) {
 
     struct target_cfg cfg = { targv, lib, plist, blist, shm, efd };
 
+    /* Everything below that can fail after the target is spawned exits via
+     * `out`, which kills/reaps the target and unlinks the shm + port files. */
+    int rc = 1;
+    int bfd = -1;
+    void *shm_base = NULL; size_t shm_size = 0, map_size = 0;
+    uint8_t *scratch = NULL, *capbuf = NULL, *txbuf = NULL;
+
     /* ---- spawn target, discover its port, attach to coverage ---- */
-    unlink(shm);
+    rr_unlink_shm(shm);
     unlink(port_file);
     pid_t pid = spawn_target(&cfg);
-    if (pid < 0) return 1;
+    if (pid < 0) goto out;
 
     unsigned target_port = 0;
     if (read_port_file(port_file, 3000, &target_port) != 0) {
         fprintf(stderr, "relay: target never published its port to %s\n", port_file);
-        kill(pid, SIGKILL); waitpid(pid, NULL, 0); return 1;
+        goto out;
     }
 
-    void *shm_base = NULL; size_t shm_size = 0, map_size = 0;
     if (rr_attach(shm, 1 /*require_active*/, 3000,
                   &shm_base, &shm_size, &map_size) != 0) {
         fprintf(stderr, "relay: coverage region never activated at %s\n", shm);
-        kill(pid, SIGKILL); waitpid(pid, NULL, 0); return 1;
+        goto out;
     }
+    /* Buffers and the HELLO are sized from this first attach; a restarted
+     * daemon must come back with the same map_size. */
+    const size_t first_map_size = map_size;
     volatile struct libcov_shm_header *hdr = shm_base;
 
     /* ---- connect to the brain, send HELLO ---- */
-    int bfd = connect_tcp(brain_host, brain_port);
+    bfd = connect_tcp(brain_host, brain_port);
     if (bfd < 0) {
         fprintf(stderr, "relay: cannot connect to brain %s:%s\n", brain_host, brain_port);
-        kill(pid, SIGKILL); waitpid(pid, NULL, 0); return 1;
+        goto out;
     }
     { int one = 1; setsockopt(bfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one); }
-    if (write_all(bfd, SZR_MAGIC, 4) < 0) { perror("send magic"); return 1; }
+    if (write_all(bfd, SZR_MAGIC, 4) < 0) { perror("send magic"); goto out; }
 
     struct utsname un;
     uname(&un);
@@ -327,25 +339,45 @@ int main(int argc, char **argv) {
     put_u16(hello + 10, arch_len);
     memcpy(hello + 12, un.machine, arch_len);
     if (send_frame(bfd, SZR_HELLO, hello, 12u + arch_len) < 0) {
-        perror("send HELLO"); return 1;
+        perror("send HELLO"); goto out;
     }
 
-    uint8_t *scratch = malloc(map_size);
-    uint8_t *capbuf  = malloc(map_size);
-    uint8_t *txbuf   = malloc(map_size + 64);
-    if (!scratch || !capbuf || !txbuf) { fprintf(stderr, "relay: OOM\n"); return 1; }
+    scratch = malloc(map_size);
+    capbuf  = malloc(map_size);
+    txbuf   = malloc(map_size + 64);
+    if (!scratch || !capbuf || !txbuf) { fprintf(stderr, "relay: OOM\n"); goto out; }
 
     /* ---- main loop: one INPUT -> one COVERAGE or CRASH ---- */
-    int rc = 0;
+    rc = 0;
     for (;;) {
         uint8_t type, *payload = NULL; uint32_t plen = 0;
         if (recv_frame(bfd, &type, &payload, &plen) < 0) break;  /* brain gone */
         if (type == SZR_BYE) { free(payload); break; }
-        if (type != SZR_INPUT || plen < 12) { free(payload); continue; }
+        if (type != SZR_INPUT) {
+            /* The brain never sends anything but INPUT/BYE; ignore, but say so. */
+            fprintf(stderr, "relay: ignoring unexpected frame type %u (%u bytes)\n",
+                    (unsigned)type, (unsigned)plen);
+            free(payload);
+            continue;
+        }
+        /* plen >= 12 is checked first, so `plen - 12` cannot wrap. */
+        if (plen < 12 || get_u32(payload + 8) > plen - 12) {
+            /* Malformed INPUT: still reply (lockstep -- the brain is blocked
+             * waiting for exactly one COVERAGE/CRASH per INPUT). */
+            uint64_t bad_id = plen >= 8 ? get_u64(payload) : 0;
+            fprintf(stderr, "relay: malformed INPUT id=%llu (payload %u bytes, "
+                    "declared len %u); replying CRASH reason=MALFORMED\n",
+                    (unsigned long long)bad_id, (unsigned)plen,
+                    plen >= 12 ? (unsigned)get_u32(payload + 8) : 0u);
+            uint8_t cb[13];
+            put_u64(cb, bad_id); cb[8] = SZR_CRASH_MALFORMED; put_u32(cb + 9, 0);
+            free(payload);
+            if (send_frame(bfd, SZR_CRASH, cb, sizeof cb) < 0) break;
+            continue;
+        }
 
         uint64_t id = get_u64(payload);
         uint32_t len = get_u32(payload + 8);
-        if (12u + len > plen) { free(payload); continue; }
         const uint8_t *data = payload + 12;
 
         uint64_t prev_gen = __atomic_load_n((uint64_t *)&hdr->gen_current,
@@ -381,12 +413,18 @@ int main(int argc, char **argv) {
 
             /* Restart the daemon and re-attach for the next input. */
             munmap(shm_base, shm_size); shm_base = NULL;
-            unlink(shm); unlink(port_file);
+            rr_unlink_shm(shm); unlink(port_file);
             pid = spawn_target(&cfg);
             if (pid < 0) { free(payload); rc = 1; break; }
             if (read_port_file(port_file, 3000, &target_port) != 0 ||
                 rr_attach(shm, 1, 3000, &shm_base, &shm_size, &map_size) != 0) {
                 fprintf(stderr, "relay: restart failed\n");
+                free(payload); rc = 1; break;
+            }
+            if (map_size != first_map_size) {
+                fprintf(stderr, "relay: restarted target has map_size %zu, "
+                        "first attach had %zu; buffers and HELLO no longer "
+                        "match -- giving up\n", map_size, first_map_size);
                 free(payload); rc = 1; break;
             }
             hdr = shm_base;
@@ -419,11 +457,15 @@ int main(int argc, char **argv) {
         free(payload);
     }
 
+out:
     if (shm_base) munmap(shm_base, shm_size);
-    kill(pid, SIGKILL);
-    waitpid(pid, NULL, 0);
-    unlink(shm); unlink(port_file);
-    close(bfd); close(efd);
+    if (pid > 0) {
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+    }
+    rr_unlink_shm(shm); unlink(port_file);
+    if (bfd >= 0) close(bfd);
+    close(efd);
     free(scratch); free(capbuf); free(txbuf);
     return rc;
 }

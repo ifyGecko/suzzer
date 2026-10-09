@@ -41,6 +41,11 @@ demalloc: $(BUILD)/target_demalloc
 # (run_validation_relay.sh). Built on demand by that suite, not by `all`.
 netd: $(BUILD)/target_netd
 
+# Every output lands in $(BUILD); create it on demand (order-only) so
+# `make -C test mt ARCH=.. BUILD=..` works on a fresh directory.
+$(BUILD):
+	mkdir -p $@
+
 # -no-pie keeps test addresses static for easy patch-list generation.
 # -fno-stack-protector trims function prologue noise.
 # ARM is built in ARM mode by default; an explicit thumb target_simple is
@@ -50,20 +55,20 @@ ifeq ($(ARCH),arm)
   TARGET_CFLAGS += -marm
 endif
 
-$(BUILD)/target_simple: target_simple.c
+$(BUILD)/target_simple: target_simple.c | $(BUILD)
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -o $@ $<
 
-$(BUILD)/target_loop: target_loop.c
+$(BUILD)/target_loop: target_loop.c | $(BUILD)
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -o $@ $<
 
 # Ordering-sensitive target for the N-gram checks in
 # run_validation_coverage_options.sh.
-$(BUILD)/target_orderable: target_orderable.c
+$(BUILD)/target_orderable: target_orderable.c | $(BUILD)
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -o $@ $<
 
 # Generator regressions (run_validation_generator.sh): function-pointer
 # dispatch + a block whose callee may exit.
-$(BUILD)/target_dispatch: target_dispatch.c
+$(BUILD)/target_dispatch: target_dispatch.c | $(BUILD)
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -o $@ $<
 
 # -O2 PIE builds of the ground-truth targets (run_validation_o2pie.sh).
@@ -76,21 +81,21 @@ ifeq ($(ARCH),arm)
 endif
 o2pie: $(BUILD)/target_simple_o2pie $(BUILD)/target_dispatch_o2pie
 
-$(BUILD)/target_simple_o2pie: target_simple.c
+$(BUILD)/target_simple_o2pie: target_simple.c | $(BUILD)
 	$(CC) $(O2PIE_CFLAGS) -o $@ $<
 
-$(BUILD)/target_dispatch_o2pie: target_dispatch.c
+$(BUILD)/target_dispatch_o2pie: target_dispatch.c | $(BUILD)
 	$(CC) $(O2PIE_CFLAGS) -o $@ $<
 
 # Boundary-marker emulation (run_validation_marker_emulation.sh).
-$(BUILD)/target_markers: target_markers.c
+$(BUILD)/target_markers: target_markers.c | $(BUILD)
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -o $@ $<
 
 # Thumb variants: only built when explicitly asked (make thumb).
-$(BUILD)/target_simple_thumb: target_simple.c
+$(BUILD)/target_simple_thumb: target_simple.c | $(BUILD)
 	$(CC) $(CFLAGS) -no-pie -fno-stack-protector -mthumb -o $@ $<
 
-$(BUILD)/target_markers_thumb: target_markers.c
+$(BUILD)/target_markers_thumb: target_markers.c | $(BUILD)
 	$(CC) $(CFLAGS) -no-pie -fno-stack-protector -mthumb -o $@ $<
 
 .PHONY: thumb
@@ -103,40 +108,40 @@ thumb: $(BUILD)/target_simple_thumb $(BUILD)/target_markers_thumb
 # can't synthesize 64-bit atomics natively (32-bit arches: mips, mipsel,
 # powerpc). On 64-bit arches __atomic_load_8 is inline and the library
 # stays unlinked.
-$(BUILD)/fuzz_driver: fuzz_driver.c ../src/ring_reader.h ../src/boundary.h
+$(BUILD)/fuzz_driver: fuzz_driver.c ../src/ring_reader.h ../src/boundary.h | $(BUILD)
 	$(CC) -O2 -g -Wall -Wextra $(DEPFLAGS) -I../src -o $@ fuzz_driver.c \
 	    -Wl,--as-needed -latomic
 
 # Single-process TCP daemon target for the remote-fuzzing template.
-$(BUILD)/target_netd: target_netd.c
+$(BUILD)/target_netd: target_netd.c | $(BUILD)
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -o $@ $<
 
-$(BUILD)/target_simple_mt: target_simple_mt.c
+$(BUILD)/target_simple_mt: target_simple_mt.c | $(BUILD)
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -pthread -o $@ $<
 
-$(BUILD)/target_loop_mt: target_loop_mt.c
+$(BUILD)/target_loop_mt: target_loop_mt.c | $(BUILD)
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -pthread -o $@ $<
 
 # Passive ring reader for targets that iterate on their own
 # (run_validation_boundary_mt.sh). Same build shape as fuzz_driver.
-$(BUILD)/ring_dump: ring_dump.c ../src/boundary.h
+$(BUILD)/ring_dump: ring_dump.c ../src/boundary.h | $(BUILD)
 	$(CC) -O2 -g -Wall -Wextra $(DEPFLAGS) -I../src -o $@ ring_dump.c \
 	    -Wl,--as-needed -latomic
 
 # target_demalloc deliberately keeps the libc allocator behavior under
 # LD_PRELOAD interception, so it is a normal -no-pie -O0 build.
-$(BUILD)/target_demalloc: target_demalloc.c
+$(BUILD)/target_demalloc: target_demalloc.c | $(BUILD)
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -o $@ $<
 
 # Multi-module pair: a shared library + a -no-pie executable that calls
 # into it. The executable links against the helper so the loader maps the
 # .so at run time; gen_patchlist.py is given both with --module so each
 # gets its own module_idx in the LCV3 output.
-$(BUILD)/libmultimod_helper.so: libmultimod_helper.c libmultimod_helper.h
+$(BUILD)/libmultimod_helper.so: libmultimod_helper.c libmultimod_helper.h | $(BUILD)
 	$(CC) $(CFLAGS) -fPIC -shared -o $@ libmultimod_helper.c
 
 $(BUILD)/target_multimod: target_multimod.c libmultimod_helper.h \
-                          $(BUILD)/libmultimod_helper.so
+                          $(BUILD)/libmultimod_helper.so | $(BUILD)
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -I. -o $@ target_multimod.c \
 	    -L$(BUILD) -lmultimod_helper -Wl,-rpath,$(abspath $(BUILD))
 
@@ -152,5 +157,6 @@ clean:
 	       $(BUILD)/target_loop_mt $(BUILD)/ring_dump \
 	       $(BUILD)/target_demalloc $(BUILD)/fuzz_driver \
 	       $(BUILD)/target_netd \
+	       $(BUILD)/target_paired $(BUILD)/target_reexec $(BUILD)/target_signals \
 	       $(BUILD)/target_multimod $(BUILD)/libmultimod_helper.so \
 	       $(BUILD)/*.d

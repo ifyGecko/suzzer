@@ -55,11 +55,14 @@ for arch in "${ARCHES[@]}"; do
         || { echo "SKIP: $arch ($tri-gcc or $q missing)"; continue; }
     sr=/usr/$tri
     B="$ROOT/build/$base"
+    built=1
     for th in st mt; do
         make --no-print-directory ARCH=$base THREADING=$th native \
             >"$WORK/$arch.$th.build.log" 2>&1 \
-            || { echo "FAIL: $arch/$th: libcov build"; fail=1; continue; }
+            || { echo "FAIL: $arch/$th: libcov build (log: $WORK/$arch.$th.build.log)"
+                 fail=1; built=0; break; }
     done
+    (( built )) || continue   # skip the whole arch, not just this variant
     T="$WORK/target_signals.$arch"
     "$tri-gcc" -O0 -g -no-pie -pthread $tflags -o "$T" test/target_signals.c \
         2>"$WORK/$arch.cc.log" \

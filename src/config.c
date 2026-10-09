@@ -169,15 +169,17 @@ int config_load(const char *path) {
     /* module_count is uint8_t so it can't exceed LIBCOV_MAX_MODULES (255)
      * by construction; no upper-bound check needed here. */
 
-    size_t need_records = recs_off + (size_t)count * sizeof(struct patchlist_record);
-    if ((size_t)st.st_size < need_records) {
+    /* Divide rather than multiply: count * recsize can wrap a 32-bit
+     * size_t and pass a crafted file. recs_off <= st_size (parse_header). */
+    if (count > ((size_t)st.st_size - recs_off) / sizeof(struct patchlist_record)) {
         libcov_logf("config: truncated records (count=%u)", count); munmap(map, st.st_size); return -1;
     }
     if (modules_size == 0 || modules_size > LIBCOV_MAX_MODULES_BYTES) {
         libcov_logf("config: invalid modules_size=%u", modules_size);
         munmap(map, st.st_size); return -1;
     }
-    if ((size_t)modules_offset + modules_size > (size_t)st.st_size) {
+    if ((size_t)modules_offset > (size_t)st.st_size ||
+        (size_t)modules_size > (size_t)st.st_size - modules_offset) {
         libcov_logf("config: module table runs past end of file");
         munmap(map, st.st_size); return -1;
     }

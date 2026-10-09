@@ -17,7 +17,14 @@ export PYTHONDONTWRITEBYTECODE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# Kept (and its path printed) when the suite fails: the generator and
+# target logs in it are how you debug.
+keep_work_on_failure() {
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then rm -rf "$WORK"; else echo "logs kept in $WORK" >&2; fi
+    return $rc
+}
+trap keep_work_on_failure EXIT
 ARCH="${ARCH:-$(uname -m)}"
 B="$ROOT/build/$ARCH"
 T="$B/target_loop"
@@ -25,7 +32,7 @@ T="$B/target_loop"
 ${CC:-gcc} -O2 -o "$WORK/wx_deny" "$ROOT/test/wx_deny.c" \
     || { echo "FAIL: build wx_deny"; exit 1; }
 
-fail=0
+fail=0 ran=0
 bad() { echo "FAIL: $*"; fail=1; }
 INPUTS=$'42\n99\n-3\nabc\nhello\n7\n0\n1000\n'
 want=$(printf '%s' "$INPUTS" | "$T")
@@ -33,6 +40,7 @@ want=$(printf '%s' "$INPUTS" | "$T")
 for th in st mt; do
     LIB="$B/libcov_$th.so"
     [[ -f "$LIB" ]] || { echo "SKIP: $LIB missing"; continue; }
+    ran=$((ran + 1))
     LCV="$WORK/$th.lcv"
     "$ROOT/tools/gen_patchlist.py" "$T" "$LCV" --threading $th >/dev/null 2>&1 \
         || { bad "$th: gen_patchlist"; continue; }
@@ -88,4 +96,5 @@ for th in st mt; do
     fi
 done
 
+(( ran )) || bad "no libcov_{st,mt}.so in $B -- nothing ran; build with: make && make THREADING=mt"
 [[ $fail -eq 0 ]] && echo "ALL PATCH-MODE VALIDATIONS PASSED ($ARCH)" || exit 1

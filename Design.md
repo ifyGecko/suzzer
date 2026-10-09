@@ -1856,7 +1856,9 @@ one reply:
    `ITER` snapshot (it drains and drops the between-request `GAP`/startup
    `INIT` gens). If the daemon died, it sends `CRASH(id, reason, status)` and
    restarts the daemon (and re-attaches, since the region resets under a new
-   owner, §20).
+   owner, §20). Reasons (`relay_proto.h`): 1 exit, 2 signal, 3 delivery
+   failed, 4 malformed `INPUT` frame (rejected by the relay; the daemon is
+   untouched). Every `INPUT` gets exactly one reply.
 
 The brain scores only `ITER` frames (new nonzero bytes vs. its cumulative
 map), enqueues inputs that found coverage, and writes `CRASH` inputs to

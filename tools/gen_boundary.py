@@ -35,6 +35,7 @@ Example:
 import argparse
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -46,23 +47,45 @@ from gen_patchlist import (default_strategy, fix_elfv1_nop_entries,  # noqa: E40
 from rz_resolve import NotFound, resolve_to_offset  # noqa: E402
 
 
+def check_inputs(binary):
+    """Fail early, with a clear message, on the two things every later
+    rizin call depends on."""
+    if not os.path.isfile(binary) or not os.access(binary, os.R_OK):
+        sys.exit(f"error: {binary}: not a readable file")
+    if shutil.which("rizin") is None:
+        sys.exit("error: rizin not found on PATH (needed to analyse the binary; "
+                 "see HOWTO.md \"Prerequisites\")")
+
+
 def rizin(binary, cmds):
-    out = subprocess.check_output(
-        ["rizin", "-q", "-c", "; ".join(cmds), binary],
-        stderr=subprocess.DEVNULL,
-    )
-    return out.decode("utf-8", errors="replace")
+    # stderr is captured, not discarded: shown when rizin fails, dropped
+    # (it is mostly analysis chatter) when it succeeds.
+    p = subprocess.run(["rizin", "-q", "-c", "; ".join(cmds), binary],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if p.returncode != 0:
+        err = p.stderr.decode("utf-8", errors="replace").strip()
+        tail = "\n".join(err.splitlines()[-10:]) or "(no stderr)"
+        sys.exit(f"error: rizin failed on {binary} (rc={p.returncode}, "
+                 f"cmds: {'; '.join(cmds)}):\n{tail}")
+    return p.stdout.decode("utf-8", errors="replace")
 
 
 def rizin_json(binary, cmds):
     raw = rizin(binary, cmds).strip()
     if not raw:
         return None
-    return json.loads(raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        sys.exit(f"error: rizin returned non-JSON output for "
+                 f"'{'; '.join(cmds)}' on {binary}: {e}")
 
 
 def get_image_info(binary):
-    info = rizin_json(binary, ["ij"])["bin"]
+    info = (rizin_json(binary, ["ij"]) or {}).get("bin")
+    if not info or "baddr" not in info:
+        sys.exit(f"error: {binary}: not an ELF, or rizin could not analyse it "
+                 f"(no 'bin' info from 'ij')")
     return int(info["baddr"]), info.get("arch"), int(info.get("bits", 0))
 
 
@@ -250,6 +273,7 @@ def main():
                          "anyway (it has no effect without END markers)")
     ap.add_argument("--verbose", "-v", action="store_true")
     args = ap.parse_args()
+    check_inputs(args.binary)
     patched = patchlist_offsets(args.patchlist) if args.patchlist else None
 
     baddr, arch, bits = get_image_info(args.binary)

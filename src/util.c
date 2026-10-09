@@ -30,6 +30,8 @@ void libcov_log_init(void) {
     if (p && *p) {
         int fd = open(p, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
         if (fd >= 0) log_fd = fd;
+        else libcov_logf("cannot open LIBCOV_LOG '%s': %s; logging to stderr",
+                         p, strerror(errno));
     }
     struct stat st;
     if (fstat(log_fd, &st) == 0) {
@@ -138,6 +140,102 @@ uintptr_t util_module_base(const char *modname) {
     }
     fclose(f);
     return base;
+}
+
+/* One mapping from the snapshot. base is the load base of its file (the
+ * first mapping of that path: lo - off, as in util_module_base), 0 for
+ * anonymous mappings. /proc/self/maps lists mappings in address order. */
+struct maps_ent {
+    uintptr_t lo, hi, base;
+    int       readable;
+};
+static struct maps_ent *g_maps;
+static size_t           g_maps_n;
+
+int util_maps_load(void) {
+    util_maps_free();
+    FILE *f = fopen("/proc/self/maps", "re");
+    if (!f) return -1;
+    /* Distinct file paths seen so far, with their base. */
+    struct { char *path; uintptr_t base; } *files = NULL;
+    size_t n_files = 0, cap = 0, fcap = 0;
+    char line[4096];
+    int rv = 0;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long lo, hi, off, ino;
+        char perms[8];
+        int devmaj, devmin;
+        int n;
+        if (sscanf(line, "%lx-%lx %7s %lx %x:%x %lu %n",
+                   &lo, &hi, perms, &off, &devmaj, &devmin, &ino, &n) < 7) continue;
+        char *path = line + n;
+        while (*path == ' ') path++;
+        size_t L = strlen(path);
+        if (L && path[L - 1] == '\n') path[L - 1] = 0;
+        strip_deleted(path);
+        uintptr_t base = 0;
+        if (*path) {
+            size_t i;
+            for (i = 0; i < n_files && strcmp(files[i].path, path); i++) {}
+            if (i == n_files) {
+                if (n_files == fcap) {
+                    size_t nc = fcap ? 2 * fcap : 64;
+                    void *p = realloc(files, nc * sizeof *files);
+                    if (!p) { rv = -1; break; }
+                    files = p; fcap = nc;
+                }
+                files[i].path = strdup(path);
+                if (!files[i].path) { rv = -1; break; }
+                files[i].base = (uintptr_t)(lo - off);
+                n_files++;
+            }
+            base = files[i].base;
+        }
+        if (g_maps_n == cap) {
+            size_t nc = cap ? 2 * cap : 256;
+            void *p = realloc(g_maps, nc * sizeof *g_maps);
+            if (!p) { rv = -1; break; }
+            g_maps = p; cap = nc;
+        }
+        g_maps[g_maps_n].lo       = (uintptr_t)lo;
+        g_maps[g_maps_n].hi       = (uintptr_t)hi;
+        g_maps[g_maps_n].base     = base;
+        g_maps[g_maps_n].readable = perms[0] == 'r';
+        g_maps_n++;
+    }
+    fclose(f);
+    for (size_t i = 0; i < n_files; i++) free(files[i].path);
+    free(files);
+    if (rv != 0) util_maps_free();
+    return rv;
+}
+
+int util_range_in_module(uintptr_t module_base, uintptr_t addr, size_t len) {
+    if (!g_maps) return 1;
+    if (addr + len < addr) return 0;
+    /* Last mapping with lo <= addr. */
+    size_t lo = 0, hi = g_maps_n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (g_maps[mid].lo <= addr) lo = mid + 1;
+        else                        hi = mid;
+    }
+    if (lo == 0) return 0;
+    uintptr_t end = addr + len;
+    for (size_t i = lo - 1; i < g_maps_n; i++) {
+        const struct maps_ent *m = &g_maps[i];
+        if (m->lo > addr || addr >= m->hi) return 0;
+        if (!m->readable || m->base != module_base) return 0;
+        if (end <= m->hi) return 1;
+        addr = m->hi;   /* the site straddles into the next mapping */
+    }
+    return 0;
+}
+
+void util_maps_free(void) {
+    free(g_maps);
+    g_maps = NULL;
+    g_maps_n = 0;
 }
 
 void util_self_range(uintptr_t *lo_out, uintptr_t *hi_out) {

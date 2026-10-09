@@ -15,7 +15,14 @@ export PYTHONDONTWRITEBYTECODE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# Kept (and its path printed) when the suite fails: the generator and
+# target logs in it are how you debug.
+keep_work_on_failure() {
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then rm -rf "$WORK"; else echo "logs kept in $WORK" >&2; fi
+    return $rc
+}
+trap keep_work_on_failure EXIT
 ARCH="${ARCH:-$(uname -m)}"
 B="$ROOT/build/$ARCH"
 T="$B/target_paired"
@@ -27,12 +34,14 @@ ${CC:-gcc} -O0 -g -no-pie -o "$T" "$ROOT/test/target_paired.c" \
 
 INPUTS=$'42\n-3\n0\nabc\n1000\n7\n'
 N=6
-fail=0
+RUN_TIMEOUT="${RUN_TIMEOUT:-60}"   # seconds per ring_dump / fuzz_driver run
+fail=0 ran=0
 bad() { echo "FAIL: $*"; fail=1; }
 
 for th in st mt; do
     LIB="$B/libcov_$th.so"
     [[ -f "$LIB" ]] || { echo "SKIP: $LIB missing"; continue; }
+    ran=$((ran + 1))
     LCV="$WORK/$th.lcv"; LCVB="$WORK/$th.lcvb"
     "$ROOT/tools/gen_patchlist.py" "$T" "$LCV" --threading $th \
         --include-pat '^dbg\.(iter_begin|iter_end|process|gap_work)$' >/dev/null 2>&1 \
@@ -41,8 +50,10 @@ for th in st mt; do
         --patchlist "$LCV" >/dev/null 2>&1 || { bad "$th: gen_boundary"; continue; }
 
     printf '%s' "$INPUTS" | LIBCOV_MODE=leapfrog LIBCOV_BOUNDARY_RING=16 \
-        "$B/ring_dump" "$LIB" "$LCV" "$LCVB" "$T" > "$WORK/$th.dump" 2>&1
-    if python3 - "$WORK/$th.dump" "$N" <<'PY'
+        timeout "$RUN_TIMEOUT" "$B/ring_dump" "$LIB" "$LCV" "$LCVB" "$T" > "$WORK/$th.dump" 2>&1
+    if [[ $? -eq 124 ]]; then
+        bad "$th/ring_dump: timed out after ${RUN_TIMEOUT}s (RUN_TIMEOUT)"
+    elif python3 - "$WORK/$th.dump" "$N" <<'PY'
 import re, sys
 path, n = sys.argv[1], int(sys.argv[2])
 gens = []
@@ -72,10 +83,15 @@ PY
     fi
 
     printf '%s' "$INPUTS" | LIBCOV_MODE=leapfrog LIBCOV_BOUNDARY_RING=16 \
-        "$B/fuzz_driver" "$LIB" "$LCV" "$LCVB" "$T" > "$WORK/$th.drv" 2>&1
-    grep -q " init=1 iter=$N gap=$N" "$WORK/$th.drv" \
-        && echo "   OK: $th/fuzz_driver: init=1 iter=$N gap=$N" \
-        || bad "$th/fuzz_driver: $(grep '^driver:' "$WORK/$th.drv")"
+        timeout "$RUN_TIMEOUT" "$B/fuzz_driver" "$LIB" "$LCV" "$LCVB" "$T" > "$WORK/$th.drv" 2>&1
+    if [[ $? -eq 124 ]]; then
+        bad "$th/fuzz_driver: timed out after ${RUN_TIMEOUT}s (RUN_TIMEOUT)"
+    elif grep -q " init=1 iter=$N gap=$N" "$WORK/$th.drv"; then
+        echo "   OK: $th/fuzz_driver: init=1 iter=$N gap=$N"
+    else
+        bad "$th/fuzz_driver: $(grep '^driver:' "$WORK/$th.drv")"
+    fi
 done
 
+(( ran )) || bad "no libcov_{st,mt}.so in $B -- nothing ran; build with: make && make THREADING=mt"
 [[ $fail -eq 0 ]] && echo "ALL PAIRED-MODE VALIDATIONS PASSED ($ARCH)" || exit 1

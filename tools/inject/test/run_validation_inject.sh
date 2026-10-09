@@ -18,15 +18,19 @@
 # (libcov_st.so and libcov_mt.so, if both are built). Each (injector,
 # threading) cell contributes 4 assertions.
 #
-# Exit code: 0 if all assertions pass; non-zero otherwise. The script
-# prints "PASS=N FAIL=M" at the end.
+# Exit code: 0 if all assertions pass; non-zero otherwise, including when
+# no cell ran at all (neither libcov variant built, or patch-list
+# generation failed for both). The script prints "PASS=N FAIL=M" at the
+# end.
 #
 # Env knobs:
 #   ARCH        -- override host arch detection (default: uname -m)
 #   ROOT        -- path to suzzer repo root (default: ../../../ from script)
-#   KEEP_TMP    -- set to keep /tmp/inj_* files around for debugging
+#   KEEP_TMP    -- set to keep the per-run scratch dir (patch lists, shm
+#                  files, logs) for debugging; it is also kept on failure
 
 set -eu
+set -o pipefail
 
 ROOT="${ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}"
 ARCH="${ARCH:-$(uname -m)}"
@@ -38,14 +42,17 @@ GEN_PATCHLIST="$ROOT/tools/gen_patchlist.py"
 LIBCOV_ST="$ROOT/build/$ARCH/libcov_st.so"
 LIBCOV_MT="$ROOT/build/$ARCH/libcov_mt.so"
 
-LCV_ST="/tmp/inj_target.st.lcv"
-LCV_MT="/tmp/inj_target.mt.lcv"
-SHM_PREFIX="/tmp/inj_validate"
-LOG_PREFIX="/tmp/inj_validate.log"
-FIFO_PREFIX="/tmp/inj_validate.fifo"
+# Per-run scratch dir (fixed /tmp/inj_* paths made parallel runs collide).
+WORK=$(mktemp -d -t libcov_inject.XXXXXX)
+LCV_ST="$WORK/target.st.lcv"
+LCV_MT="$WORK/target.mt.lcv"
+SHM_PREFIX="$WORK/validate"
+LOG_PREFIX="$WORK/validate.log"
+FIFO_PREFIX="$WORK/validate.fifo"
 
 PASS=0
 FAIL=0
+CELLS=0
 FAIL_LIST=()
 
 note()  { printf '   %s\n' "$*"; }
@@ -54,14 +61,17 @@ ok()    { PASS=$((PASS + 1)); printf '   PASS: %s\n' "$*"; }
 fail()  { FAIL=$((FAIL + 1)); FAIL_LIST+=("$*"); printf '   FAIL: %s\n' "$*"; }
 
 cleanup() {
-    local pid
+    local rc=$? pid
     for pid in "$@"; do
         kill -9 "$pid" 2>/dev/null || true
     done
     wait 2>/dev/null || true
-    if [[ -z "${KEEP_TMP:-}" ]]; then
-        rm -f "$SHM_PREFIX".* "$LOG_PREFIX".* "$FIFO_PREFIX".*
+    if [[ -z "${KEEP_TMP:-}" && $rc -eq 0 ]]; then
+        rm -rf "$WORK"
+    else
+        echo "scratch files kept in $WORK" >&2
     fi
+    return $rc
 }
 trap 'cleanup ${TARGET_PIDS:-}' EXIT
 
@@ -86,19 +96,24 @@ fi
 # libcov_mt is refused at init, leaving the library inert (bitmap stays
 # empty -> validation B/C fail with cryptic results). So we generate
 # one of each.
+# A failed generator leaves no .lcv, so that cell is skipped below (and
+# counted as a FAIL); its log tail is shown here.
 hdr "Regenerate patch lists for target_inject_loop"
-"$GEN_PATCHLIST" "$TARGET" "$LCV_ST" \
-    --include-pat '^dbg\.(main|classify|loop_sum|cmdline|process_one)$' \
-    2>&1 | tail -1
-"$GEN_PATCHLIST" "$TARGET" "$LCV_MT" \
-    --include-pat '^dbg\.(main|classify|loop_sum|cmdline|process_one)$' \
-    --threading mt 2>&1 | tail -1
-note "st patchlist: $(stat -c '%s bytes' "$LCV_ST")"
-note "mt patchlist: $(stat -c '%s bytes' "$LCV_MT")"
+for th in st mt; do
+    lcv="$WORK/target.$th.lcv"
+    if "$GEN_PATCHLIST" "$TARGET" "$lcv" --threading $th \
+            --include-pat '^dbg\.(main|classify|loop_sum|cmdline|process_one)$' \
+            >/dev/null 2>"$WORK/gen.$th.log"; then
+        note "$th patchlist: $(stat -c '%s bytes' "$lcv")"
+    else
+        rm -f "$lcv"
+        fail "gen_patchlist --threading $th: $(tail -3 "$WORK/gen.$th.log")"
+    fi
+done
 
 # Capture a baseline target stdout (no injection at all) for assertion D.
 hdr "Capture baseline stdout (no libcov)"
-BASELINE_OUT="/tmp/inj_validate.baseline.out"
+BASELINE_OUT="$WORK/baseline.out"
 (
     "$TARGET" <<EOF
 42
@@ -147,10 +162,10 @@ run_one() {
     fi
 
     # Inject libcov.
-    "$INJ" -P "$lcv" -S "$shm" -M "$mode" -L "$log" $tpid "$lib" > /tmp/inj_validate.injout 2>&1
+    "$INJ" -P "$lcv" -S "$shm" -M "$mode" -L "$log" $tpid "$lib" > "$WORK/injout" 2>&1
     local rc=$?
     if [[ $rc -ne 0 ]]; then
-        cat /tmp/inj_validate.injout >&2
+        cat "$WORK/injout" >&2
         kill -9 $tpid 2>/dev/null || true
         exec 9>&-
         rm -f "$fifo"
@@ -166,13 +181,15 @@ run_one() {
     # branch graph we exercise.
     sleep 0.2
 
-    # Capture bitmap. libcov shm layout: 72-byte header + 64KB bitmap.
-    python3 -c "
-import sys
-with open('$shm','rb') as f:
-    f.seek(72)
-    sys.stdout.buffer.write(f.read(65536))
-" > "$shm.bitmap"
+    # Capture the live bitmap. Its size and offset come from the shm
+    # header (auto-sized map, target ABI), so let shm_bitmap.py find it.
+    python3 "$ROOT/test/shm_bitmap.py" extract "$shm" "$shm.bitmap" || {
+        kill -9 $tpid 2>/dev/null || true
+        exec 9>&-
+        rm -f "$fifo"
+        echo "ERROR: could not read the bitmap from $shm" >&2
+        return 1
+    }
 
     # Close fifo to send EOF; target exits its read loop.
     exec 9>&-
@@ -202,6 +219,7 @@ assert_for_lib() {
         return 0
     fi
     hdr "Assertions against $tag (lib=$lib, lcv=$lcv)"
+    CELLS=$((CELLS + 1))
 
     local inputs1="42 -3 helloworld"
     # inputs2 is chosen for maximum cross-input divergence: different
@@ -221,8 +239,8 @@ assert_for_lib() {
         ok "$tag/A determinism: identical inputs -> identical bitmap"
     else
         local a_set b_set
-        a_set=$(python3 -c "print(sum(1 for b in open('$SHM_PREFIX.${tag}_a.bitmap','rb').read() if b))")
-        b_set=$(python3 -c "print(sum(1 for b in open('$SHM_PREFIX.${tag}_b.bitmap','rb').read() if b))")
+        a_set=$(python3 "$ROOT/test/shm_bitmap.py" stats "$SHM_PREFIX.${tag}_a.bitmap" | cut -d' ' -f1)
+        b_set=$(python3 "$ROOT/test/shm_bitmap.py" stats "$SHM_PREFIX.${tag}_b.bitmap" | cut -d' ' -f1)
         fail "$tag/A determinism: bitmaps differ (a=$a_set b=$b_set set bytes)"
     fi
 
@@ -250,10 +268,7 @@ assert_for_lib() {
     # forces a several-iter loop_sum.
     run_one "$lib" "$lcv" leapfrog "${tag}_d" "99 50 7" || { fail "$tag/C run failed"; return; }
     local max
-    max=$(python3 -c "
-import sys
-d = open('$SHM_PREFIX.${tag}_d.bitmap','rb').read()
-print(max(d))")
+    max=$(python3 "$ROOT/test/shm_bitmap.py" stats "$SHM_PREFIX.${tag}_d.bitmap" | cut -d' ' -f3)
     if [[ "$max" -ge 2 ]]; then
         ok "$tag/C leapfrog: recorded hit count > 1 (max=$max)"
     else
@@ -277,6 +292,11 @@ print(max(d))")
 
 assert_for_lib "$LIBCOV_ST" "$LCV_ST" st
 assert_for_lib "$LIBCOV_MT" "$LCV_MT" mt
+
+if [[ $CELLS -eq 0 ]]; then
+    fail "nothing ran: no (libcov, patch list) cell was available -- build with:" \
+         "make ARCH=$ARCH && make ARCH=$ARCH THREADING=mt (and check gen_patchlist above)"
+fi
 
 echo
 echo "==================================================="

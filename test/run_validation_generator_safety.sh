@@ -18,7 +18,14 @@ TARGET="$B/target_dispatch"
 [[ -e "$TARGET" ]] || { echo "missing $TARGET. Run 'make'." >&2; exit 1; }
 
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# Kept (and its path printed) when the suite fails: the generator and
+# target logs in it are how you debug.
+keep_work_on_failure() {
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then rm -rf "$WORK"; else echo "logs kept in $WORK" >&2; fi
+    return $rc
+}
+trap keep_work_on_failure EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 echo ">> 1. unit tests for the data / IT / overlap filters"
@@ -80,7 +87,8 @@ print("   OK: all filter unit tests passed")
 EOF
 
 echo ">> 2. emitted sites for target_dispatch never overlap"
-"$ROOT/tools/gen_patchlist.py" "$TARGET" "$WORK/t.lcv" >/dev/null 2>&1
+"$ROOT/tools/gen_patchlist.py" "$TARGET" "$WORK/t.lcv" >/dev/null 2>"$WORK/gen.log" \
+    || fail "gen_patchlist: $(tail -5 "$WORK/gen.log")"
 python3 - "$WORK/t.lcv" <<'EOF'
 import struct, sys
 data = open(sys.argv[1], "rb").read()
@@ -102,8 +110,8 @@ EOF
 
 echo ">> 3. --include-fcn and --fail-on-overlap run cleanly"
 "$ROOT/tools/gen_patchlist.py" "$TARGET" "$WORK/t2.lcv" --include-fcn \
-    --fail-on-overlap >/dev/null 2>&1 \
-    || fail "--include-fcn --fail-on-overlap failed on target_dispatch"
+    --fail-on-overlap >/dev/null 2>"$WORK/gen2.log" \
+    || fail "--include-fcn --fail-on-overlap failed on target_dispatch: $(tail -5 "$WORK/gen2.log")"
 echo "   OK: flags accepted, no overlap error on a real binary"
 
 echo

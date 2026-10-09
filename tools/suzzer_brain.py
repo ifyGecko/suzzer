@@ -20,7 +20,13 @@ minimisation, no crash triage). Swap in AFL++ or your own loop as needed.
 
 Usage:
   suzzer_brain.py --listen HOST:PORT --seeds DIR [--out DIR]
-                  [--iters N] [--seed-rng N] [--quiet]
+                  [--iters N] [--seed-rng N] [--accept-timeout S]
+                  [--io-timeout S] [--quiet]
+
+Runs in the foreground: start it first (backgrounded, or in another
+terminal), then start suzzer-relay within --accept-timeout seconds. It exits
+after the seeds plus --iters mutated inputs. A missing or empty --seeds
+directory falls back to built-in seeds.
 """
 import argparse
 import os
@@ -37,7 +43,7 @@ from mutate import Engine  # noqa: E402
 SZR_MAGIC = b"SZR1"
 SZR_HELLO, SZR_INPUT, SZR_COVERAGE, SZR_CRASH, SZR_BYE = 1, 2, 3, 4, 5
 SLOT_INIT, SLOT_ITER, SLOT_GAP = 1, 2, 4
-CRASH_EXIT, CRASH_SIGNAL, CRASH_DELIVERY = 1, 2, 3
+CRASH_EXIT, CRASH_SIGNAL, CRASH_DELIVERY, CRASH_MALFORMED = 1, 2, 3, 4
 
 
 def recvn(sock, n):
@@ -67,17 +73,26 @@ def main():
     ap.add_argument("--out", default=None, help="output dir (crashes, corpus)")
     ap.add_argument("--iters", type=int, default=200, help="mutation execs")
     ap.add_argument("--seed-rng", type=int, default=0xC0FFEE)
-    ap.add_argument("--accept-timeout", type=float, default=15.0)
+    ap.add_argument("--accept-timeout", type=float, default=15.0,
+                    help="seconds to wait for the relay to connect")
+    ap.add_argument("--io-timeout", type=float, default=60.0,
+                    help="seconds to wait for each relay reply (0 = forever)")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
     host, _, port = args.listen.rpartition(":")
+    if not port.isdigit():
+        sys.exit("brain: --listen must be HOST:PORT (e.g. 127.0.0.1:7000), got %r"
+                 % args.listen)
     out = args.out or os.path.join(os.getcwd(), "suzzer_out")
     crash_dir = os.path.join(out, "crashes")
     os.makedirs(crash_dir, exist_ok=True)
 
     seeds = []
-    for name in sorted(os.listdir(args.seeds)):
+    if not os.path.isdir(args.seeds):
+        print("brain: WARNING: seed directory %r does not exist; using built-in seeds"
+              % args.seeds, file=sys.stderr)
+    for name in (sorted(os.listdir(args.seeds)) if os.path.isdir(args.seeds) else []):
         p = os.path.join(args.seeds, name)
         if os.path.isfile(p):
             with open(p, "rb") as f:
@@ -97,7 +112,12 @@ def main():
     lsock.settimeout(args.accept_timeout)
     # Print the bound port so a caller that passed :0 can discover it.
     log("listening on %s:%d" % (host, lsock.getsockname()[1]))
-    conn, peer = lsock.accept()
+    try:
+        conn, peer = lsock.accept()
+    except socket.timeout:
+        sys.exit("brain: no relay connected within %gs (--accept-timeout)"
+                 % args.accept_timeout)
+    conn.settimeout(args.io_timeout or None)
     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     log("relay connected from %s:%d" % peer)
 
@@ -167,13 +187,19 @@ def main():
             corpus.append(data)
             log("new coverage +%d (corpus=%d) from %r" % (newly, len(corpus), data[:24]))
 
-    # ---- baseline: run every seed once ----
-    for s in seeds:
-        run_one(s)
-    # ---- fuzz: mutate corpus entries ----
-    for _ in range(args.iters):
-        base = rng.choice(corpus) if corpus else b"\n"
-        run_one(engine.mutate(base))
+    try:
+        # ---- baseline: run every seed once ----
+        for s in seeds:
+            run_one(s)
+        # ---- fuzz: mutate corpus entries ----
+        for _ in range(args.iters):
+            base = rng.choice(corpus) if corpus else b"\n"
+            run_one(engine.mutate(base))
+    except socket.timeout:
+        sys.exit("brain: relay sent no reply within %gs (--io-timeout)"
+                 % args.io_timeout)
+    except ConnectionError as e:
+        sys.exit("brain: %s" % e)
 
     send_frame(conn, SZR_BYE)
     total = sum(1 for b in cumulative if b)

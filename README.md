@@ -54,6 +54,13 @@ aarch64 only; see [Limitations](#limitations).
 
 ## Build
 
+Prerequisites: `gcc` + `make` to build; `python3` (3.8+), **rizin** and the
+`rzpipe` Python module for the patch-list generators; a cross `gcc` and
+`qemu-<arch>-static` per foreign architecture. Install commands and a
+verification one-liner are in [HOWTO.md §2](HOWTO.md#2-prerequisites). New
+to the project? [HOWTO.md](HOWTO.md) is the step-by-step operational guide;
+this file is the reference.
+
 ```
 make                                    # native ST build
 make THREADING=mt                       # native MT build
@@ -264,16 +271,16 @@ module you want instrumented its own root.
 |---|---|---|
 | `LIBCOV_PATCHLIST` | *(required)* | Path to LCV3 patch list. If unset, the library is inert. |
 | `LIBCOV_REQUIRE` | unset | Any non-empty value other than `0`: abort the process if libcov ends up inert or any init step fails (unset patch list, unresolvable module, trap self-test failure, refused boundary config). Off by default because children that inherit `LD_PRELOAD` are usually meant to run inert. |
-| `LIBCOV_SHM_PATH` | `/libcov_<pid>` | Bitmap path. Leading `/` and no other slashes → `shm_open`; otherwise a filesystem path. If `shm_open` fails, falls back to `$TMPDIR/<name>` (or `/tmp`); a filesystem path has no fallback. `%p` expands to the pid (`%%` to `%`), giving each process of a forking/re-execing daemon its own region. See "Re-exec and fork+exec". |
+| `LIBCOV_SHM_PATH` | `/libcov_<pid>` | Bitmap path. No `/` other than an optional leading one (`/cov`, `cov`) → `shm_open`, i.e. `/dev/shm/cov`; anything with a non-leading `/` (`/tmp/cov`, `./cov`) is a filesystem path. Init logs the resolved location. If `shm_open` fails, falls back to `$TMPDIR/<name>` (or `/tmp`); a filesystem path has no fallback. `%p` expands to the pid (`%%` to `%`), giving each process of a forking/re-execing daemon its own region. See "Re-exec and fork+exec". |
 | `LIBCOV_ST_PATCH` | `auto` | `libcov_st.so` only. `auto`: make patched code pages `R|W|X` once at init, so arming/disarming is a plain store (no syscalls per trap, about 3x faster in leapfrog); falls back to `mprotect` if the kernel refuses `R|W|X`; unknown values mean `auto`. `mprotect`: two `mprotect` calls per arm/disarm, code pages never writable and executable at once. |
-| `LIBCOV_MODE` | `leapfrog` | `oneshot` (each site fires once, fastest) or `leapfrog` (re-arm previous site each trap; gives approximate hit counts). Any value other than exactly `oneshot`, typos included, silently means leapfrog. |
+| `LIBCOV_MODE` | `leapfrog` | `oneshot` (each site fires once, fastest) or `leapfrog` (re-arm previous site each trap; gives approximate hit counts). Any value other than exactly `oneshot` means leapfrog; a value that is neither `oneshot` nor `leapfrog` (a typo) also logs a WARNING. |
 | `LIBCOV_MODULE` | the main executable | Module name for boundary-mode sidecar resolution only. The patch list itself carries its own module name table (LCV3) so this only affects `LIBCOV_BOUNDARY_LIST` lookups. A bare name or an absolute path, as for `LIBCOV_MODULE_RENAME`. |
 | `LIBCOV_MODULE_RENAME` | unset | `old=new[,old=new…]`: resolve patch-list module `old` as `new`. For a binary run under another name than it was generated from (`target=target.stripped`), or, with an absolute path as `new`, to pick one of several mapped files with the same basename. |
-| `LIBCOV_LOG` | unset (stderr) | Diagnostic log. Never written from the signal handler; after init, only while the fd still refers to the same non-socket file (see Hardening). |
+| `LIBCOV_LOG` | unset (stderr) | Diagnostic log. If the file can't be opened, one line saying so goes to stderr and logging stays on stderr. Never written from the signal handler; after init, only while the fd still refers to the same non-socket file (see Hardening). |
 | `LIBCOV_BOUNDARY_LIST` | unset | Path to LCVB1 iteration-boundary sidecar. Iteration framing is inert if unset. |
 | `LIBCOV_BOUNDARY_REARM` | `none` | `none` / `all` / `touched`. What to re-arm at each boundary fire. Any other value means `none` and logs a WARNING (and counts as `none` for the oneshot refusal). |
 | `LIBCOV_BOUNDARY_RING` | `8` | Number of snapshot slots, clamped to 2..16 (a non-numeric value gives 2), each one `map_size` bytes. Driver lag tolerance = `RING - 1` iterations. |
-| `LIBCOV_BOUNDARY_INIT_GRACE` | `0` | Don't publish the first N boundary fires (process-wide, across all threads, counted after depth filtering). Their coverage is not discarded; it is merged into the first published snapshot, flagged `INIT`. |
+| `LIBCOV_BOUNDARY_INIT_GRACE` | `0` | Don't publish the first N boundary fires (process-wide, across all threads, counted after depth filtering). Their coverage is not discarded; it is merged into the first published snapshot, flagged `INIT`. A negative or non-numeric value logs a WARNING and means `0`. |
 | `LIBCOV_BOUNDARY_NOTIFY_FD` | unset | Inherited **eventfd** (fd > 0); libcov writes a `uint64` 1 after each snapshot. Anything else (e.g. a pipe, which could block or SIGPIPE the target inside the trap handler) is ignored with a warning. Counter polling works without it. |
 | `LIBCOV_BOUNDARY_EMULATE` | `1` | `0`: never emulate boundary markers; always use disarm + deferred re-arm (see Threading). |
 | `LIBCOV_SYNC_FALLBACK` | `auto` | `libcov_mt.so` only. Cross-core sync when the kernel lacks `membarrier(PRIVATE_EXPEDITED_SYNC_CORE)`: `auto` broadcasts `LIBCOV_SYNC_SIGNO` (default `SIGRTMAX-2`, `src/tunables.h`) to every peer thread after each patch batch; `tgkill` forces that even when SYNC_CORE works; `off` relies on cache maintenance alone; unknown values mean `auto`. The broadcast is slow (roughly 7-10x on a 16-thread stress) and can make non-restarting syscalls return `EINTR`; see Design.md §17.2.5. |
@@ -1017,9 +1024,8 @@ clears the live bitmap between iterations), and all three viable
 ## What's next
 
 See [TODO.md](TODO.md) for the design backlog. Iteration boundaries,
-multi-module patch lists, multi-threading and re-exec handling are
-already implemented (above). Still open: daemon lifecycle work,
-fork-per-connection (`suzzer-forkserver`), runtime-selectable N-gram
-width, and remote coverage transport via a separate relay binary
-(`suzzer-relay`). There is no network transport today; see HOWTO.md §9
-for remote-collection patterns that work now.
+multi-module patch lists, multi-threading, re-exec handling and a
+remote (over-IP) fuzzing template (`tools/suzzer-relay.c` +
+`tools/suzzer_brain.py`, HOWTO.md §9 Pattern C and §14.1) are already
+implemented. Still open: daemon lifecycle work, fork-per-connection
+daemons (`suzzer-forkserver`), and runtime-selectable N-gram width.

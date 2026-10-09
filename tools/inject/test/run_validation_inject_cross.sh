@@ -18,10 +18,13 @@
 #                     - The arch is fully supported but no qemu /
 #                       real-hw runner is available in this environment.
 #
+#   SKIP         -- the arch's cross gcc is not installed; nothing was
+#                   built or run for it.
+#
 #   FAIL         -- cross-build failed, or runtime validation was
 #                   attempted and one or more assertions failed.
 #
-# Final line: "FULL_PASS=N  BUILD_ONLY=M  FAIL=K"
+# Summary line: "FULL_PASS=N  BUILD_ONLY=M  SKIP=S  FAIL=K"
 #
 # We deliberately don't try to run all 11 backends under qemu-user-
 # static even though the binaries cross-build cleanly:
@@ -33,9 +36,12 @@
 #   - Spending ~30s per arch on a qemu run that may flake is not a
 #     productive default.
 #
-# Real-hardware runtime validation for the 6 stub arches is
-# blocked on those backends being implemented; see arch_inject_<arch>.c
-# headers for the planned implementation.
+# Real-hardware runtime validation for the build-only arches
+# (ARCHES_BUILDONLY below: arm, mips, mipsel, mips64, mips64el, powerpc,
+# powerpc64, powerpc64le, riscv64 -- 9 arches sharing 6 stub backends,
+# arch_inject_{arm,mips,mips64,powerpc,powerpc64,riscv64}.c) is blocked on
+# those backends being implemented; see the arch_inject_<arch>.c headers
+# for the planned implementation.
 
 set -eu
 
@@ -45,8 +51,19 @@ HOST_ARCH="$(uname -m)"
 
 FULL_PASS=0
 BUILD_ONLY=0
+SKIP=0
 FAIL=0
 RESULTS=()
+
+# Per-run scratch dir for the build / run logs (fixed /tmp paths made
+# parallel runs collide). Kept, with its path printed, when anything fails.
+WORK=$(mktemp -d -t libcov_inject_cross.XXXXXX)
+keep_work_on_failure() {
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then rm -rf "$WORK"; else echo "logs kept in $WORK" >&2; fi
+    return $rc
+}
+trap keep_work_on_failure EXIT
 
 ARCHES_FULL=(x86_64 aarch64)
 # All other arches stay in build-only until either the per-arch backend
@@ -58,14 +75,33 @@ ARCHES_BUILDONLY=(arm mips mipsel mips64 mips64el powerpc powerpc64 powerpc64le 
 note() { printf '   %s\n' "$*"; }
 hdr()  { printf '\n=== %s ===\n' "$*"; }
 
-# Build everything first.
+# Build every arch first, one at a time, so a missing toolchain or one
+# broken backend doesn't stop the matrix. STATUS[arch] = built | skip | fail.
+declare -A STATUS=()
 hdr "Cross-build every backend"
-make -C "$INJ_DIR" all-arch > /tmp/inj_cross_build.log 2>&1 ||
-    { echo "cross-build failed; see /tmp/inj_cross_build.log" >&2; exit 1; }
-note "OK (11 arches built)"
+for a in "${ARCHES_FULL[@]}" "${ARCHES_BUILDONLY[@]}"; do
+    cc=$(make -s --no-print-directory -C "$INJ_DIR" ARCH="$a" print-vars \
+         | sed -n 's/^CC=//p')
+    if [[ -z "$cc" ]] || ! command -v "$cc" >/dev/null; then
+        note "$a: SKIP (${cc:-cross gcc} not found)"
+        STATUS[$a]=skip; SKIP=$((SKIP + 1))
+        RESULTS+=("SKIP  $a (${cc:-cross gcc} not found)")
+        continue
+    fi
+    if make --no-print-directory -C "$INJ_DIR" ARCH="$a" > "$WORK/build.$a.log" 2>&1; then
+        note "$a: built"
+        STATUS[$a]=built
+    else
+        note "$a: build FAILED (log: $WORK/build.$a.log)"
+        tail -5 "$WORK/build.$a.log" | sed 's/^/      /'
+        STATUS[$a]=fail; FAIL=$((FAIL + 1))
+        RESULTS+=("FAIL  $a (build)")
+    fi
+done
 
 # Full-pass: x86_64 (native), aarch64 (qemu attempt or skip).
 for a in "${ARCHES_FULL[@]}"; do
+    [[ ${STATUS[$a]} == built ]] || continue
     hdr "ARCH=$a -- FULL run"
 
     if ! [[ -x "$INJ_DIR/build/$a/inject_ptrace" ]]; then
@@ -76,13 +112,21 @@ for a in "${ARCHES_FULL[@]}"; do
     fi
 
     if [[ "$a" == "$HOST_ARCH" ]]; then
-        # Native run -- delegate to run_validation_inject.sh
-        if ARCH="$a" "$INJ_DIR/test/run_validation_inject.sh" > /tmp/inj_cross.$a.log 2>&1; then
-            tail -1 /tmp/inj_cross.$a.log
+        # Native run -- delegate to run_validation_inject.sh, which needs
+        # the test target (`make test`) on top of the injectors.
+        if ! make --no-print-directory -C "$INJ_DIR" ARCH="$a" test \
+                > "$WORK/build.$a.test.log" 2>&1; then
+            tail -5 "$WORK/build.$a.test.log"
+            FAIL=$((FAIL + 1))
+            RESULTS+=("FAIL  $a (build target_inject_loop)")
+            continue
+        fi
+        if ARCH="$a" "$INJ_DIR/test/run_validation_inject.sh" > "$WORK/run.$a.log" 2>&1; then
+            tail -1 "$WORK/run.$a.log"
             FULL_PASS=$((FULL_PASS + 1))
             RESULTS+=("PASS  $a (native)")
         else
-            tail -5 /tmp/inj_cross.$a.log
+            tail -5 "$WORK/run.$a.log"
             FAIL=$((FAIL + 1))
             RESULTS+=("FAIL  $a (native run)")
         fi
@@ -101,6 +145,7 @@ done
 
 # Build-only: stub arches.
 for a in "${ARCHES_BUILDONLY[@]}"; do
+    [[ ${STATUS[$a]} == built ]] || continue
     hdr "ARCH=$a -- BUILD-ONLY"
 
     if ! [[ -x "$INJ_DIR/build/$a/inject_ptrace" ]]; then
@@ -116,9 +161,12 @@ done
 
 echo
 echo "================================================================"
-printf " inject_ptrace cross matrix:  FULL_PASS=%d  BUILD_ONLY=%d  FAIL=%d\n" \
-    "$FULL_PASS" "$BUILD_ONLY" "$FAIL"
+printf " inject_ptrace cross matrix:  FULL_PASS=%d  BUILD_ONLY=%d  SKIP=%d  FAIL=%d\n" \
+    "$FULL_PASS" "$BUILD_ONLY" "$SKIP" "$FAIL"
 echo "================================================================"
 for r in "${RESULTS[@]}"; do printf '  %s\n' "$r"; done
+if [[ $FULL_PASS -eq 0 && $BUILD_ONLY -eq 0 && $FAIL -eq 0 ]]; then
+    echo "NOTE: every arch was skipped -- nothing was built or tested."
+fi
 if [[ $FAIL -gt 0 ]]; then exit 1; fi
 exit 0

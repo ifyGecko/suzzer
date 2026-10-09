@@ -11,7 +11,6 @@
 #     - LIBCOV_MODE=leapfrog      -- max hit per bucket >= 2 on loops
 #     - LIBCOV_SHM_PATH as fs path -- file at that path
 #     - LIBCOV_LOG                -- log file written, contains "ready"
-#     - LIBCOV_TRAP_SIGNO         -- via per-arch override build
 #     - LIBCOV_BOUNDARY_RING      -- shm header reports requested ring size
 #     - LIBCOV_BOUNDARY_INIT_GRACE -- drops first N marker hits before publish
 #
@@ -31,11 +30,15 @@
 #
 # Multi-module + the boundary REARM matrix are already exercised by
 # run_validation_multimod.sh and run_validation_boundary.sh and are not
-# duplicated here -- this script focuses on the orthogonal axes.
+# duplicated here -- this script focuses on the orthogonal axes. (A
+# LIBCOV_TRAP_SIGNO / trap-encoding mismatch build is exercised by
+# run_validation_failloud.sh.)
 #
-# All variant libcov builds land under $SCRATCH (default: a fresh mktemp -d, removed on exit)
-# so the user's build/ directory is not touched. Re-running uses cached
-# variant builds; set REBUILD=1 to force a fresh rebuild.
+# All variant libcov builds land under $SCRATCH (default: a fresh mktemp -d,
+# removed on exit) so the user's build/ directory is not touched. With a
+# reused SCRATCH, each variant is rebuilt incrementally (make runs every
+# time, so edits under src/ are picked up); set REBUILD=1 to wipe and
+# rebuild every variant from scratch.
 
 set -euo pipefail
 
@@ -75,28 +78,22 @@ skip()    { echo "   SKIP: $1"; SKIP=$((SKIP+1)); }
 build_variant() {
     local tag="$1" extra="$2"
     local vbuild="$SCRATCH/$tag"
-    local lib="$vbuild/libcov_${THREADING}.so"
-    local need_rebuild=0
-    if [[ "${REBUILD:-0}" == "1" ]]; then need_rebuild=1; fi
-    for f in "$lib" "$vbuild/target_simple" "$vbuild/target_orderable" \
-             "$vbuild/target_loop"; do
-        [[ -f "$f" ]] || { need_rebuild=1; break; }
-    done
-    if [[ "$need_rebuild" == "1" ]]; then
-        rm -rf "$vbuild"
-        mkdir -p "$vbuild"
-        # The Makefile honours `BUILD=` from the command line so we redirect
-        # objects + outputs to the per-tag scratch dir and leave the user's
-        # default build/ alone. EXTRA_CFLAGS is appended to CFLAGS by the
-        # top-level Makefile (see Makefile line 129).
-        if ! make -C "$ROOT" --no-print-directory \
-                 ARCH="$ARCH" THREADING="$THREADING" \
-                 BUILD="$vbuild" EXTRA_CFLAGS="$extra" \
-                 >"$vbuild/build.log" 2>&1; then
-            echo "BUILD FAILED for $tag (EXTRA_CFLAGS='$extra'):" >&2
-            tail -40 "$vbuild/build.log" >&2
-            exit 1
-        fi
+    if [[ "${REBUILD:-0}" == "1" ]]; then rm -rf "$vbuild"; fi
+    mkdir -p "$vbuild"
+    # Always run make: it is incremental (the .d dependency files track
+    # src/ headers), so a reused variant dir picks up source edits instead
+    # of silently testing a stale library. The Makefile honours `BUILD=`
+    # from the command line so objects + outputs go to the per-tag scratch
+    # dir and the user's default build/ is left alone. EXTRA_CFLAGS is
+    # appended to CFLAGS by the top-level Makefile (`CFLAGS +=
+    # $(EXTRA_CFLAGS)`).
+    if ! make -C "$ROOT" --no-print-directory \
+             ARCH="$ARCH" THREADING="$THREADING" \
+             BUILD="$vbuild" EXTRA_CFLAGS="$extra" \
+             >"$vbuild/build.log" 2>&1; then
+        echo "BUILD FAILED for $tag (EXTRA_CFLAGS='$extra'):" >&2
+        tail -40 "$vbuild/build.log" >&2
+        exit 1
     fi
     echo "$vbuild"
 }

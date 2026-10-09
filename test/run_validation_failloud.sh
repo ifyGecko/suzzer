@@ -24,19 +24,30 @@ for f in "$LIB_ST" "$B/target_simple" "$B/target_loop" "$B/target_simple_mt"; do
 done
 
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# Kept (and its path printed) when the suite fails: the generator and
+# target logs in it are how you debug.
+keep_work_on_failure() {
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then rm -rf "$WORK"; else echo "logs kept in $WORK" >&2; fi
+    return $rc
+}
+trap keep_work_on_failure EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 "$ROOT/tools/gen_patchlist.py" "$B/target_simple" "$WORK/simple.lcv" \
-    --include-pat '^dbg\.(main|classify|loop_sum|cmdline)$' >/dev/null 2>&1
+    --include-pat '^dbg\.(main|classify|loop_sum|cmdline)$' >/dev/null 2>"$WORK/gen.simple.log" \
+    || fail "gen_patchlist target_simple: $(tail -5 "$WORK/gen.simple.log")"
 "$ROOT/tools/gen_patchlist.py" "$B/target_loop" "$WORK/loop.lcv" \
     --include-pat '^dbg\.(main|classify|loop_sum|cmdline|process_one|iter_begin)$' \
-    >/dev/null 2>&1
+    >/dev/null 2>"$WORK/gen.loop.log" \
+    || fail "gen_patchlist target_loop: $(tail -5 "$WORK/gen.loop.log")"
 "$ROOT/tools/gen_boundary.py" "$B/target_loop" "$WORK/loop.lcvb" iter_begin:begin \
-    >/dev/null 2>&1
+    >/dev/null 2>"$WORK/gen.loop_bnd.log" \
+    || fail "gen_boundary target_loop: $(tail -5 "$WORK/gen.loop_bnd.log")"
 "$ROOT/tools/gen_patchlist.py" "$B/target_simple_mt" "$WORK/simple_mt_st.lcv" \
-    >/dev/null 2>&1
+    >/dev/null 2>"$WORK/gen.simple_mt.log" \
+    || fail "gen_patchlist target_simple_mt: $(tail -5 "$WORK/gen.simple_mt.log")"
 
 run() {  # <log> <env...> -- <cmd...>; returns the target's exit code
     local log="$1"; shift
@@ -106,7 +117,8 @@ if [[ "${SKIP_REBUILD:-0}" == 1 ]]; then
     echo "   SKIP (SKIP_REBUILD=1)"
 else
     make -C "$ROOT" BUILD="$WORK/sigtrap" ARCH="$ARCH" \
-        EXTRA_CFLAGS=-DLIBCOV_TRAP_SIGNO=SIGTRAP native >/dev/null 2>&1
+        EXTRA_CFLAGS=-DLIBCOV_TRAP_SIGNO=SIGTRAP native >"$WORK/4.build.log" 2>&1 \
+        || fail "mismatch build: $(tail -5 "$WORK/4.build.log")"
     rc=0; run "$WORK/4" LD_PRELOAD="$WORK/sigtrap/libcov_st.so" \
         LIBCOV_PATCHLIST="$WORK/simple.lcv" -- "$B/target_simple" 42 || rc=$?
     [[ $rc -eq 0 ]] && grep -q "trap self-test failed" "$WORK/4" \
@@ -119,11 +131,11 @@ rc=0
 "$ROOT/tools/gen_patchlist.py" "$B/target_simple" "$WORK/empty.lcv" \
     --include-pat '^main$' >/dev/null 2>"$WORK/5" || rc=$?
 [[ $rc -ne 0 && ! -e "$WORK/empty.lcv" ]] && grep -q "no patch sites selected" "$WORK/5" \
-    || fail "empty selection: rc=$rc"
+    || fail "empty selection: rc=$rc: $(tail -5 "$WORK/5")"
 echo "   OK: non-zero exit, nothing written"
 "$ROOT/tools/gen_patchlist.py" "$B/target_simple" "$WORK/empty.lcv" \
-    --include-pat '^main$' --allow-empty >/dev/null 2>&1 \
-    && [[ -e "$WORK/empty.lcv" ]] || fail "--allow-empty didn't write the file"
+    --include-pat '^main$' --allow-empty >/dev/null 2>"$WORK/5b" \
+    && [[ -e "$WORK/empty.lcv" ]] || fail "--allow-empty didn't write the file: $(tail -5 "$WORK/5b")"
 echo "   OK: --allow-empty writes it"
 
 echo

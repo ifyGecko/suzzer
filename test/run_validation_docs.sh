@@ -36,7 +36,14 @@ for f in "$ROOT/HOWTO.md" "$ROOT/README.md" "$B/libcov_st.so" "$B/libcov_mt.so" 
 done
 
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# Kept (and its path printed) when the suite fails: the generator and
+# target logs in it are how you debug.
+keep_work_on_failure() {
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then rm -rf "$WORK"; else echo "logs kept in $WORK" >&2; fi
+    return $rc
+}
+trap keep_work_on_failure EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # extract <doc> <heading-regex>: print the first ```bash/``` block after
@@ -122,9 +129,11 @@ run_block readme_slice "$ROOT/README.md" '^### Example$'
 echo "   OK: both example lists written"
 
 echo ">> 6. documented behaviour: ST boundary mode leaves the live bitmap empty"
-"$ROOT/tools/gen_patchlist.py" "$B/target_loop" "$WORK/l.lcv" --root main >/dev/null 2>&1
+"$ROOT/tools/gen_patchlist.py" "$B/target_loop" "$WORK/l.lcv" --root main \
+    >/dev/null 2>"$WORK/l.gen.log" || fail "gen_patchlist: $(tail -5 "$WORK/l.gen.log")"
 "$ROOT/tools/gen_boundary.py" "$B/target_loop" "$WORK/l.lcvb" iter_begin \
-    --patchlist "$WORK/l.lcv" >/dev/null 2>&1
+    --patchlist "$WORK/l.lcv" >/dev/null 2>"$WORK/l.bnd.log" \
+    || fail "gen_boundary: $(tail -5 "$WORK/l.bnd.log")"
 printf 'alpha\nbeta\n' | LIBCOV_PATCHLIST="$WORK/l.lcv" LIBCOV_BOUNDARY_LIST="$WORK/l.lcvb" \
     LIBCOV_SHM_PATH="$WORK/bcov" LD_PRELOAD="$B/libcov_st.so" "$B/target_loop" >/dev/null 2>&1
 [[ "$("$ROOT/test/shm_bitmap.py" stats "$WORK/bcov")" == "0 0 0" ]] \

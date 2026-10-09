@@ -18,11 +18,18 @@ export PYTHONDONTWRITEBYTECODE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# Kept (and its path printed) when the suite fails: the generator and
+# target logs in it are how you debug.
+keep_work_on_failure() {
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then rm -rf "$WORK"; else echo "logs kept in $WORK" >&2; fi
+    return $rc
+}
+trap keep_work_on_failure EXIT
 ARCH="${ARCH:-$(uname -m)}"
 B="$ROOT/build/$ARCH"
 GEN="$ROOT/tools/gen_patchlist.py"
-fail=0
+fail=0 ran=0
 bad() { echo "FAIL: $*"; fail=1; }
 
 [[ -x "$B/target_simple" ]] || { echo "missing $B/target_simple. Run 'make'." >&2; exit 1; }
@@ -33,6 +40,7 @@ edges() { python3 "$ROOT/test/shm_bitmap.py" stats "$1" | cut -d' ' -f1; }
 for th in st mt; do
     LIB="$B/libcov_$th.so"
     [[ -f "$LIB" ]] || { echo "SKIP: $LIB missing"; continue; }
+    ran=$((ran + 1))
     run() {  # <lcv> <log> <shm> <exe> [env...] -- runs "<exe> 42"
         local lcv=$1 log=$2 shm=$3 exe=$4; shift 4
         rm -f "$shm"
@@ -51,9 +59,11 @@ for th in st mt; do
     "$GEN" "$WORK/sym/app" "$WORK/sym.lcv" --threading $th >/dev/null 2>"$WORK/sym.gen" \
         || bad "$th/symlink: gen"
     out=$(run "$WORK/sym.lcv" "$WORK/sym.log" "$WORK/sym.shm" "$WORK/sym/app")
-    covered "$out" "$WORK/sym.shm" "$WORK/sym.log" symlink \
-        && grep -q "module\[0\] 'target_simple'" "$WORK/sym.log" \
-        && echo "   OK: $th/symlink: named after the real file, coverage collected"
+    if covered "$out" "$WORK/sym.shm" "$WORK/sym.log" symlink; then
+        grep -q "module\[0\] 'target_simple'" "$WORK/sym.log" \
+            && echo "   OK: $th/symlink: named after the real file, coverage collected" \
+            || bad "$th/symlink: module not named 'target_simple': $(grep 'module\[' "$WORK/sym.log" | head -3)"
+    fi
 
     # 2. renamed copy
     mkdir -p "$WORK/ren"; cp "$B/target_simple" "$WORK/ren/app2"
@@ -79,6 +89,8 @@ for th in st mt; do
     covered "$out" "$WORK/del.shm" "$WORK/del.log" deleted \
         && echo "   OK: $th/deleted: ' (deleted)' mapping resolved"
 done
+
+(( ran )) || { echo "FAIL: no libcov_{st,mt}.so in $B -- nothing ran; build with: make && make THREADING=mt"; exit 1; }
 
 # 4. same basename, different files
 D="$WORK/dup"; mkdir -p "$D/a" "$D/b"

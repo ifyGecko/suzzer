@@ -77,10 +77,160 @@ usage(const char *prog)
 "  -v                verbose; -vv for debug-level.\n"
 "  -h                this help.\n"
 "\n"
+"Exit status:\n"
+"  0  injected; libcov's coverage region exists and carries the LCVS magic\n"
+"  1  attach / symbol resolution / remote setenv / dlopen failed\n"
+"  2  usage error (bad option, pid, --scratch-size or library path)\n"
+"  3  dlopen succeeded but libcov appears inert: no coverage region with\n"
+"     the LCVS magic at the -S path (default /libcov_<pid>). Re-run with\n"
+"     -L <logfile> to see why, and -e LIBCOV_REQUIRE=1 to make libcov\n"
+"     abort instead of running inert.\n"
+"\n"
 "Example:\n"
 "  sudo %s -P /tmp/t.lcv -S /libcov_dropbear -M leapfrog \\\n"
 "          $(pgrep dropbear) build/x86_64/libcov_st.so\n",
         prog, prog);
+}
+
+/* Exit status when dlopen succeeded but libcov's constructor apparently
+ * did not set up a coverage region (it ran inert). */
+#define INJECT_EXIT_INERT 3
+
+/* Look up KEY in the target's *initial* environment (/proc/<pid>/environ).
+ * Returns 0 and copies the value into out, or -1 if absent/unreadable. */
+static int
+target_initial_env(pid_t pid, const char *key, char *out, size_t outlen)
+{
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/environ", (int)pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    size_t klen = strlen(key);
+    char buf[4096];
+    size_t n = 0;
+    int c, found = -1;
+    /* Entries are NUL-separated; overlong ones are skipped. */
+    while ((c = fgetc(f)) != EOF) {
+        if (c != 0) {
+            if (n < sizeof buf - 1) buf[n++] = (char)c;
+            continue;
+        }
+        buf[n] = 0;
+        if (n > klen && !strncmp(buf, key, klen) && buf[klen] == '=') {
+            snprintf(out, outlen, "%s", buf + klen + 1);
+            found = 0;   /* keep scanning: last one wins, like getenv */
+        }
+        n = 0;
+    }
+    fclose(f);
+    return found;
+}
+
+/* Value libcov's getenv(KEY) will see in the target: the last -e/-S/...
+ * entry for KEY (we setenv them in order), else the target's initial env. */
+static const char *
+effective_env(const struct env_list *envs, pid_t pid, const char *key,
+              char *buf, size_t buflen)
+{
+    const char *v = NULL;
+    for (int i = 0; i < envs->n; i++)
+        if (!strcmp(envs->items[i].key, key)) v = envs->items[i].val;
+    if (v) return v;
+    if (target_initial_env(pid, key, buf, buflen) == 0) return buf;
+    return NULL;
+}
+
+/* Does `path` (as seen by the injector) start with libcov's "LCVS" shm
+ * magic? */
+static int
+has_lcvs_magic(const char *path)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOCTTY);
+    if (fd < 0) return 0;
+    char m[4];
+    ssize_t r = read(fd, m, sizeof m);
+    close(fd);
+    return r == (ssize_t)sizeof m && !memcmp(m, "LCVS", 4);
+}
+
+/* Check whether libcov set up its coverage region, following libcov's own
+ * LIBCOV_SHM_PATH rules (src/sink_shm.c): unset -> /libcov_<pid>; "%p"
+ * expands to the pid; a name with no '/' other than an optional leading
+ * one is a POSIX shm object (/dev/shm/NAME, falling back to $TMPDIR/NAME
+ * or /tmp/NAME); anything else is a filesystem path. Each candidate is
+ * tried through /proc/<pid>/root (or /proc/<pid>/cwd for a relative path)
+ * first so chrooted/containerised targets resolve correctly, then as-is.
+ * Returns 1 if a region with the LCVS magic exists; fills where/wherelen
+ * with the path checked (the first candidate when none matched). */
+static int
+coverage_region_ok(const struct env_list *envs, pid_t pid,
+                   char *where, size_t wherelen)
+{
+    char envbuf[PATH_MAX], raw[PATH_MAX], name[PATH_MAX + 16];
+    const char *v = effective_env(envs, pid, "LIBCOV_SHM_PATH",
+                                  envbuf, sizeof envbuf);
+    if (!v || !*v) {
+        snprintf(raw, sizeof raw, "/libcov_%d", (int)pid);
+    } else {
+        size_t o = 0;
+        for (const char *p = v; *p && o < sizeof raw - 1; p++) {
+            if (p[0] == '%' && p[1] == 'p') {
+                o += (size_t)snprintf(raw + o, sizeof raw - o, "%d", (int)pid);
+                if (o >= sizeof raw) o = sizeof raw - 1;
+                p++;
+            } else if (p[0] == '%' && p[1] == '%') {
+                raw[o++] = '%'; p++;
+            } else {
+                raw[o++] = *p;
+            }
+        }
+        raw[o] = 0;
+    }
+
+    int is_shm = 1;
+    for (const char *p = raw + (raw[0] == '/'); *p; p++)
+        if (*p == '/') { is_shm = 0; break; }
+
+    const char *cands[2];
+    int ncand = 0;
+    char tmpbuf[PATH_MAX], fb[2 * PATH_MAX + 2];
+    if (is_shm) {
+        const char *bare = raw[0] == '/' ? raw + 1 : raw;
+        snprintf(name, sizeof name, "/dev/shm/%s", bare);
+        cands[ncand++] = name;
+        const char *tmpdir = effective_env(envs, pid, "TMPDIR",
+                                           tmpbuf, sizeof tmpbuf);
+        if (!tmpdir || !*tmpdir) tmpdir = "/tmp";
+        snprintf(fb, sizeof fb, "%s/%s", tmpdir, bare);
+        cands[ncand++] = fb;
+    } else {
+        cands[ncand++] = raw;
+    }
+
+    snprintf(where, wherelen, "%s", cands[0]);
+    for (int i = 0; i < ncand; i++) {
+        char viaproc[2 * PATH_MAX + 96];
+        snprintf(viaproc, sizeof viaproc, "/proc/%d/%s/%s", (int)pid,
+                 cands[i][0] == '/' ? "root" : "cwd",
+                 cands[i][0] == '/' ? cands[i] + 1 : cands[i]);
+        if (has_lcvs_magic(viaproc) || has_lcvs_magic(cands[i])) {
+            snprintf(where, wherelen, "%s", cands[i]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Strict decimal parse for a pid: whole string, > 0, fits pid_t. */
+static int
+parse_pid(const char *s, pid_t *out)
+{
+    char *end;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (errno || end == s || *end != 0 || v <= 0 || v > INT_MAX) return -1;
+    *out = (pid_t)v;
+    return 0;
 }
 
 static int
@@ -165,13 +315,26 @@ main(int argc, char **argv)
         case 1001: rtld_flags = 0x00000002; break;   /* RTLD_NOW */
         case 1002: rtld_flags = 0x00000001; break;   /* RTLD_LAZY */
         case 1003: dry_run = 1; break;
-        case 1004:
-            scratch_size = (size_t)strtoul(optarg, NULL, 0);
+        case 1004: {
+            /* strtoul silently accepts "-1" (as ULONG_MAX) and trailing
+             * junk; reject both. Base 0: decimal, 0x hex or 0 octal. */
+            char *end;
+            const char *a = optarg;
+            while (*a == ' ' || *a == '\t') a++;
+            errno = 0;
+            unsigned long v = strtoul(a, &end, 0);
+            if (*a == '-' || end == a || *end != 0 || errno == ERANGE) {
+                LOG_ERR("invalid --scratch-size '%s' (expected a byte count, "
+                        "e.g. 8192 or 0x2000)", optarg);
+                return 2;
+            }
+            scratch_size = (size_t)v;
             if (scratch_size < 256) {
                 LOG_ERR("--scratch-size minimum is 256 bytes");
                 return 2;
             }
             break;
+        }
         case 'h':
             usage(argv[0]);
             return 0;
@@ -186,9 +349,10 @@ main(int argc, char **argv)
         return 2;
     }
 
-    pid_t pid = (pid_t)atoi(argv[optind]);
-    if (pid <= 0) {
-        LOG_ERR("invalid pid '%s'", argv[optind]);
+    pid_t pid;
+    if (parse_pid(argv[optind], &pid) < 0) {
+        LOG_ERR("invalid pid '%s' (expected a positive decimal process id)",
+                argv[optind]);
         return 2;
     }
     const char *user_libpath = argv[optind + 1];
@@ -279,5 +443,24 @@ main(int argc, char **argv)
 
     printf("injected %s into pid %d (arch=%s, handle=0x%lx)\n",
            libpath, (int)pid, s.arch->name, (unsigned long)handle);
+
+    /* dlopen returning a handle only means the library loaded. libcov's
+     * constructor runs inside that dlopen and, on any init failure, logs
+     * and returns inert (unless LIBCOV_REQUIRE is set). The first thing a
+     * working init does is create the coverage region with the LCVS magic,
+     * so its absence means coverage will never appear. */
+    char region[PATH_MAX];
+    if (!coverage_region_ok(&envs, pid, region, sizeof region)) {
+        fflush(stdout);
+        fprintf(stderr,
+                "inject: WARNING: libcov appears inert in pid %d: no coverage "
+                "region with LCVS magic at %s\n"
+                "inject:   re-run with -L <logfile> to see libcov's init log, "
+                "and -e LIBCOV_REQUIRE=1 to make libcov abort instead of "
+                "running inert; exiting with status %d\n",
+                (int)pid, region, INJECT_EXIT_INERT);
+        return INJECT_EXIT_INERT;
+    }
+    LOG_INFO("coverage region %s present (LCVS)", region);
     return 0;
 }

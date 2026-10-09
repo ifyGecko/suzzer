@@ -27,11 +27,19 @@ for f in "$TARGET" "$LIB"; do
 done
 
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# Kept (and its path printed) when the suite fails: the generator and
+# target logs in it are how you debug.
+keep_work_on_failure() {
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then rm -rf "$WORK"; else echo "logs kept in $WORK" >&2; fi
+    return $rc
+}
+trap keep_work_on_failure EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 echo ">> 1. call-terminated blocks are probed at the call"
-"$ROOT/tools/gen_patchlist.py" "$TARGET" "$WORK/t.lcv" >/dev/null 2>&1
+"$ROOT/tools/gen_patchlist.py" "$TARGET" "$WORK/t.lcv" >/dev/null 2>"$WORK/gen.log" \
+    || fail "gen_patchlist: $(tail -5 "$WORK/gen.log")"
 python3 - "$TARGET" "$WORK/t.lcv" <<'EOF'
 import struct, sys, rzpipe
 target, lcv = sys.argv[1:]
@@ -61,7 +69,8 @@ echo "   OK: n=7 exits inside the callee under libcov (rc=7)"
 
 echo ">> 2. indirect calls are reported for --root slices"
 "$ROOT/tools/gen_patchlist.py" "$TARGET" /dev/null --root main --print-reachable \
-    >/dev/null 2>"$WORK/reach.log"
+    >/dev/null 2>"$WORK/reach.log" \
+    || fail "gen_patchlist --print-reachable: $(tail -5 "$WORK/reach.log")"
 grep -q "note: the slice has 1 indirect call" "$WORK/reach.log" \
     || fail "no indirect-call note: $(grep -v WARNING "$WORK/reach.log")"
 grep -Eq "dispatch .*indirect: 1 call" "$WORK/reach.log" \

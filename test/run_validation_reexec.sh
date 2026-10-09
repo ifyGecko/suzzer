@@ -19,7 +19,14 @@ export PYTHONDONTWRITEBYTECODE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# Kept (and its path printed) when the suite fails: the generator and
+# target logs in it are how you debug.
+keep_work_on_failure() {
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then rm -rf "$WORK"; else echo "logs kept in $WORK" >&2; fi
+    return $rc
+}
+trap keep_work_on_failure EXIT
 ARCH="${ARCH:-$(uname -m)}"
 BUILD="$ROOT/build/$ARCH"
 TARGET="$BUILD/target_reexec"
@@ -57,12 +64,13 @@ disjoint() {  # "<a>" "<b>" "<c>": (a - b) nonempty and disjoint from c?
     python3 -c "import sys; a,b,c=(set(x.split()) for x in sys.argv[1:]); d=a-b; sys.exit(0 if d and not d & c else 1)" "$1" "$2" "$3"
 }
 
-fail=0
+fail=0 ran=0
 bad() { echo "FAIL: $*"; fail=1; }
 
 for th in st mt; do
     LIB="$BUILD/libcov_$th.so"
     [[ -f "$LIB" ]] || { echo "SKIP: $LIB missing (make THREADING=$th)"; continue; }
+    ran=$((ran + 1))
     LCV="$WORK/$th.lcv"; LCVB="$WORK/$th.lcvb"
     "$ROOT/tools/gen_patchlist.py" "$TARGET" "$LCV" --threading $th \
         --include-pat '^dbg\.(work_a|work_b|iter_begin)$' >/dev/null 2>&1 \
@@ -143,4 +151,5 @@ for th in st mt; do
     fi
 done
 
+(( ran )) || bad "no libcov_{st,mt}.so in $BUILD -- nothing ran; build with: make && make THREADING=mt"
 [[ $fail -eq 0 ]] && echo "ALL RE-EXEC VALIDATIONS PASSED ($ARCH)" || exit 1

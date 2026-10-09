@@ -69,7 +69,11 @@ def live_bitmap(data):
 
 
 def main():
-    if len(sys.argv) < 3 or sys.argv[1] not in ("extract", "stats", "gen", "scheme"):
+    if len(sys.argv) >= 2 and sys.argv[1] in ("-h", "--help"):
+        print(__doc__)
+        return
+    if (len(sys.argv) < 3 or sys.argv[1] not in ("extract", "stats", "gen", "scheme")
+            or (sys.argv[1] == "extract" and len(sys.argv) < 4)):
         sys.exit(__doc__)
     with open(sys.argv[2], "rb") as f:
         data = f.read()

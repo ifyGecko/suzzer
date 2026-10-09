@@ -136,6 +136,9 @@ static void libcov_init(void) {
     enum libcov_mode mode = LIBCOV_MODE_LEAPFROG;
     const char *mode_str = getenv("LIBCOV_MODE");
     if (mode_str && !strcmp(mode_str, "oneshot")) mode = LIBCOV_MODE_ONESHOT;
+    else if (mode_str && *mode_str && strcmp(mode_str, "leapfrog") != 0)
+        libcov_logf("init: WARNING: unknown LIBCOV_MODE='%s', using leapfrog "
+                    "(valid: leapfrog, oneshot)", mode_str);
 
     /* config_load first: it only resolves module bases + builds the patch
      * table (no shm/bitmap touch), and the site-id model needs the patch

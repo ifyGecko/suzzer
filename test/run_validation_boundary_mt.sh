@@ -46,16 +46,25 @@ for f in "$LIB" "$TARGET" "$DUMP"; do
 done
 
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# Kept (and its path printed) when the suite fails: the generator and
+# target logs in it are how you debug.
+keep_work_on_failure() {
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then rm -rf "$WORK"; else echo "logs kept in $WORK" >&2; fi
+    return $rc
+}
+trap keep_work_on_failure EXIT
 LCV="$WORK/t.lcv"
 LCVB="$WORK/t.lcvb"
 
 echo ">> generate MT patch list + boundary sidecar for target_loop_mt"
 "$ROOT/tools/gen_patchlist.py" "$TARGET" "$LCV" --threading mt \
     --include-pat '^dbg\.(iter_begin|worker|path_a|path_a_leaf|path_b|path_b_leaf)$' \
-    >/dev/null 2>"$WORK/gen.log"
+    >/dev/null 2>"$WORK/gen.log" \
+    || { echo "FAIL: gen_patchlist (log: $WORK/gen.log)" >&2; exit 1; }
 "$ROOT/tools/gen_boundary.py" "$TARGET" "$LCVB" iter_begin:begin \
-    --patchlist "$LCV" >/dev/null 2>"$WORK/bnd.log"
+    --patchlist "$LCV" >/dev/null 2>"$WORK/bnd.log" \
+    || { echo "FAIL: gen_boundary (log: $WORK/bnd.log)" >&2; exit 1; }
 
 run_dump() {  # <out> <workers> <iters>
     # 100us of pause per worker keeps the total publish rate (~10k/s)

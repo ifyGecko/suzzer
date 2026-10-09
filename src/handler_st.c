@@ -23,7 +23,24 @@ static struct patch_entry *g_last_restored = NULL;
 typedef int (*sigaction_fn)(int, const struct sigaction *, struct sigaction *);
 static sigaction_fn real_sigaction = NULL;
 
-static void trap_handler(int signo, siginfo_t *info, void *uctx) {
+/* The original bytes could not be written back (mprotect refused, ...):
+ * returning would re-execute the trap forever at 100% CPU. Hand the trap
+ * signal back to the default action, as libcov_chain_trap does for an
+ * unhandled trap, so the re-executed instruction kills the process with
+ * the usual exit status / core. write(2) only: we are in the handler. */
+static void disarm_failed(int signo) {
+    static const char msg[] =
+        "libcov: handler: FATAL: cannot restore original instruction at trap "
+        "site (patch_disarm failed); restoring default action for the trap "
+        "signal\n";
+    (void)write(2, msg, sizeof msg - 1);
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof dfl);
+    dfl.sa_handler = SIG_DFL;
+    if (real_sigaction) real_sigaction(signo, &dfl, NULL);
+}
+
+static void trap_body(int signo, siginfo_t *info, void *uctx) {
     ucontext_t *uc = (ucontext_t *)uctx;
     uintptr_t pc = libcov_arch_pc_from_uctx(uc);
 
@@ -52,7 +69,10 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
     }
 
     /* Restore the original instruction so execution can resume. */
-    patch_disarm(e);
+    if (patch_disarm(e) != 0) {
+        disarm_failed(signo);
+        return;
+    }
 
     if (g_mode == LIBCOV_MODE_LEAPFROG) {
         /* Re-arm the previously hit site so we keep getting edge events from
@@ -72,6 +92,14 @@ static void trap_handler(int signo, siginfo_t *info, void *uctx) {
     boundary_on_trap(pc, e);
 
     /* Returning resumes execution at pc; kernel re-fetches the now-valid insn. */
+}
+
+/* The trap can land between a libc call and the target's errno check;
+ * mprotect / sigaction / a chained handler must not clobber it. */
+static void trap_handler(int signo, siginfo_t *info, void *uctx) {
+    int saved_errno = errno;
+    trap_body(signo, info, uctx);
+    errno = saved_errno;
 }
 
 int handler_install(enum libcov_mode mode, struct sigaction *prev_out) {

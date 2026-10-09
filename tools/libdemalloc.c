@@ -27,6 +27,22 @@
  *     make tools EXTRA_CFLAGS='-DLIBDEM_QUARANTINE_SLOTS=128 \
  *                              -DLIBDEM_ALIGN_ALLOCATIONS=1'
  *
+ * Alignment: by default on x86 (LIBDEM_ALIGN_ALLOCATIONS=0) malloc()
+ * places the buffer flush against the guard page, so a malloc(n) pointer
+ * is only as aligned as n is (malloc(13) returns an odd-ish address,
+ * NOT 16-byte / max_align_t aligned). That is deliberate: a one-byte
+ * overflow then faults immediately. x86 tolerates the misalignment for
+ * ordinary loads/stores, but SSE code using aligned moves (movaps etc.)
+ * on malloc'd memory will fault. Strict-alignment targets (ARM, MIPS,
+ * PowerPC, SPARC, ...) and SSE-heavy x86 targets should build with
+ * -DLIBDEM_ALIGN_ALLOCATIONS=1, which is the default on every non-x86
+ * architecture. posix_memalign / memalign / aligned_alloc / valloc /
+ * pvalloc always honour the requested alignment, including alignments
+ * larger than the page size.
+ *
+ * Sizes: the per-allocation length is stored as a uint32_t, so requests
+ * above UINT32_MAX bytes fail with NULL / ENOMEM.
+ *
  * Catches:
  *   - heap overflow reads/writes  (trailing guard page)
  *   - heap underflow writes       (header canary check on free/realloc)
@@ -41,8 +57,11 @@
  *   - UAF beyond the quarantine horizon (increase LIBDEM_QUARANTINE_SLOTS)
  *   - intra-allocation overflows
  *
- * VA / RSS sizing: at the default N=1024 slots and ~1-page allocations,
- * steady-state cost is ~8 MB virtual / ~4 MB resident. On 32-bit
+ * VA / RSS sizing: at the default N=128 slots and ~1-page allocations,
+ * quarantine cost is ~1 MB virtual (2 pages per slot: data + guard),
+ * and with LIBDEM_RELEASE_RSS_ON_FREE=1 (default) almost none of it
+ * stays resident. Raising LIBDEM_QUARANTINE_SLOTS scales this linearly
+ * (e.g. 1024 slots ~ 8 MB virtual). On 32-bit
  * embedded targets, reduce LIBDEM_QUARANTINE_SLOTS at compile time.
  */
 
@@ -102,9 +121,15 @@
 /* When 1, round each allocation up to _Alignof(max_align_t) and stamp
  * the trailing slack with LIBDEM_TAIL_CANARY for end-of-buffer write
  * detection. Trades a little overflow-detection precision for strict
- * C-standard alignment.                                            */
+ * C-standard alignment. Defaults to 0 on x86 (unaligned access is
+ * legal, and byte-exact overflow detection is worth more) and to 1
+ * everywhere else, where a misaligned malloc() pointer can SIGBUS.  */
 #ifndef LIBDEM_ALIGN_ALLOCATIONS
-  #define LIBDEM_ALIGN_ALLOCATIONS 0
+  #if defined(__x86_64__) || defined(__i386__)
+    #define LIBDEM_ALIGN_ALLOCATIONS 0
+  #else
+    #define LIBDEM_ALIGN_ALLOCATIONS 1
+  #endif
 #endif
 
 /* When 1, abort the process on calloc(a,b) where a*b overflows.
@@ -140,7 +165,8 @@
  *
  * This matters a lot for fuzzers targeting parsers that allocate
  * large containers (string tables, section data, debug info, etc.):
- * a few KB-MB allocations × 1024 quarantine slots would otherwise
+ * a few KB-MB allocations × LIBDEM_QUARANTINE_SLOTS quarantine slots
+ * (128 by default; often raised for long UAF horizons) would otherwise
  * pin hundreds of MB of resident memory per harness lifetime, even
  * though every byte is unreachable.
  *
@@ -368,12 +394,28 @@ __attribute__((constructor)) static void libdem_init(void) {
 /* Core allocator.                                                  */
 /* ---------------------------------------------------------------- */
 
-static void *dem_alloc(size_t len) {
+/* Allocate len bytes. align is the caller's required alignment of the
+ * returned pointer: 0 for plain malloc. For align <= PAGE_SIZE the
+ * caller must pass a len that is a multiple of align (the buffer ends
+ * on a page boundary, so its start is then aligned). For align >
+ * PAGE_SIZE we additionally place the guard page on an align
+ * boundary by over-mapping and trimming; the surviving mapping has
+ * exactly the normal {base, span} layout so dem_region() / free()
+ * need no extra metadata.                                          */
+static void *dem_alloc_aligned(size_t len, size_t align) {
   uint8_t *ret;
-  size_t   tlen, rlen;
+  size_t   tlen, rlen, extra = 0;
+
+  /* The length is stored as a uint32_t in the header (PTR_L).       */
+#if SIZE_MAX > UINT32_MAX
+  if (len > UINT32_MAX) { errno = ENOMEM; return NULL; }
+#endif
 
   /* Overflow checks: len + ALIGN + PAGE_SIZE must not wrap.         */
-  if (len > SIZE_MAX - PAGE_SIZE - ALLOC_ALIGN_SIZE - 16) return NULL;
+  if (len > SIZE_MAX - PAGE_SIZE - ALLOC_ALIGN_SIZE - 16) {
+    errno = ENOMEM;
+    return NULL;
+  }
 
 #if LIBDEM_ALIGN_ALLOCATIONS
   if (len & (ALLOC_ALIGN_SIZE - 1))
@@ -387,9 +429,27 @@ static void *dem_alloc(size_t len) {
   /* +8 for header metadata (length + canary).                      */
   tlen = (1 + PG_COUNT(rlen + 8)) * PAGE_SIZE;
 
-  ret = (uint8_t *)mmap(NULL, tlen, PROT_READ | PROT_WRITE,
+  if (align > PAGE_SIZE) {
+    extra = align - PAGE_SIZE;
+    if (tlen > SIZE_MAX - extra) { errno = ENOMEM; return NULL; }
+  }
+
+  ret = (uint8_t *)mmap(NULL, tlen + extra, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (ret == MAP_FAILED) return NULL;
+  if (ret == MAP_FAILED) { errno = ENOMEM; return NULL; }
+
+  if (extra) {
+    /* Slide the layout so the guard page (and hence, with len a
+     * multiple of align, the buffer start) lands on an align
+     * boundary, then unmap the unused head and tail. Both pieces are
+     * whole pages because mmap results and align are page-aligned. */
+    uintptr_t guard  = (uintptr_t)ret + PG_COUNT(rlen + 8) * PAGE_SIZE;
+    size_t    shift  = (size_t)(((guard + align - 1) & ~(uintptr_t)(align - 1))
+                                - guard);
+    if (shift) (void)munmap(ret, shift);
+    if (extra - shift) (void)munmap(ret + shift + tlen, extra - shift);
+    ret += shift;
+  }
 
 #if LIBDEM_NAME_PAGES
   (void)prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, (unsigned long)ret, tlen,
@@ -419,6 +479,10 @@ static void *dem_alloc(size_t len) {
 #endif
 
   return ret;
+}
+
+static void *dem_alloc(size_t len) {
+  return dem_alloc_aligned(len, 0);
 }
 
 /* Recover the (mmap_base, mmap_span) for a user pointer ptr whose
@@ -501,7 +565,8 @@ void free(void *ptr) {
    * in quarantine. Combined with the PROT_NONE below this makes the
    * pages unreachable AND unbacked -- UAF/double-free still segfaults
    * (the access can't happen) but the kernel reclaims the RSS now
-   * instead of when the slot is munmap'd 1023 frees later. Ignore the
+   * instead of when the slot is munmap'd LIBDEM_QUARANTINE_SLOTS frees
+ * later (128 by default). Ignore the
    * return: a kernel that refuses MADV_DONTNEED here (e.g. on a hugepage
    * VMA) just leaves the pages resident, which is the pre-D1 behaviour. */
   (void)madvise(base, span, MADV_DONTNEED);
@@ -537,10 +602,15 @@ int posix_memalign(void **ptr, size_t align, size_t len) {
     return EINVAL;
   if (len == 0) { *ptr = NULL; return 0; }
 
+  /* Round len up to a multiple of align: dem_alloc_aligned() ends the
+   * buffer on an align boundary, so this aligns its start.          */
   size_t rem = len % align;
-  if (rem) len += align - rem;
+  if (rem) {
+    if (len > SIZE_MAX - (align - rem)) return ENOMEM;
+    len += align - rem;
+  }
 
-  void *p = dem_alloc(len);
+  void *p = dem_alloc_aligned(len, align);
   if (!p) return ENOMEM;
   memset(p, LIBDEM_CLOBBER_BYTE, len);
   *ptr = p;
@@ -549,8 +619,20 @@ int posix_memalign(void **ptr, size_t align, size_t len) {
 
 __attribute__((malloc)) __attribute__((alloc_size(2)))
 void *memalign(size_t align, size_t len) {
+  /* glibc's memalign accepts any alignment: small ones are raised to
+   * pointer size, non-powers of two rounded up to the next power.   */
+  if (align < sizeof(void *)) align = sizeof(void *);
+  if (align & (align - 1)) {
+    size_t a = sizeof(void *);
+    while (a < align) {
+      if (a > SIZE_MAX / 2) { errno = EINVAL; return NULL; }
+      a <<= 1;
+    }
+    align = a;
+  }
   void *ret = NULL;
-  (void)posix_memalign(&ret, align, len);
+  int   rc  = posix_memalign(&ret, align, len);
+  if (rc) errno = rc;
   return ret;
 }
 
@@ -558,8 +640,30 @@ __attribute__((malloc)) __attribute__((alloc_size(2)))
 void *aligned_alloc(size_t align, size_t len) {
   if (align == 0 || (len % align)) return NULL;
   void *ret = NULL;
-  if (posix_memalign(&ret, align, len)) return NULL;
+  int   rc  = posix_memalign(&ret, align, len);
+  if (rc) { errno = rc; return NULL; }
   return ret;
+}
+
+/* Page-aligned allocation. valloc(0) / pvalloc(0) return a usable
+ * one-page buffer (like glibc), not NULL.                          */
+__attribute__((malloc)) __attribute__((alloc_size(1)))
+void *valloc(size_t len) {
+  void *ret = NULL;
+  int   rc  = posix_memalign(&ret, PAGE_SIZE, len ? len : 1);
+  if (rc) { errno = rc; return NULL; }
+  return ret;
+}
+
+/* As valloc(), with len rounded up to a whole number of pages.
+ * (posix_memalign already rounds len to the alignment, so the only
+ * difference is making that rounding explicit and overflow-checked.) */
+__attribute__((malloc))
+void *pvalloc(size_t len) {
+  size_t plen = len ? len : 1;
+  if (plen > SIZE_MAX - (PAGE_SIZE - 1)) { errno = ENOMEM; return NULL; }
+  plen = PG_COUNT(plen) * PAGE_SIZE;
+  return valloc(plen);
 }
 
 __attribute__((alloc_size(2, 3)))

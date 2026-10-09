@@ -71,6 +71,10 @@ enum szr_crash_reason {
     SZR_CRASH_EXIT     = 1,   /* target process exited between requests  */
     SZR_CRASH_SIGNAL   = 2,   /* target killed by a signal               */
     SZR_CRASH_DELIVERY = 3,   /* could not connect/deliver to the target */
+    SZR_CRASH_MALFORMED = 4,  /* relay rejected a malformed INPUT frame
+                               * (payload < 12 bytes or len overruns it);
+                               * nothing was delivered, the target is fine.
+                               * id is 0 if the payload was < 8 bytes. */
 };
 
 #endif /* SUZZER_RELAY_PROTO_H */

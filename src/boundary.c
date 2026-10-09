@@ -264,8 +264,8 @@ static int load_sidecar(const char *path, uintptr_t module_base) {
         libcov_logf("boundary: bad version %u", version);
         munmap(map, st.st_size); return -1;
     }
-    size_t need = sizeof(*h) + (size_t)count * sizeof(struct lcvb_record);
-    if ((size_t)st.st_size < need) {
+    /* Overflow-safe on 32-bit size_t; st_size >= sizeof(*h) checked above. */
+    if (count > ((size_t)st.st_size - sizeof(*h)) / sizeof(struct lcvb_record)) {
         libcov_logf("boundary: truncated (count=%u)", count);
         munmap(map, st.st_size); return -1;
     }
@@ -337,7 +337,18 @@ int boundary_init(void) {
 
     const char *modname = getenv("LIBCOV_MODULE");
     uintptr_t base = util_module_base(modname);
-    if (!base) { libcov_logf("boundary: cannot resolve module base"); return -1; }
+    if (!base) {
+        /* Mirror config.c's log_unresolved(): name what we looked for. */
+        if (modname && *modname)
+            libcov_logf("boundary: cannot resolve module base for '%s': not "
+                        "mapped (set LIBCOV_MODULE to the mapped basename)",
+                        modname);
+        else
+            libcov_logf("boundary: cannot resolve module base for the main "
+                        "executable (LIBCOV_MODULE unset; set LIBCOV_MODULE "
+                        "to the mapped basename)");
+        return -1;
+    }
 
     if (load_sidecar(list, base) < 0) return -1;
     if (g_marker_count == 0) {
@@ -353,7 +364,20 @@ int boundary_init(void) {
                     "using none (valid: none, touched, all)", rearm_env);
 
     const char *grace_str = getenv("LIBCOV_BOUNDARY_INIT_GRACE");
-    if (grace_str && *grace_str) g_init_grace_initial = (uint32_t)atoi(grace_str);
+    if (grace_str && *grace_str) {
+        /* strtoul silently negates "-1" to ULONG_MAX; reject a sign, junk
+         * and out-of-range values rather than skip ~4G boundaries. */
+        char *end;
+        errno = 0;
+        unsigned long v = strtoul(grace_str, &end, 10);
+        if (strchr(grace_str, '-') || *end || end == grace_str || errno ||
+            (unsigned long)(uint32_t)v != v) {
+            libcov_logf("boundary: WARNING: invalid LIBCOV_BOUNDARY_INIT_GRACE='%s', "
+                        "using 0 (expected a non-negative integer)", grace_str);
+            v = 0;
+        }
+        g_init_grace_initial = (uint32_t)v;
+    }
     g_init_grace_remaining = g_init_grace_initial;
 
     const char *efd_str = getenv("LIBCOV_BOUNDARY_NOTIFY_FD");

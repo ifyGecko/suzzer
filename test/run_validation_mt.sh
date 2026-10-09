@@ -20,7 +20,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Per-run scratch dir: fixed /tmp paths made parallel runs collide.
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# Kept (and its path printed) when the suite fails: the generator and
+# target logs in it are how you debug.
+keep_work_on_failure() {
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then rm -rf "$WORK"; else echo "logs kept in $WORK" >&2; fi
+    return $rc
+}
+trap keep_work_on_failure EXIT
 ARCH="${ARCH:-$(uname -m)}"
 LIB="$ROOT/build/$ARCH/libcov_mt.so"
 TARGET="$ROOT/build/$ARCH/target_simple_mt"
@@ -41,7 +48,8 @@ fi
 echo ">> generate MT patch list"
 "$ROOT/tools/gen_patchlist.py" "$TARGET" "$LCV" --threading mt \
     --include-pat '^dbg\.(main|classify|loop_sum|cmdline|worker)$' \
-    >/dev/null 2>$WORK/v_mt.gen.log
+    >/dev/null 2>$WORK/v_mt.gen.log \
+    || { echo "FAIL: gen_patchlist (log: $WORK/v_mt.gen.log)" >&2; exit 1; }
 records=$(python3 -c "
 import struct
 with open('$LCV','rb') as f: h=f.read(16)

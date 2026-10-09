@@ -44,6 +44,10 @@
 #
 #     Nothing is run for these arches (qemu can't model the re-arm path
 #     at all), so libcov_mt's init path is not exercised there either.
+#
+# An arch whose cross gcc or qemu binary is missing is SKIPped, not
+# failed. RUN_TIMEOUT (seconds, default 60) bounds every target/qemu run;
+# a run that hits it is a FAIL ("timed out").
 
 set -uo pipefail
 
@@ -101,15 +105,19 @@ declare -A CROSS=(
   [riscv64]=riscv64-linux-gnu-
 )
 
+RUN_TIMEOUT="${RUN_TIMEOUT:-60}"
+
+# Both runners are bounded by RUN_TIMEOUT (rc 124 = timed out). env sets
+# LD_PRELOAD after timeout(1) has started, so libcov never loads into it.
 run_target() {
     local arch=$1; shift
     local lib=$1; shift
     local q=${QEMU[$arch]:-}
     local sr=${SYSROOT[$arch]:-}
     if [[ -z "$q" ]]; then
-        LD_PRELOAD="$lib" "$@"
+        timeout "$RUN_TIMEOUT" env LD_PRELOAD="$lib" "$@"
     else
-        "$q" -L "$sr" -E LD_PRELOAD="$lib" "$@"
+        timeout "$RUN_TIMEOUT" "$q" -L "$sr" -E LD_PRELOAD="$lib" "$@"
     fi
 }
 
@@ -118,9 +126,9 @@ run_target_clean() {
     local q=${QEMU[$arch]:-}
     local sr=${SYSROOT[$arch]:-}
     if [[ -z "$q" ]]; then
-        "$@"
+        timeout "$RUN_TIMEOUT" "$@"
     else
-        "$q" -L "$sr" "$@"
+        timeout "$RUN_TIMEOUT" "$q" -L "$sr" "$@"
     fi
 }
 
@@ -150,6 +158,16 @@ for arch in "${ARCHES[@]}"; do
     echo "================= $arch (MT) ================="
 
     cross_prefix=${CROSS[$arch]:-}
+
+    # Missing toolchain / emulator: SKIP, not FAIL. Build-only arches
+    # never run qemu, so only the full-run ones need it.
+    if ! command -v "${cross_prefix}gcc" >/dev/null; then
+        echo "  SKIP (${cross_prefix}gcc not found)"; SKIP=$((SKIP+1)); continue
+    fi
+    q=${QEMU[$arch]:-}
+    if is_full_run_arch "$arch" && [[ -n $q ]] && ! command -v "$q" >/dev/null; then
+        echo "  SKIP ($q not found)"; SKIP=$((SKIP+1)); continue
+    fi
 
     if ! make --no-print-directory ARCH=$arch THREADING=mt >/dev/null 2>build/$arch.mt.build.log; then
         echo "FAIL libcov_mt build"
@@ -205,11 +223,19 @@ print(c, th)")
     fi
 
     # Full-run path (x86_64 native + aarch64 under qemu).
+    # A failed baseline on a FULL_RUN arch means nothing below is tested:
+    # that is a FAIL, not a SKIP.
     run_target_clean "$arch" "$target_bin" "$THREADS" "$ITERS" "${INPUTS[@]}" \
         > $WORK/$arch.mt.bare 2>&1
-    if [[ $? -ne 0 ]] || ! grep -q '^TOTAL=' $WORK/$arch.mt.bare; then
-        echo "  SKIP (baseline run failed)"
-        SKIP=$((SKIP+1)); continue
+    rc=$?
+    if [[ $rc -ne 0 ]] || ! grep -q '^TOTAL=' $WORK/$arch.mt.bare; then
+        if [[ $rc -eq 124 ]]; then
+            echo "FAIL baseline run timed out after ${RUN_TIMEOUT}s (RUN_TIMEOUT)"
+        else
+            echo "FAIL baseline run (no libcov) rc=$rc"
+        fi
+        tail -10 $WORK/$arch.mt.bare
+        FAIL=$((FAIL+1)); FAILED+=("$arch:baseline"); continue
     fi
 
     rm -f "$SHM" "$LOG"
@@ -219,7 +245,7 @@ print(c, th)")
         "$THREADS" "$ITERS" "${INPUTS[@]}" > $WORK/$arch.mt.os 2>&1
     rc=$?
     if [[ $rc -ne 0 ]]; then
-        echo "FAIL oneshot run rc=$rc"
+        echo "FAIL oneshot run rc=$rc$( (( rc == 124 )) && echo " (timed out after ${RUN_TIMEOUT}s, RUN_TIMEOUT)")"
         tail -10 $WORK/$arch.mt.os; tail -10 "$LOG"
         FAIL=$((FAIL+1)); FAILED+=("$arch:oneshot_rc"); continue
     fi
@@ -245,7 +271,7 @@ print(c, th)")
         "$THREADS" "$ITERS" "${INPUTS[@]}" > $WORK/$arch.mt.lf 2>&1
     rc=$?
     if [[ $rc -ne 0 ]]; then
-        echo "FAIL leapfrog run rc=$rc"
+        echo "FAIL leapfrog run rc=$rc$( (( rc == 124 )) && echo " (timed out after ${RUN_TIMEOUT}s, RUN_TIMEOUT)")"
         tail -10 $WORK/$arch.mt.lf; tail -10 "$LOG"
         FAIL=$((FAIL+1)); FAILED+=("$arch:lf_rc"); continue
     fi
@@ -278,8 +304,13 @@ echo "FULL_PASS=$PASS  BUILD_ONLY=$BUILD_ONLY  FAIL=$FAIL  SKIP=$SKIP"
 echo "Full-run arches: ${FULL_RUN_ARCHES[*]}"
 echo "Build-only arches use qemu-user, which can't model in-process hot-patching"
 echo "across threads on weakly-ordered guest ISAs. Correctness for those arches"
-echo "follows from the atomic-write argument in src/patch_mt.c; the build-only"
-echo "smoke test confirms libcov_mt loads and inits cleanly."
+echo "follows from the atomic-write argument in src/patch_mt.c. Nothing runs on"
+echo "build-only arches: they only confirm libcov_mt.so and target_simple_mt"
+echo "build and link and that an LCV3 patch list is generated."
+if (( PASS == 0 && BUILD_ONLY == 0 && FAIL == 0 && SKIP > 0 )); then
+    echo "NOTE: every arch was skipped -- nothing was tested. Install the cross"
+    echo "      toolchains and qemu-user-static (HOWTO.md \"Prerequisites\")."
+fi
 if [[ ${#FAILED[@]} -gt 0 ]]; then
     printf '  %s\n' "${FAILED[@]}"
     exit 1

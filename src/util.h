@@ -2,6 +2,7 @@
 #define LIBCOV_UTIL_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 /* Init-time logging. Writes "libcov: <msg>\n" to LIBCOV_LOG (or stderr if
  * unset). Never called from the signal handler. After libcov_log_seal()
@@ -18,6 +19,17 @@ void libcov_logf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
  * exactly. A " (deleted)" suffix on the mapping is ignored. Logs a warning
  * if a bare name matches two different files. */
 uintptr_t util_module_base(const char *modname);
+
+/* Init-time snapshot of /proc/self/maps, so patch_arm_all can check that
+ * a patch site is mapped before reading it (a patch list for another
+ * build can point anywhere). util_range_in_module returns 1 if
+ * [addr, addr+len) lies in readable, contiguous mappings of the file whose
+ * base (as util_module_base computes it) is module_base, else 0; with no
+ * snapshot loaded (maps unreadable) it returns 1, i.e. no check. Not
+ * signal-safe. */
+int  util_maps_load(void);
+int  util_range_in_module(uintptr_t module_base, uintptr_t addr, size_t len);
+void util_maps_free(void);
 
 /* Returns [lo, hi) of libcov.so's own mapping (so we can refuse to patch
  * ourselves). Both 0 on failure. */

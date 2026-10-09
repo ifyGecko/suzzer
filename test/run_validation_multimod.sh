@@ -9,7 +9,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Per-run scratch dir: fixed /tmp paths made parallel runs collide.
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# Kept (and its path printed) when the suite fails: the generator and
+# target logs in it are how you debug.
+keep_work_on_failure() {
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then rm -rf "$WORK"; else echo "logs kept in $WORK" >&2; fi
+    return $rc
+}
+trap keep_work_on_failure EXIT
 ARCH="${ARCH:-$(uname -m)}"
 LIB="$ROOT/build/$ARCH/libcov_st.so"
 TARGET="$ROOT/build/$ARCH/target_multimod"
@@ -56,13 +63,15 @@ echo ">> baseline output (no libcov)"
 
 echo ">> generate single-module patch list (exe only)"
 "$ROOT/tools/gen_patchlist.py" "$TARGET" "$LCV_ONE" \
-    --include-pat "$INCLUDE" >/dev/null 2>$WORK/multimod.gen_one.log
+    --include-pat "$INCLUDE" >/dev/null 2>$WORK/multimod.gen_one.log \
+    || { echo "FAIL: gen_patchlist exe-only (log: $WORK/multimod.gen_one.log)" >&2; exit 1; }
 extract_lcv_meta "$LCV_ONE" | sed 's/^/   /'
 
 echo ">> generate multi-module patch list (exe + helper.so)"
 "$ROOT/tools/gen_patchlist.py" "$TARGET" "$LCV_BOTH" \
     --module "libmultimod_helper.so:$HELPER" \
-    --include-pat "$INCLUDE" >/dev/null 2>$WORK/multimod.gen_both.log
+    --include-pat "$INCLUDE" >/dev/null 2>$WORK/multimod.gen_both.log \
+    || { echo "FAIL: gen_patchlist exe+helper (log: $WORK/multimod.gen_both.log)" >&2; exit 1; }
 extract_lcv_meta "$LCV_BOTH" | sed 's/^/   /'
 
 rm -f "$SHM_ONE" "$SHM_BOTH"

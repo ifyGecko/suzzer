@@ -227,18 +227,32 @@ int sink_init(const char *path, unsigned ring_size, size_t map_size) {
             libcov_logf("sink: open(%s): %s", path, strerror(errno));
             return -1;
         }
+        libcov_logf("sink: region at %s (file)", path);
     } else {
-        if (try_shm_open(path, &fd) < 0) {
+        const char *bare = (path[0] == '/') ? path + 1 : path;
+        if (try_shm_open(path, &fd) == 0) {
+            libcov_logf("sink: region at /dev/shm/%s (shm_open)", bare);
+        } else {
+            int shm_err = errno;
             const char *tmpdir = getenv("TMPDIR");
             if (!tmpdir || !*tmpdir) tmpdir = "/tmp";
             char fallback[512];
-            const char *bare = (path[0] == '/') ? path + 1 : path;
-            snprintf(fallback, sizeof fallback, "%s/%s", tmpdir, bare);
-            if (try_file_open(fallback, O_NOFOLLOW | O_CLOEXEC, &fd) < 0) {
-                libcov_logf("sink: shm_open + fallback failed for %s", path);
+            int n = snprintf(fallback, sizeof fallback, "%s/%s", tmpdir, bare);
+            if (n < 0 || (size_t)n >= sizeof fallback) {
+                /* A truncated name would open some other file. */
+                libcov_logf("sink: shm_open(/%s): %s; file fallback path "
+                            "'%s/%s' too long (max %zu bytes)",
+                            bare, strerror(shm_err), tmpdir, bare,
+                            sizeof fallback - 1);
                 return -1;
             }
-            libcov_logf("sink: using file fallback %s", fallback);
+            if (try_file_open(fallback, O_NOFOLLOW | O_CLOEXEC, &fd) < 0) {
+                libcov_logf("sink: shm_open(/%s): %s; file fallback open(%s): %s",
+                            bare, strerror(shm_err), fallback, strerror(errno));
+                return -1;
+            }
+            libcov_logf("sink: region at %s (file fallback; shm_open(/%s): %s)",
+                        fallback, bare, strerror(shm_err));
         }
     }
 

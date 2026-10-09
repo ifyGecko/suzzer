@@ -84,6 +84,7 @@
 #include "arch.h"
 #include "util.h"
 #include "membarrier.h"
+#include "sink.h"   /* libcov_module_bases */
 
 #include <string.h>
 #include <unistd.h>
@@ -118,6 +119,15 @@ static int     g_have_sync_core = 0;
  * need this lock because pwrite bypasses VMA permission checks. */
 static uint8_t g_fallback_lock = 0;
 
+/* A patch list for another build can name addresses outside its module,
+ * or nowhere mapped at all: reading (patch_validate) or mprotect'ing
+ * those would fault in the constructor or touch someone else's pages.
+ * Needs the util_maps_load() snapshot taken by patch_arm_all. */
+static int site_in_module(const struct patch_entry *e) {
+    return util_range_in_module(libcov_module_bases[e->module_idx],
+                                e->addr, e->len);
+}
+
 /* Make every page that holds a patch site R|W|X, once. The table is
  * sorted by address so consecutive entries share pages; each distinct
  * page is mprotect'ed once. Returns 0 if every page succeeded. */
@@ -128,6 +138,7 @@ static int make_sites_writable(void) {
     uintptr_t mask = ~((uintptr_t)g_pagesize - 1);
     uintptr_t last_lo = 0, last_hi = 0;
     for (size_t i = 0; i < n; i++) {
+        if (!site_in_module(&t[i])) continue;   /* stale; patch_arm_all logs it */
         uintptr_t lo = t[i].addr & mask;
         uintptr_t hi = (t[i].addr + t[i].len + (uintptr_t)g_pagesize - 1) & mask;
         if (lo >= last_lo && hi <= last_hi) continue;
@@ -349,11 +360,14 @@ int patch_disarm(struct patch_entry *e) {
 }
 
 size_t patch_arm_all(void) {
+    if (util_maps_load() != 0)
+        libcov_logf("patch_mt: cannot snapshot /proc/self/maps; "
+                    "patch sites not range-checked");
     mt_init_once();
 
     size_t n;
     struct patch_entry *t = config_table_mut(&n);
-    if (!t) return 0;
+    if (!t) { util_maps_free(); return 0; }
 
     uintptr_t self_lo, self_hi;
     util_self_range(&self_lo, &self_hi);
@@ -364,6 +378,12 @@ size_t patch_arm_all(void) {
         if (self_lo && e->addr >= self_lo && e->addr < self_hi) {
             libcov_logf("patch_mt: refusing self-patch at 0x%lx", (unsigned long)e->addr);
             skipped++;
+            continue;
+        }
+        if (!site_in_module(e)) {
+            libcov_logf("patch_mt: stale entry at 0x%lx (not mapped in module %u)",
+                        (unsigned long)e->addr, (unsigned)e->module_idx);
+            validate_fail++;
             continue;
         }
         if (patch_validate(e) != 0) {
@@ -379,6 +399,7 @@ size_t patch_arm_all(void) {
         }
         armed++;
     }
+    util_maps_free();
     libcov_logf("patch_mt: armed=%zu skipped=%zu stale=%zu",
                 armed, skipped, validate_fail);
     return armed;
