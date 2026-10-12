@@ -1,4 +1,4 @@
-# HOWTO: Using libcov (suzzer) to Collect Coverage
+# HOWTO: Collect Coverage and Fuzz with libcov (suzzer)
 
 This is an operational guide for an engineer or an automated agent who has
 **never seen this project before** and needs to drive it end to end: build
@@ -10,6 +10,17 @@ Read [README.md](README.md) for the design rationale and
 [Design.md](Design.md) for internals. **This document tells you what to run,
 in what order, and how to know it worked.** Every command here is literal and
 copy-pasteable. Where a choice exists, this guide tells you how to choose.
+
+> **Building a fuzzer? Start at [Recipe 1 — Fuzz a target](#13-recipes).**
+> Most people reach for libcov to *fuzz*, and the strong fuzzing setup differs
+> from a bare coverage dump in several knobs at once (leapfrog mode, ordered
+> 3-gram, a persistent driver, a heap oracle, a disk corpus, real crash
+> triage). Recipe 1 wires all of them up in one copy-pasteable block; the
+> intervening sections explain each piece. **Do not** assemble a fuzzer from
+> the earliest/simplest snippets below (`oneshot`, `N=1`, fork-exec per input)
+> — those are coverage *sanity checks* and they miss bugs. See the
+> [coverage-vs-fuzzing table](README.md#collecting-coverage-vs-building-a-fuzzer-read-this-first)
+> in the README for the one-glance summary.
 
 > **One rule to never break:** readers must learn the bitmap size and layout
 > from the shm **header**, never by hard-coding `64 KB @ offset 72`. The
@@ -27,7 +38,7 @@ copy-pasteable. Where a choice exists, this guide tells you how to choose.
 3. [Decision tree: which variant and mode do I want?](#3-decision-tree)
 4. [Step 1 — Build the library and test targets](#4-step-1-build)
 5. [Step 2 — Generate the patch list (the coverage points)](#5-step-2-patchlist)
-6. [Step 3 — (Optional) Generate the iteration-boundary sidecar](#6-step-3-boundary)
+6. [Step 3 — Generate the iteration-boundary sidecar (long-running targets)](#6-step-3-boundary)
 7. [Step 4 — Run the target under libcov and collect coverage](#7-step-4-run)
 8. [Step 5 — Read the bitmap from a fuzzer/driver](#8-step-5-read)
 9. [Remote / across-the-network collection](#9-remote)
@@ -35,7 +46,7 @@ copy-pasteable. Where a choice exists, this guide tells you how to choose.
 11. [Testing and validating your setup](#11-testing)
 12. [Troubleshooting (symptom → cause → fix)](#12-troubleshooting)
 13. [Worked end-to-end recipes](#13-recipes)
-14. [Optional tooling (mutator, heap checker, live-process injector)](#14-tooling)
+14. [Fuzzing tooling (relay/brain, heap oracle, mutator, status board, injector)](#14-tooling)
 
 ---
 
@@ -135,18 +146,28 @@ Answer these in order. Each answer sets one knob.
 > The patch list carries a threading hint. An MT-generated list given to
 > `libcov_st.so` (or vice-versa) is **refused at init**. Match them.
 
-**Q2. Do you need hit counts, or just "was this edge reached"?**
-- Just reached, fastest → `LIBCOV_MODE=oneshot` (each site fires once, then
-  stays restored).
-- Hit counts / per-iteration edge sets → `LIBCOV_MODE=leapfrog` (**default**).
+**Q2. Are you fuzzing, or just taking a one-off coverage reading?**
+- **Fuzzing** → `LIBCOV_MODE=leapfrog` (**default**). A fuzzer needs coverage
+  that keeps responding as inputs evolve; leapfrog gives per-iteration edge
+  sets and hit counts. This is the right answer for essentially every fuzzing
+  campaign.
+- **One-off "did this edge get reached" reading**, nothing evolving →
+  `LIBCOV_MODE=oneshot` is faster, but it goes path-blind after warmup (each
+  site fires once), so **never use it to fuzz**.
 
 **Q3. Is the target a one-shot program (runs once per input, then exits) or a
 long-running loop/daemon (one process handles many inputs)?**
-- **One-shot** → you do **not** need boundaries. Run once per input, read the
-  cumulative bitmap, repeat.
-- **Long-running** → you need an **iteration-boundary sidecar** (Step 3) so
-  libcov knows where one input ends and the next begins, and publishes a
-  per-iteration snapshot into the ring.
+- **One-shot** → simplest to wire up: run the process per input and read the
+  cumulative bitmap. You still want `leapfrog` + ordered 3-gram for fuzzing;
+  boundaries are optional (per-input scoping comes for free from the fresh
+  process). A fast fuzzer will still prefer a persistent driver to avoid
+  paying process-startup + re-instrumentation on every input.
+- **Long-running / daemon** → add an **iteration-boundary sidecar** (Step 3)
+  so libcov knows where one input ends and the next begins and publishes a
+  per-iteration snapshot into the ring. This is the stronger model: the target
+  stays resident (no fork+exec per input) and is driven by `fuzz_driver` or
+  `suzzer-relay`. (A fork-per-connection daemon is covered too — see
+  [Pattern C](#9-remote).)
 
 **Q4. Only for long-running targets — pick `(MODE, BOUNDARY_REARM)`:**
 
@@ -221,10 +242,13 @@ Defaults are shipped; override only if needed. Two equivalent ways — editing
 the header, or passing `-D` via `EXTRA_CFLAGS` (the `-D` wins):
 
 ```bash
-# Block coverage instead of AFL edges (cheapest):
-make EXTRA_CFLAGS='-DLIBCOV_NGRAM_N=1'
-# 8-gram path-sensitive coverage with rotation:
+# Ordered 3-gram -- RECOMMENDED FOR FUZZING (path-sensitive; rotation defeats
+# A,B,C == B,A,C history-permutation collisions). Build your fuzzing libcov with this:
+make EXTRA_CFLAGS='-DLIBCOV_NGRAM_N=3 -DLIBCOV_NGRAM_ROTATE=1'
+# Wider window (8-gram) for deeper path sensitivity at higher cost:
 make EXTRA_CFLAGS='-DLIBCOV_NGRAM_N=8 -DLIBCOV_NGRAM_ROTATE=1'
+# Block coverage, path-blind (cheapest) -- sanity checks only, NOT for fuzzing:
+make EXTRA_CFLAGS='-DLIBCOV_NGRAM_N=1'
 # Retarget the MIPS illegal encoding for an odd chip rev
 # (mips64 uses LIBCOV_ARCH_MIPS64_ILLEGAL instead):
 make ARCH=mips EXTRA_CFLAGS='-DLIBCOV_ARCH_MIPS_ILLEGAL=0xDEADBEEFu'
@@ -362,10 +386,13 @@ xxd /tmp/t.lcv | head          # first 4 bytes must be "LCV3"
 ---
 
 <a name="6-step-3-boundary"></a>
-## 6. Step 3 — (Optional) Generate the iteration-boundary sidecar
+## 6. Step 3 — Generate the iteration-boundary sidecar (long-running targets)
 
-**Skip this entirely for one-shot targets.** It is only for long-running
-targets where one process handles many inputs and you want per-input coverage.
+Needed for long-running targets — a loop or daemon where one process handles
+many inputs and you want per-input coverage (this is the stronger, persistent
+fuzzing model). One-shot programs that exit per input can skip it (the fresh
+process already scopes coverage per input), though a persistent driver is
+still faster for a real campaign.
 
 The sidecar (format **LCVB1**) names the addresses that mark iteration
 boundaries. [`tools/gen_boundary.py`](tools/gen_boundary.py) resolves function
@@ -423,8 +450,11 @@ Each `SPEC` is `SYM[:kind[:depth_filter]]`:
 ## 7. Step 4 — Run the target under libcov and collect coverage
 
 Set the environment, `LD_PRELOAD` the right library, run the target.
+(These examples *collect coverage*. To actually fuzz, see
+[Recipe 1 — Fuzz a target](#13-recipes), which adds leapfrog + ordered 3-gram
++ a persistent driver + the heap oracle on top of this.)
 
-### Native, one-shot target
+### Native, single run (one coverage reading)
 
 ```bash
 LIBCOV_PATCHLIST=/tmp/t.lcv \
@@ -556,7 +586,10 @@ cumulative bitmap lives at `bitmap_offset`.
 ### Long-running workflow — `fuzz_driver` (the reference driver)
 
 [`test/fuzz_driver.c`](test/fuzz_driver.c) spawns the target **once**, pipes
-inputs (one per line, at most 1023 bytes each; longer lines are split) to
+inputs (one per line, at most 1023 bytes each; longer lines are split — this
+1023 is `fuzz_driver`'s newline framing of stdin, **not** a recommended input
+size; mutate.py defaults to 64 KB inputs, and binary/stateful protocols should
+use a length-framed driver such as `suzzer-relay`, not newline framing) to
 its stdin, and reads one coverage snapshot per iteration from the ring using
 the correct seqlock protocol. It sets up the required env for you: its own
 region at `/tmp/libcov_driver_<pid>` and `LIBCOV_MODE=leapfrog` unless you
@@ -708,9 +741,22 @@ foreign-ABI header, which sidesteps the byte-order pitfalls of Patterns A/B.
 (the relay uses one; see §8).
 
 This template targets a **single-process** daemon (one process handles
-requests in a loop). A fork-per-connection daemon shares one coverage region
-across children (ST non-atomic increments, interleaved snapshots); that case
-is the next step, not yet handled (see [TODO.md](TODO.md)).
+requests in a loop). **Fork-per-connection daemons (many inetd-style
+services) are fuzzable too** — just don't let the children share one coverage
+region (ST increments aren't atomic and snapshots would interleave). Two
+working approaches:
+
+- **Per-process regions:** give each child its own region with
+  `LIBCOV_SHM_PATH=/dev/shm/cov_%p` (the `%p` expands to the pid; see §10 and
+  "Per-process regions for forking/re-execing daemons"). The driver reads the
+  child's region for the connection it drove.
+- **One connection per process (simplest and robust):** drive exactly one
+  connection per target process — accept, hand the socket to a freshly started
+  instance, send the input, read that process's own region, let it exit. This
+  trades some throughput for perfectly isolated per-input coverage and crash
+  attribution. Keep per-exec cost low (persist expensive setup, avoid fixed
+  sleeps so you don't pay a full timeout per connection) so throughput stays
+  usable.
 
 ### Pattern D — qemu-user on the brain host (no real device at all)
 
@@ -894,7 +940,74 @@ python3 tools/mutate.py --selftest      # mutation engine sanity checks
 <a name="13-recipes"></a>
 ## 13. Worked end-to-end recipes
 
-### Recipe 1 — One-shot x86_64 target, coverage per input, local
+**If you are building a fuzzer, copy the Fuzzing recipe immediately below.**
+The numbered "Recipe N" blocks after it are smaller, single-purpose coverage
+demos (one-shot reading, MT, qemu, ssh, slicing) — useful building blocks, but
+each is deliberately minimal and **none of them on its own is a fuzzing setup**.
+
+### Fuzzing recipe (start here): the strong end-to-end setup
+
+This is the configuration to copy for a real campaign. It differs from the
+coverage demos below in every row of the
+[coverage-vs-fuzzing table](README.md#collecting-coverage-vs-building-a-fuzzer-read-this-first):
+leapfrog + ordered 3-gram + a persistent (boundary) model + a heap oracle + a
+resumable on-disk corpus + real crash triage. The full mutate→run→score→save
+loop is the relay + brain on a network daemon (`target_netd`); for a
+fork-per-connection daemon use the one-connection-per-process pattern
+([§9 Pattern C](#9-remote)) with the same knobs.
+
+```bash
+# 1. Build libcov with ORDERED 3-GRAM (path-sensitive) -- not the default N=2.
+make EXTRA_CFLAGS='-DLIBCOV_NGRAM_N=3 -DLIBCOV_NGRAM_ROTATE=1'
+# 2. Build the heap-bug oracle (your bug detector), the relay, and the demo daemon.
+make tools
+make -C tools relay ARCH=x86_64 BUILD=$PWD/build/x86_64
+make -C test  netd  ARCH=x86_64 BUILD=$PWD/build/x86_64
+# 3. Coverage points + PAIRED request boundaries wrapping the handler.
+./tools/gen_patchlist.py build/x86_64/target_netd /tmp/n.lcv --root main
+./tools/gen_boundary.py  build/x86_64/target_netd /tmp/n.lcvb \
+    req_begin:begin req_end:end --patchlist /tmp/n.lcv
+# 4. Brain off-device: mutates, scores novelty, keeps a RESUMABLE ./corpus on
+#    disk, saves full crash inputs + metadata. Runs until stopped.
+mkdir -p ./corpus && printf 'hello' > ./corpus/s1
+python3 tools/suzzer_brain.py --listen 0.0.0.0:7000 --seeds ./corpus --out ./out &
+# 5. Relay on-device: spawns the daemon under libcov with the HEAP ORACLE
+#    CO-LOADED (colon LD_PRELOAD list). leapfrog is libcov's default, so the
+#    strong per-trap mode is automatic here.
+./build/x86_64/suzzer-relay \
+    --brain 127.0.0.1:7000 --port-file /tmp/netd.port \
+    --libcov "$PWD/build/x86_64/libcov_st.so:$PWD/build/x86_64/libdemalloc.so" \
+    --patchlist /tmp/n.lcv --boundary /tmp/n.lcvb --shm /tmp/relaycov \
+    -- $PWD/build/x86_64/target_netd /tmp/netd.port
+# 6. Watch it live, afl-style: have the brain write a status feed and render it.
+#    Add `--status-file /tmp/fuzz.jsonl` to the brain (step 4), then:
+python3 tools/status_tui.py --input /tmp/fuzz.jsonl --artifacts ./out/crashes
+```
+
+**Fuzzing essentials the demos below don't show (do these):**
+- **Fuzz a sequence, not one buffer.** For a stateful protocol (a
+  login-then-commands session, an HTTP/1.1 keep-alive connection, any
+  handshake-then-messages flow) mutate the *whole session* — the ordered list
+  of messages — not just a trailing payload. One fixed handshake + one mutated
+  tail reaches only a sliver of the state machine.
+- **Keep a disk corpus and resume.** Save every new-coverage input to a seed
+  directory and reload it on start. An in-memory-only corpus throws away the
+  campaign on every restart.
+- **Triage-ready crashes.** Save the full input/session that crashed (plus the
+  config to replay it), then minimize it — a bare 64 KB payload with no
+  transcript is expensive to debug. Dedup by crash site/coverage so one bug
+  doesn't fill the directory with hundreds of copies.
+- **Vary the target's invocation.** Fuzz more than one argv/config/entry path;
+  a single fixed invocation leaves most of the binary's attack surface unreached.
+- **Input size:** leave mutate.py's 64 KB `--max-size` default; don't cap at
+  ~1 KB. The `1023` you see near `fuzz_driver` is stdin line-framing, not a
+  recommended size.
+
+### Recipe 1 — One-shot coverage sanity check (NOT a fuzzing setup)
+
+> This reads cumulative coverage with the *weakest* knobs (`oneshot`, one
+> process per input, no boundaries). It is a "did instrumentation fire" check,
+> not a fuzzer — to fuzz, use the Fuzzing recipe above.
 
 ```bash
 make
@@ -908,7 +1021,7 @@ for input in 1 2 3 42; do
 done
 ```
 
-### Recipe 2 — Long-running stdin loop, per-iteration coverage, local
+### Recipe 2 — Long-running stdin loop, per-iteration coverage, local (persistent model)
 
 ```bash
 make
@@ -979,10 +1092,12 @@ ssh dev 'cat /dev/shm/cov' > /tmp/dev_cov.raw
 ---
 
 <a name="14-tooling"></a>
-## 14. Optional tooling
+## 14. Fuzzing tooling
 
-None of this is needed for basic coverage collection, and none of it is
-built by `make` (the relay has its own goal).
+Not needed for a bare one-off coverage reading, but **most of this is exactly
+what you want for a fuzzing campaign** — the remote relay/brain, the heap-bug
+oracle, and the mutation engine. None of it is built by plain `make`; build
+the pieces you need with `make tools` / `make -C tools relay` as shown below.
 
 <a name="14-1-remote"></a>
 ### 14.1 Remote fuzzing: `suzzer-relay` + the brain
@@ -1015,10 +1130,11 @@ Run the brain off-device and the relay on the device. The brain listens; the
 relay dials in. **The brain runs in the foreground and blocks**, so start it
 in another terminal or in the background, then start the relay within its
 `--accept-timeout` (default 15 s). It prints the port it bound (pass port
-`0` for an ephemeral one), runs every seed once plus `--iters` (default 200)
-mutated inputs, then exits. A missing or empty `--seeds` directory falls back
-to built-in seeds with a warning. `--io-timeout` (default 60 s) bounds the
-wait for each relay reply.
+`0` for an ephemeral one), runs the corpus once, then mutates **until you stop
+it** (`--iters N` caps the run only if you ask; default 0 = open-ended). It
+keeps a **resumable on-disk corpus** under `<out>/corpus` (reloaded on the next
+start) and a built-in-seed fallback if `--seeds` is missing/empty.
+`--io-timeout` (default 60 s) bounds the wait for each relay reply.
 
 ```bash
 # Brain (off-device), backgrounded so the relay can be started next.
@@ -1034,8 +1150,11 @@ python3 tools/suzzer_brain.py --listen 0.0.0.0:7000 --seeds ./seeds --out ./out 
     -- $PWD/build/x86_64/target_netd /tmp/netd.port
 ```
 
-The brain writes crashing inputs to `./out/crashes/` and logs each input that
-reached new coverage. One `INPUT` gets exactly one `COVERAGE` or `CRASH` reply
+The brain saves each new crash to `./out/crashes/` as the **minimized input
+plus a `.info` sidecar** (reason, status, size, hex for replay), **deduplicated
+by crash signature** so one bug does not pile up hundreds of files; and it
+persists every new-coverage input to `./out/corpus/`. One `INPUT` gets exactly
+one `COVERAGE` or `CRASH` reply
 (lockstep); the relay also answers a malformed `INPUT` with a `CRASH` frame
 (reason 4, saved by the brain as `crash_<id>_r4_s0`) rather than dropping it, so the brain never waits forever. `--shm` follows the
 same naming rule as `LIBCOV_SHM_PATH` (§10). To point it at your own daemon, give the relay your binary and a
@@ -1043,8 +1162,11 @@ boundary sidecar for your handler's entry/exit, and make sure the daemon binds
 a port it writes to `--port-file` (or adapt the relay's delivery to your
 transport). `test/run_validation_relay.sh` runs this whole path on loopback.
 
-**Scope:** single-process daemon, plain TCP (no auth), one input in flight.
-Fork-per-connection daemons and encryption are out of scope (see TODO.md).
+**Scope:** this relay template drives a single-process daemon over plain TCP
+(no auth), one input in flight. Fork-per-connection daemons are still fuzzable —
+drive one connection per process with per-process coverage regions; see
+[Pattern C](#9-remote). Encryption/auth transports need you to adapt the
+relay's `deliver`.
 
 ### 14.2 Other tools
 
@@ -1057,10 +1179,34 @@ Fork-per-connection daemons and encryption are out of scope (see TODO.md).
   ```
   Other flags: `--max-size`, `--seed-rng`, `--splice-from`, `--splice-prob`,
   `--weights`, `--trace`, `--selftest`.
-- **Heap-bug catcher — [`tools/libdemalloc.c`](tools/libdemalloc.c).** An
-  opt-in `LD_PRELOAD` allocator, a "poor man's ASan": guard pages, an
-  underflow canary, and a bounded quarantine that catches UAF and
-  double-free while keeping memory use bounded for daemons. Build it with
+- **Status board — [`tools/status_tui.py`](tools/status_tui.py).** A generic,
+  target-agnostic afl/afl++-style live status screen (the boxed process-timing /
+  overall-results / map-coverage / findings panels, plus a coverage chart and an
+  event feed). It is a **template you copy**: it reads a simple JSON-lines status
+  feed (one object per line — `t`, `execs`, `corpus`, `edges`, `map_size`,
+  `crashes`, `crashes_unique`, `config{}`, and `event{}` entries; full key list
+  in the file header), so any fuzzer that prints those lines gets the board for
+  free — or you replace the one small parser (see the "ADAPT ME" block) to read
+  your own log format, keeping `render()` unchanged. suzzer's reference brain
+  emits the feed directly:
+  ```bash
+  # produce a feed from the reference brain, render it live:
+  python3 tools/suzzer_brain.py --listen … --seeds … --status-file /tmp/fuzz.jsonl &
+  python3 tools/status_tui.py --input /tmp/fuzz.jsonl --artifacts ./out/crashes
+  # or just see the layout with no fuzzer at all:
+  python3 tools/status_tui.py --demo         # synthetic data
+  python3 tools/status_tui.py --selftest     # render checks, exits 0
+  ```
+  `--dump` prints one text frame (no curses) for CI / tty-less use; `--input -`
+  reads the JSON feed from stdin.
+- **Heap-bug oracle — [`tools/libdemalloc.c`](tools/libdemalloc.c). Load this
+  whenever you are bug-finding.** Without it, the only bugs you catch are the
+  ones that happen to hit an unmapped page; most heap overflows and
+  use-after-frees die silently. It is an `LD_PRELOAD` allocator, a "poor man's
+  ASan": guard pages, an underflow canary, and a bounded quarantine that
+  catches UAF and double-free while keeping memory use bounded for daemons.
+  Co-load it with libcov: `LD_PRELOAD="$PWD/build/<arch>/libcov_st.so:$PWD/build/<arch>/libdemalloc.so"`.
+  Build it with
   `make tools [ARCH=…]`, which writes `build/<arch>/libdemalloc.so`. Tune it
   at compile time, e.g.
   `make tools EXTRA_CFLAGS='-DLIBDEM_QUARANTINE_SLOTS=128'`. Load it

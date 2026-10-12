@@ -1,39 +1,57 @@
 #!/usr/bin/env python3
 """suzzer_brain.py -- off-device coverage-guided fuzzing brain.
 
-Reference "brain" for the remote fuzzing template. It listens for one
-suzzer-relay connection (the relay dials in from the device), then runs a
-coverage-guided loop entirely off the device:
+Reference "brain" for the remote fuzzing template, and a worked example of a
+*strong-by-default* coverage-guided loop. The relay (tools/suzzer-relay.c)
+dials in from the device; everything below runs off-device:
 
   - mutates inputs with tools/mutate.py (Engine);
   - sends each input to the relay, which delivers it to the target daemon and
     returns one COVERAGE (or CRASH) frame;
   - folds the returned bitmap into a cumulative map, keeps inputs that reached
-    new coverage in the corpus, and saves crashing inputs.
+    new coverage, and saves + triages crashing inputs.
+
+What makes this a fuzzing setup rather than a coverage dump (copy these
+choices; do not strip them back out):
+
+  * Runs **until you stop it** (Ctrl-C / SIGTERM). `--iters N` caps the run
+    only if you ask; the default (0) is an open-ended campaign.
+  * Keeps a **disk-backed corpus** under <out>/corpus and **reloads it on
+    start**, so a restart resumes the campaign instead of throwing it away.
+  * Saves each crash as the **full input plus a .info sidecar** (reason,
+    status, size, hex) so it can be replayed, and **deduplicates** by crash
+    signature so one bug does not fill the directory with hundreds of copies.
+  * **Minimizes** a newly-found crash (bounded block-dropping) before saving.
+  * Default `--max-size` is 64 KB -- a real input budget, not a 1 KB stub.
+    (The 64 KB is an input-size cap; it is unrelated to the coverage map size.)
+
+Pair it with the heap oracle: start the relay with libdemalloc co-loaded in
+its --libcov argument (a colon list), so heap overflows/UAFs that would die
+silently become visible CRASH frames.
 
 Protocol: tools/relay_proto.h. The relay decodes the shm header on the device,
 so this never parses a foreign-ABI header -- it receives map_size plus raw
 uint8 counters.
 
-This is a readable reference, not a production fuzzer (no scheduler, no corpus
-minimisation, no crash triage). Swap in AFL++ or your own loop as needed.
-
 Usage:
   suzzer_brain.py --listen HOST:PORT --seeds DIR [--out DIR]
-                  [--iters N] [--seed-rng N] [--accept-timeout S]
-                  [--io-timeout S] [--quiet]
+                  [--iters N] [--max-size N] [--no-minimize]
+                  [--seed-rng N] [--accept-timeout S] [--io-timeout S] [--quiet]
 
-Runs in the foreground: start it first (backgrounded, or in another
-terminal), then start suzzer-relay within --accept-timeout seconds. It exits
-after the seeds plus --iters mutated inputs. A missing or empty --seeds
-directory falls back to built-in seeds.
+Start it first (backgrounded, or in another terminal), then start
+suzzer-relay within --accept-timeout seconds. A missing or empty --seeds
+directory falls back to built-in seeds (plus any resumed corpus).
 """
 import argparse
+import hashlib
+import json
 import os
 import random
+import signal
 import socket
 import struct
 import sys
+import time
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -70,13 +88,25 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--listen", required=True, help="HOST:PORT to listen on")
     ap.add_argument("--seeds", required=True, help="directory of seed inputs")
-    ap.add_argument("--out", default=None, help="output dir (crashes, corpus)")
-    ap.add_argument("--iters", type=int, default=200, help="mutation execs")
+    ap.add_argument("--out", default=None,
+                    help="output dir (holds crashes/ and the resumable corpus/)")
+    ap.add_argument("--iters", type=int, default=0,
+                    help="stop after N mutated execs (0 = run until stopped)")
+    ap.add_argument("--max-size", type=int, default=65536,
+                    help="max mutated input bytes (default 65536; an input "
+                         "budget, not a protocol limit -- do not shrink to ~1KB)")
+    ap.add_argument("--no-minimize", dest="minimize", action="store_false",
+                    help="skip crash minimization (on by default)")
     ap.add_argument("--seed-rng", type=int, default=0xC0FFEE)
     ap.add_argument("--accept-timeout", type=float, default=15.0,
                     help="seconds to wait for the relay to connect")
     ap.add_argument("--io-timeout", type=float, default=60.0,
                     help="seconds to wait for each relay reply (0 = forever)")
+    ap.add_argument("--status-file",
+                    help="append a JSON-lines status feed here for a live "
+                         "status board (watch with tools/status_tui.py --input)")
+    ap.add_argument("--status-interval", type=float, default=1.0,
+                    help="seconds between status snapshots (default 1.0)")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
@@ -86,23 +116,59 @@ def main():
                  % args.listen)
     out = args.out or os.path.join(os.getcwd(), "suzzer_out")
     crash_dir = os.path.join(out, "crashes")
+    corpus_dir = os.path.join(out, "corpus")
     os.makedirs(crash_dir, exist_ok=True)
-
-    seeds = []
-    if not os.path.isdir(args.seeds):
-        print("brain: WARNING: seed directory %r does not exist; using built-in seeds"
-              % args.seeds, file=sys.stderr)
-    for name in (sorted(os.listdir(args.seeds)) if os.path.isdir(args.seeds) else []):
-        p = os.path.join(args.seeds, name)
-        if os.path.isfile(p):
-            with open(p, "rb") as f:
-                seeds.append(f.read())
-    if not seeds:
-        seeds = [b"A", b"B", b"C"]
+    os.makedirs(corpus_dir, exist_ok=True)
 
     def log(*a):
         if not args.quiet:
             print("brain:", *a, flush=True)
+
+    # ---- load seeds, and RESUME any previously-saved corpus --------------
+    def load_dir(d):
+        out_list = []
+        for name in (sorted(os.listdir(d)) if os.path.isdir(d) else []):
+            p = os.path.join(d, name)
+            if os.path.isfile(p) and not name.endswith(".info"):
+                with open(p, "rb") as f:
+                    out_list.append(f.read())
+        return out_list
+
+    if not os.path.isdir(args.seeds):
+        print("brain: WARNING: seed directory %r does not exist; using built-in seeds"
+              % args.seeds, file=sys.stderr)
+    seeds = load_dir(args.seeds)
+    resumed = load_dir(corpus_dir)
+    if resumed:
+        log("resumed %d inputs from %s" % (len(resumed), corpus_dir))
+    # de-dup by content so reload is idempotent
+    seen_inputs = set()
+    corpus = []
+    for data in seeds + resumed:
+        h = hashlib.sha1(data).digest()
+        if h not in seen_inputs:
+            seen_inputs.add(h)
+            corpus.append(data)
+    if not corpus:
+        corpus = [b"A", b"B", b"C"]
+
+    def save_corpus_input(data):
+        """Persist a new-coverage input so the campaign is resumable."""
+        h = hashlib.sha1(data).hexdigest()
+        if h in save_corpus_input.seen:
+            return
+        save_corpus_input.seen.add(h)
+        with open(os.path.join(corpus_dir, "cov_%s" % h[:16]), "wb") as f:
+            f.write(data)
+    save_corpus_input.seen = set(hashlib.sha1(d).hexdigest() for d in corpus)
+
+    # ---- stop cleanly on Ctrl-C / SIGTERM (campaign state is on disk) ----
+    stop = {"flag": False}
+
+    def _stop(_signum, _frame):
+        stop["flag"] = True
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
 
     # ---- accept one relay ----
     lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -129,9 +195,13 @@ def main():
     ver, flags, map_size, ring_size, arch_len = struct.unpack(">HHIHH", payload[:12])
     arch = payload[12:12 + arch_len].decode("ascii", "replace")
     if flags & 0x4:   # SZR_HELLO_FLAG_SCHEME (relay_proto.h)
+        ngram = (flags >> 8) & 0xf
         scheme = "n=%d model=%s rotate=%d" % (
-            (flags >> 8) & 0xf, "pc" if flags & 0x8 else "site",
+            ngram, "pc" if flags & 0x8 else "site",
             1 if flags & 0x10 else 0)
+        if ngram < 3:
+            log("NOTE: coverage scheme is n=%d; for fuzzing rebuild libcov with "
+                "-DLIBCOV_NGRAM_N=3 -DLIBCOV_NGRAM_ROTATE=1 (path-sensitive)" % ngram)
     else:
         scheme = "unknown"
     log("HELLO proto=%d arch=%s map_size=%d ring=%d flags=0x%x scheme=%s"
@@ -139,15 +209,50 @@ def main():
 
     cumulative = bytearray(map_size)
     rng = random.Random(args.seed_rng)
-    corpus = list(seeds)
 
     def splice_donor():
         return rng.choice(corpus) if corpus else b""
 
-    engine = Engine(rng, corpus=splice_donor, max_size=max(64, map_size))
+    engine = Engine(rng, corpus=splice_donor, max_size=args.max_size)
 
     execs = new_cov = crashes = 0
-    next_id = 1
+    crash_sigs = {}        # (reason, status) -> count; the dedup key
+    next_id = [1]
+
+    # ---- optional JSON-lines status feed (for tools/status_tui.py) -------
+    start = time.monotonic()
+    status_fp = open(args.status_file, "a", buffering=1) if args.status_file else None
+    last_status = [0.0]
+
+    def emit_status(finished=False):
+        if not status_fp:
+            return
+        el = time.monotonic() - start
+        edges = sum(1 for b in cumulative if b)
+        status_fp.write(json.dumps({
+            "t": round(el, 1), "execs": execs,
+            "execs_per_sec": round(execs / el, 1) if el > 0 else 0.0,
+            "corpus": len(corpus), "edges": edges, "map_size": map_size,
+            "new_edges": edges, "crashes": crashes,
+            "crashes_unique": len(crash_sigs), "stage": "havoc + splice",
+            "finished": finished,
+            "config": {"arch": arch, "max_size": args.max_size,
+                       "minimize": str(bool(args.minimize))},
+        }) + "\n")
+
+    def emit_event(kind, msg, edges=None):
+        if not status_fp:
+            return
+        ev = {"kind": kind, "msg": msg}
+        if edges is not None:
+            ev["edges"] = edges
+        status_fp.write(json.dumps({"event": ev}) + "\n")
+
+    def maybe_status():
+        now = time.monotonic()
+        if now - last_status[0] >= args.status_interval:
+            emit_status()
+            last_status[0] = now
 
     def fold(bitmap):
         """Merge bitmap into cumulative; return count of newly-set bytes."""
@@ -158,55 +263,124 @@ def main():
                 newly += 1
         return newly
 
-    def run_one(data):
-        nonlocal execs, new_cov, crashes, next_id
-        ident = next_id
-        next_id += 1
+    def probe(data):
+        """Send one input, return a parsed result with no accounting:
+        ('crash', reason, status) | ('iter', bitmap) | ('other', None)."""
+        ident = next_id[0]
+        next_id[0] += 1
         send_frame(conn, SZR_INPUT, struct.pack(">QI", ident, len(data)) + data)
         ftype, payload = recv_frame(conn)
-        execs += 1
         if ftype == SZR_CRASH:
-            cid, reason, status = struct.unpack(">QBi", payload[:13])
-            crashes += 1
-            name = "crash_%06d_r%d_s%d" % (cid, reason, status)
-            with open(os.path.join(crash_dir, name), "wb") as f:
-                f.write(data)
-            log("CRASH id=%d reason=%d status=%d (saved %s)"
-                % (cid, reason, status, name))
-            return
+            _cid, reason, status = struct.unpack(">QBi", payload[:13])
+            return ("crash", reason, status)
         if ftype != SZR_COVERAGE:
-            log("unexpected frame type %d" % ftype)
+            return ("other", None)
+        _cid, _gen, kind, msz = struct.unpack(">QQBI", payload[:21])
+        if kind != SLOT_ITER:      # only score per-request (ITER) coverage
+            return ("other", None)
+        return ("iter", payload[21:21 + msz])
+
+    def minimize(data, reason):
+        """Bounded block-dropping: shrink `data` while it still crashes with
+        the same reason. A readable tmin, not an optimal one."""
+        if not args.minimize or len(data) <= 1:
+            return data
+        best = data
+        chunk = max(1, len(best) // 2)
+        budget = 200                      # cap re-sends so minimize stays cheap
+        while chunk >= 1 and budget > 0:
+            i = 0
+            while i < len(best) and budget > 0:
+                cand = best[:i] + best[i + chunk:]
+                budget -= 1
+                if cand and probe(cand)[:2] == ("crash", reason):
+                    best = cand           # drop kept the crash
+                else:
+                    i += chunk
+            chunk //= 2
+        return best
+
+    def save_crash(data, reason, status):
+        nonlocal crashes
+        crashes += 1
+        sig = (reason, status)
+        n = crash_sigs.get(sig, 0) + 1
+        crash_sigs[sig] = n
+        if n > 1:                         # already have this bug -> don't flood
+            log("CRASH id=%d reason=%d status=%d dup (count=%d, not saved)"
+                % (crashes, reason, status, n))
             return
-        cid, gen, kind, msz = struct.unpack(">QQBI", payload[:21])
-        bitmap = payload[21:21 + msz]
-        if kind != SLOT_ITER:          # only score per-request (ITER) coverage
+        data = minimize(data, reason)
+        name = "crash_r%d_s%d_%s" % (reason, status,
+                                     hashlib.sha1(data).hexdigest()[:12])
+        with open(os.path.join(crash_dir, name), "wb") as f:
+            f.write(data)
+        with open(os.path.join(crash_dir, name + ".info"), "w") as f:
+            f.write("reason=%d\nstatus=%d\nlen=%d\nsig=r%d/s%d\nhex=%s\n"
+                    % (reason, status, len(data), reason, status, data.hex()))
+        log("CRASH id=%d reason=%d status=%d NEW len=%d (saved %s)"
+            % (crashes, reason, status, len(data), name))
+        emit_event("crash", "r%d/s%d %s" % (reason, status, name))
+
+    def run_one(data):
+        nonlocal execs, new_cov
+        kind, a, b = _unpack3(probe(data))
+        execs += 1
+        if kind == "crash":
+            save_crash(data, a, b)
             return
-        newly = fold(bitmap)
-        if newly:
-            new_cov += 1
-            corpus.append(data)
-            log("new coverage +%d (corpus=%d) from %r" % (newly, len(corpus), data[:24]))
+        if kind == "iter":
+            newly = fold(a)
+            if newly:
+                new_cov += 1
+                corpus.append(data)
+                save_corpus_input(data)
+                log("new coverage +%d (corpus=%d) from %r"
+                    % (newly, len(corpus), data[:24]))
+                emit_event("find", "corpus=%d" % len(corpus), edges=newly)
 
     try:
-        # ---- baseline: run every seed once ----
-        for s in seeds:
+        # ---- baseline: run the resumed corpus once ----
+        emit_status()
+        for s in list(corpus):
+            if stop["flag"]:
+                break
             run_one(s)
-        # ---- fuzz: mutate corpus entries ----
-        for _ in range(args.iters):
+            maybe_status()
+        # ---- fuzz: mutate corpus entries until stopped (or --iters) ----
+        mutated = 0
+        while not stop["flag"]:
+            if args.iters and mutated >= args.iters:
+                break
             base = rng.choice(corpus) if corpus else b"\n"
             run_one(engine.mutate(base))
+            mutated += 1
+            maybe_status()
     except socket.timeout:
         sys.exit("brain: relay sent no reply within %gs (--io-timeout)"
                  % args.io_timeout)
     except ConnectionError as e:
         sys.exit("brain: %s" % e)
 
-    send_frame(conn, SZR_BYE)
+    try:
+        send_frame(conn, SZR_BYE)
+    except OSError:
+        pass
     total = sum(1 for b in cumulative if b)
-    log("done: execs=%d new_cov=%d crashes=%d corpus=%d edges=%d"
-        % (execs, new_cov, crashes, len(corpus), total))
+    log("done: execs=%d new_cov=%d crashes=%d (unique=%d) corpus=%d edges=%d"
+        % (execs, new_cov, crashes, len(crash_sigs), len(corpus), total))
+    emit_status(finished=True)
+    if status_fp:
+        status_fp.close()
     conn.close()
     lsock.close()
+
+
+def _unpack3(t):
+    """Normalize a 2- or 3-tuple probe() result to (kind, a, b)."""
+    if len(t) == 3:
+        return t
+    return (t[0], t[1], None)
 
 
 if __name__ == "__main__":

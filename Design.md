@@ -372,7 +372,11 @@ tools/
   suzzer-relay.c, relay_proto.h
                         on-device coverage relay for remote fuzzing; `make -C
                         tools relay` (§24)
-  suzzer_brain.py       off-device reference fuzzing brain (§24)
+  suzzer_brain.py       off-device reference fuzzing brain (§24);
+                        --status-file emits a JSON-lines feed for status_tui.py
+  status_tui.py         generic target-agnostic afl-style status board; reads a
+                        JSON-lines status feed (or an adapted parser); a copy-me
+                        template (render() + Status model + JSON adapter)
   inject/               standalone live-process injector (own Makefile,
                         README and Design.md)
 

@@ -14,6 +14,29 @@ threading variants are built as separate LEGO bricks:
 Both variants share the same 8 backends, which cover 11 architectures. Pick the
 brick that fits your target.
 
+## Collecting coverage vs building a fuzzer (read this first)
+
+This library has two very different uses, and they want different settings.
+**Most readers who end up here are building a fuzzer.** If that's you, copy the
+right-hand column below. The left column is only a quick "did my instrumentation
+fire" sanity check — it is **not** a fuzzing configuration and it will miss bugs.
+
+| | Quick coverage sanity check | **Effective fuzzing campaign (use this)** |
+|---|---|---|
+| Per-trap mode | `LIBCOV_MODE=oneshot` | `LIBCOV_MODE=leapfrog` (the default) |
+| Coverage scheme (build-time) | default `N=2` | **`-DLIBCOV_NGRAM_N=3 -DLIBCOV_NGRAM_ROTATE=1`** (ordered 3-gram) |
+| Per-input coverage | cumulative, one process per input | boundary markers + `LIBCOV_BOUNDARY_REARM=all` (or `touched`) |
+| Execution | fork+exec a fresh process per input | **persistent driver** (`fuzz_driver` / `suzzer-relay`); the target stays up |
+| Bug oracle | none (only raw crashes) | **co-load `libdemalloc.so`** in `LD_PRELOAD` ("poor man's ASan") |
+| Corpus | throwaway | **disk-backed seed dir, saved + reloaded = resumable** |
+| Crashes | — | save the **full input / session**, then minimize |
+| Max input size | n/a | leave mutate.py's **64 KB** default; do **not** cap at 1 KB |
+
+The complete copy-pasteable strong recipe (build + run + corpus + crashes) is
+[**HOWTO.md Recipe 1 — Fuzz a target**](HOWTO.md). Every weak knob's bug-finding
+cost is called out inline below under [Coverage scheme](#coverage-scheme-n-gram)
+and [Modes](#modes) — read those before reaching for the "fastest/cheapest" option.
+
 ## Idea
 
 Replace selected instructions in a target binary with an architecture's
@@ -151,6 +174,12 @@ in the host environment as well would load an aarch64 `.so` into the host
 qemu process. For a native target, drop qemu and set
 `LD_PRELOAD=$PWD/build/<arch>/libcov_st.so` directly.
 
+This Quick start only *collects coverage*. **Building a fuzzer?** Build with
+the ordered-3-gram flags, run with `LIBCOV_MODE=leapfrog`, drive the target
+with a persistent driver, and co-load `libdemalloc.so` — the full recipe is
+[HOWTO.md Recipe 1 — Fuzz a target](HOWTO.md), and the knob summary is in
+[Collecting coverage vs building a fuzzer](#collecting-coverage-vs-building-a-fuzzer-read-this-first).
+
 The shm region (header + bitmap + snapshot ring) is written to `/tmp/cov`
 (or whatever path `LIBCOV_SHM_PATH` points at). `test/shm_bitmap.py
 stats|extract|gen|scheme <region> [out]` reads it. An external fuzzer mmaps
@@ -273,7 +302,7 @@ module you want instrumented its own root.
 | `LIBCOV_REQUIRE` | unset | Any non-empty value other than `0`: abort the process if libcov ends up inert or any init step fails (unset patch list, unresolvable module, trap self-test failure, refused boundary config). Off by default because children that inherit `LD_PRELOAD` are usually meant to run inert. |
 | `LIBCOV_SHM_PATH` | `/libcov_<pid>` | Bitmap path. No `/` other than an optional leading one (`/cov`, `cov`) → `shm_open`, i.e. `/dev/shm/cov`; anything with a non-leading `/` (`/tmp/cov`, `./cov`) is a filesystem path. Init logs the resolved location. If `shm_open` fails, falls back to `$TMPDIR/<name>` (or `/tmp`); a filesystem path has no fallback. `%p` expands to the pid (`%%` to `%`), giving each process of a forking/re-execing daemon its own region. See "Re-exec and fork+exec". |
 | `LIBCOV_ST_PATCH` | `auto` | `libcov_st.so` only. `auto`: make patched code pages `R|W|X` once at init, so arming/disarming is a plain store (no syscalls per trap, about 3x faster in leapfrog); falls back to `mprotect` if the kernel refuses `R|W|X`; unknown values mean `auto`. `mprotect`: two `mprotect` calls per arm/disarm, code pages never writable and executable at once. |
-| `LIBCOV_MODE` | `leapfrog` | `oneshot` (each site fires once, fastest) or `leapfrog` (re-arm previous site each trap; gives approximate hit counts). Any value other than exactly `oneshot` means leapfrog; a value that is neither `oneshot` nor `leapfrog` (a typo) also logs a WARNING. |
+| `LIBCOV_MODE` | `leapfrog` | `oneshot` (each site fires once, fastest, path-blind after warmup) or `leapfrog` (re-arm previous site each trap; gives approximate hit counts). **For fuzzing keep the default `leapfrog`** (see [Modes](#modes)); `oneshot` is for one-off sanity checks only. Any value other than exactly `oneshot` means leapfrog; a value that is neither `oneshot` nor `leapfrog` (a typo) also logs a WARNING. |
 | `LIBCOV_MODULE` | the main executable | Module name for boundary-mode sidecar resolution only. The patch list itself carries its own module name table (LCV3) so this only affects `LIBCOV_BOUNDARY_LIST` lookups. A bare name or an absolute path, as for `LIBCOV_MODULE_RENAME`. |
 | `LIBCOV_MODULE_RENAME` | unset | `old=new[,old=new…]`: resolve patch-list module `old` as `new`. For a binary run under another name than it was generated from (`target=target.stripped`), or, with an absolute path as `new`, to pick one of several mapped files with the same basename. |
 | `LIBCOV_LOG` | unset (stderr) | Diagnostic log. If the file can't be opened, one line saying so goes to stderr and logging stays on stderr. Never written from the signal handler; after init, only while the fd still refers to the same non-socket file (see Hardening). |
@@ -296,7 +325,12 @@ a bucket index:
   `next_pow2(n_sites * LIBCOV_MAP_FUDGE)` (clamped by
   `LIBCOV_MAP_MIN_POW2`/`MAX_POW2`, never below `next_pow2(n_sites)`),
   so at N=1 there are zero collisions. At N>=2 the history is folded in
-  and collisions become possible again. The default `LIBCOV_MAP_FUDGE`
+  and collisions become possible again. (Do not read "zero collisions at
+  N=1" as "N=1 is best" — N=1 is `idx = cur`, so `A->B` and `C->B` are
+  indistinguishable and you lose *all* edge/path sensitivity. For fuzzing
+  use N>=3; a modest, fudge-compensated collision rate is the price of
+  telling paths apart, and telling paths apart is what finds bugs.) The
+  default `LIBCOV_MAP_FUDGE`
   scales with `LIBCOV_NGRAM_N` (2 at N=1, 16 at N=2, doubling per extra
   position: 64 at N=4, 1024 at N=8); `-DLIBCOV_MAP_FUDGE=` replaces it.
   Init logs the fudge, the buckets per site and an expected collision
@@ -315,20 +349,21 @@ drivers, and the snapshot ring need no changes.
 
 | `LIBCOV_NGRAM_N` | Scheme            | Index formula                                  | When to use                                 |
 |------------------|-------------------|------------------------------------------------|---------------------------------------------|
-| `1`              | Block coverage    | `idx = cur`                                    | Lowest overhead; "did this block run" only. |
+| `1`              | Block coverage    | `idx = cur`                                    | Lowest overhead, but **path-blind** (no edges). Sanity checks only — **misses bugs when fuzzing**. |
 | `2` (**default**)| AFL-style edges   | `idx = cur ^ prev[0]`                          | Hashed-PC model: bit-identical to historical libcov. |
-| `3..8`           | N-gram coverage   | `idx = cur ^ prev[0] ^ ... ^ prev[N-2]`        | Path-sensitive; distinguishes loop trips, dispatch sequences, and call-chain variants the same edge map collapses. |
+| `3..8`           | N-gram coverage   | `idx = cur ^ prev[0] ^ ... ^ prev[N-2]`        | **Recommended for fuzzing.** Path-sensitive; distinguishes loop trips, dispatch sequences, and call-chain variants the same edge map collapses. |
 
 ```sh
-# Block coverage (cheapest):
-make EXTRA_CFLAGS='-DLIBCOV_NGRAM_N=1'
+# Ordered 3-gram -- RECOMMENDED FOR FUZZING. Path-sensitive; rotation defeats
+# A,B,C == B,A,C history-permutation collisions:
+make EXTRA_CFLAGS='-DLIBCOV_NGRAM_N=3 -DLIBCOV_NGRAM_ROTATE=1'
 
-# 4-gram coverage:
-make EXTRA_CFLAGS='-DLIBCOV_NGRAM_N=4'
-
-# 8-gram with per-position rotation (defeats A,B,C == B,A,C history-permutation collisions;
-# recommended for any N >= 3):
+# Wider window (8-gram, rotated) for deeper path sensitivity at higher cost:
 make EXTRA_CFLAGS='-DLIBCOV_NGRAM_N=8 -DLIBCOV_NGRAM_ROTATE=1'
+
+# Block coverage (cheapest, PATH-BLIND) -- instrumentation sanity checks only,
+# not a fuzzing setup:
+make EXTRA_CFLAGS='-DLIBCOV_NGRAM_N=1'
 ```
 
 Cost is roughly `N-1` extra XORs and `N-1` TLS stores per emit — well
@@ -347,16 +382,24 @@ Two orthogonal axes:
 **Per-trap mode** (`LIBCOV_MODE`)
 
 - `oneshot` -- On the first trap at site X, restore the original
-  instruction and leave it alone. Fastest; gives "edge-was-reached"
-  coverage with no hit-count. Recommended for the corpus-explore phase
-  of fuzzing. Safe under `libcov_mt.so`, and under `libcov_st.so` for
-  single-threaded targets only (see Leapfrog below).
+  instruction and leave it alone. Fastest, but each site fires at most
+  once for the life of the process, so you get a plain "edge-was-reached"
+  set with no hit-counts and (without boundary re-arm) no per-input
+  coverage. **Bug-finding cost: once a block has been seen, a mutation
+  that drives it down a new path looks identical to one that changes
+  nothing — the fuzzer goes blind and stops making progress.** Use it for
+  a one-off "did instrumentation fire" check, *not* for fuzzing. Safe
+  under `libcov_mt.so`, and under `libcov_st.so` for single-threaded
+  targets only (see Leapfrog below).
 - `leapfrog` -- On trap at X, restore X *and* re-arm the previously
   restored site. Lets the bitmap accumulate hit counts on hot edges
   (approximate: a block that loops straight back to itself stays restored,
   so it counts once per alternation, not once per execution)
   and gives full per-iter edge sets when used with the boundary
-  mechanism. Higher overhead.
+  mechanism. Higher overhead, and **the per-trap mode you want for
+  fuzzing / bug-finding** (pair it with ordered 3-gram, and for a
+  long-running daemon with boundary markers — see
+  [HOWTO Recipe 1](HOWTO.md)).
   - Under `libcov_st.so`: safe only for single-threaded targets.
   - Under `libcov_mt.so`: safe under arbitrary thread counts. Each
     thread leapfrogs through its own TLS `g_last_restored`; per-entry
@@ -442,7 +485,10 @@ Drivers read snapshots via a seqlock pattern:
 exit summary together with `publish_dropped` (MT publishes libcov had
 to drop because a newer generation held the slot), and exits 3 on any
 ring overrun or failed read. Its exit code is not the target's. It feeds
-stdin one line per input (lines over 1023 bytes are split), discards the
+stdin one line per input (lines over 1023 bytes are split — this is
+`fuzz_driver`'s line-framing of stdin, **not** a recommended input-size
+cap; mutate.py defaults to 64 KB inputs and binary protocols should use a
+length-framed path, not newline framing), discards the
 target's stdout, and uses its own region `/tmp/libcov_driver_<pid>`.
 `ring_dump` always exits 0; check its `OVERRUN`/`MISSING` lines instead. `FUZZ_DRIVER_BURST=1` feeds every input before
 reading anything, which makes an overrun of a small ring reproducible.
@@ -929,14 +975,25 @@ tools/
                       dictionaries, user-defined StructuredInsert
                       factories, pre/post hooks, opt-in trace hash;
                       `python3 tools/mutate.py --selftest` to verify;
-                      CLI: --seed F --out DIR [--count N --dict D ...]
+                      CLI: --seed F --out DIR [--count N --dict D
+                      --max-size N ...]  (--max-size default 65536;
+                      do NOT cap at ~1 KB for a fuzzer)
   libdemalloc.c       opt-in LD_PRELOAD heap-bug catcher ("poor man's ASan":
                       guard pages, canary, bounded UAF/double-free
                       quarantine); `make tools` -> build/<arch>/libdemalloc.so
   suzzer-relay.c      on-device coverage relay for remote (over-IP) fuzzing;
   relay_proto.h       `make -C tools relay`. Wire protocol in relay_proto.h.
-  suzzer_brain.py     off-device reference fuzzing brain (mutate + score +
-                      save crashes); pairs with suzzer-relay. See HOWTO §14.1
+  suzzer_brain.py     off-device reference fuzzing brain, strong by default:
+                      mutate + score + resumable on-disk corpus + crash
+                      dedup/minimize; runs until stopped; --status-file writes
+                      a JSON-lines feed for status_tui.py. Pairs with
+                      suzzer-relay. See HOWTO §14.1 and Recipe 1
+  status_tui.py       generic, target-agnostic afl/afl++-style live status
+                      board (boxed timing/results/coverage/findings panels +
+                      coverage chart + event feed). A copy-me template: reads a
+                      JSON-lines status feed (any fuzzer can emit it; or swap
+                      the one parser for your log format, keeping render()).
+                      --demo / --selftest / --dump; see HOWTO §14.2
   inject/             standalone injector that loads libcov into an
                       already-running PID (inject_ptrace: works on x86_64,
                       aarch64 builds but is not runtime-validated, other
