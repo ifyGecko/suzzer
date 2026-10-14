@@ -3,3 +3,6 @@ build/
 # Python bytecode from importing tools/gen_patchlist.py.
 __pycache__/
 test/baremetal/_out/
+
+# Local code-graph tool cache (not part of the project).
+.codegraph/

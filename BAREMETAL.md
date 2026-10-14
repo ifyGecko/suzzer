@@ -40,7 +40,7 @@ code write + I-cache sync, the coverage region, module base, logging and timing.
 
 The default MIPS trap encoding, `MFC0 $0,$0`, only raises Reserved Instruction
 in **user** mode (it is a privileged-op fault). A baremetal image — and most
-RTOSes, including VxWorks — runs in **kernel/supervisor** mode, where `MFC0` is
+kernel-mode RTOSes — run in **kernel/supervisor** mode, where `MFC0` is
 legal and would not trap. The baremetal build therefore overrides the encoding
 with a word that is reserved in every mode on MIPS32:
 
@@ -75,7 +75,6 @@ gdbstub.
 `test/run_validation_baremetal.sh` is a complete, self-contained example: it
 builds the core plus a small instrumented app, boots it under stock
 `qemu-system-mips -M malta` (big-endian 24Kc), and reads coverage back over the
-QEMU gdbstub, asserting determinism and input differentiation. A real firmware
-(for example an AR9330/VxWorks router whose recon gives the RAM map and vector)
-is instrumented the same way — only the macros, the `putc`/`chain` hooks, and
+QEMU gdbstub, asserting determinism and input differentiation. A real firmware image
+(whose recon gives its RAM map and exception vector) is instrumented the same way — only the macros, the `putc`/`chain` hooks, and
 the patch list change.

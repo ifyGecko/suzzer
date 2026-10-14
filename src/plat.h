@@ -104,7 +104,7 @@ static inline unsigned long long *libcov_frame_pcptr(libcov_frame *f) {
  * the exception-vector trampoline at 0x80000180 on baremetal MIPS. The plat
  * calls the shared dispatcher on each trap and uses plat_trap_chain for a
  * trap whose PC is not one of ours (the target's own handler on Linux; the
- * saved VxWorks vector on baremetal). */
+ * firmware's own saved exception handler on baremetal). */
 int  plat_trap_install(void);
 void plat_trap_chain(libcov_frame *f);
 

@@ -10,9 +10,8 @@
  * Example integrations (NOT dependencies of suzzer):
  *   - a QEMU 'malta' test image (see test/baremetal/): defines libcov_bm_putc
  *     for the Malta 16550 UART and sets the arena macros to its RAM map.
- *   - a real firmware (e.g. an AR9330/VxWorks router): sets the module/arena
- *     macros to that image's RECON values and points libcov_bm_putc at its
- *     own UART MMIO.
+ *   - a real firmware image: sets the module/arena macros to that image's
+ *     memory map and points libcov_bm_putc at its own UART MMIO.
  *
  * Memory-map macros (override per target):
  *   LIBCOV_BM_MODULE_LO/HI : address range of the instrumented code (the one
