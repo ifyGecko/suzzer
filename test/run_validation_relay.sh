@@ -112,8 +112,13 @@ ls "$WORK/out/crashes"/* >/dev/null 2>&1 || fail "no crash file saved"
 echo "   OK: planted crash reported (SIGABRT) and saved to crashes/"
 
 # 4. Clean finish with a grown corpus.
+# The planted crash was already verified deterministically in step 3. The
+# brain is a randomized mutator, so the *total* crash-event count is not fixed
+# (it can re-trigger the same one bug from several mutated inputs -- e.g.
+# "crashes=2 (unique=1)"); only "at least one crash was found" is stable here.
 summary=$(grep "done:" "$WORK/brain.log") || fail "brain printed no summary"
-echo "$summary" | grep -q "crashes=1" || fail "expected exactly 1 crash: $summary"
+crashes=$(echo "$summary" | sed -n 's/.*crashes=\([0-9]*\).*/\1/p')
+[[ "${crashes:-0}" -ge 1 ]] || fail "expected at least one crash: $summary"
 edges=$(echo "$summary" | sed -n 's/.* edges=\([0-9]*\).*/\1/p')
 [[ "${edges:-0}" -gt 0 ]] || fail "no cumulative edges recorded: $summary"
 echo "   OK: $summary"
