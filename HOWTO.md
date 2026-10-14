@@ -47,6 +47,7 @@ copy-pasteable. Where a choice exists, this guide tells you how to choose.
 12. [Troubleshooting (symptom → cause → fix)](#12-troubleshooting)
 13. [Worked end-to-end recipes](#13-recipes)
 14. [Fuzzing tooling (relay/brain, heap oracle, mutator, status board, injector)](#14-tooling)
+15. [Baremetal / RTOS targets (no OS, no LD_PRELOAD)](#15-baremetal)
 
 ---
 
@@ -1227,6 +1228,107 @@ relay's `deliver`.
   coverage region exists, `1` attach/dlopen failed, `2` usage error, `3`
   dlopen worked but libcov looks **inert** (no region; re-run with `-L
   <log>` and `-e LIBCOV_REQUIRE=1`). See its README for details.
+
+<a name="15-baremetal"></a>
+## 15. Baremetal / RTOS targets (no OS, no LD_PRELOAD)
+
+Everything above assumes a Linux process: libcov is `LD_PRELOAD`ed and catches
+`SIGILL`. A raw firmware or RTOS image has no userland, no dynamic linker and no
+libc, so libcov takes control a different way — through the CPU's own
+**exception vector** — while reusing the exact same coverage core (sink, patch
+table, ISA decode, LCV3 format). This section is the generic procedure;
+[`test/run_validation_baremetal.sh`](test/run_validation_baremetal.sh) is a
+complete runnable example and [BAREMETAL.md](BAREMETAL.md) is the reference.
+
+Supported today: MIPS32 (`PLAT=baremetal-mips`). The approach generalizes to any
+ISA that has an illegal-instruction exception.
+
+### How it differs from the Linux flow
+
+|                      | Linux userland            | Baremetal (`PLAT=baremetal-mips`)                         |
+|----------------------|---------------------------|-----------------------------------------------------------|
+| take control         | `sigaction(SIGILL)`       | general-exception vector (MIPS `0x80000180`), filter Reserved Instruction |
+| faulting PC          | `ucontext`                | CP0 EPC in the trap frame                                 |
+| inject               | `LD_PRELOAD`              | load the core blob into RAM, call `libcov_init()`         |
+| patch code           | `mprotect` + `clear_cache`| write + `synci`/`sync` (code already lives in RAM)        |
+| coverage bitmap      | POSIX shm                 | a fixed free-RAM region, read over a debug probe / gdbstub |
+| chain foreign faults | the target's handler      | the firmware's own exception handler (a hook)             |
+
+### 15.1 Build the core blob
+
+```
+make baremetal EXTRA_CFLAGS='-DLIBCOV_ARCH_MIPS_ILLEGAL=0x00000038u'
+```
+
+produces `build/baremetal-mips/libcov_core.{elf,bin}`: freestanding,
+`-nostdlib`, self-contained (`nm` shows no undefined symbols).
+
+**The trap encoding matters.** The shipped MIPS default `MFC0 $0,$0` only raises
+Reserved Instruction in *user* mode; a baremetal/RTOS image runs in kernel mode
+where it is a legal CP0 read and would never trap. Use a word reserved in every
+mode — `0x00000038` (DSLL, a 64-bit op, illegal on any MIPS32) — via
+`LIBCOV_ARCH_MIPS_ILLEGAL`.
+
+### 15.2 Describe your target (board-agnostic knobs)
+
+libcov hard-codes nothing about your board. Set the memory map with `-D` flags:
+
+| macro | meaning |
+|---|---|
+| `LIBCOV_BM_MODULE_LO` / `_HI` | address range of the instrumented code |
+| `LIBCOV_BM_ARENA_LO` / `_HI`  | free RAM for the coverage bitmap + scratch (must not overlap the OS, the code, or the loaded blob) |
+| `LIBCOV_BM_EXC_VECTOR`        | general-exception vector (default `0x80000180`, BEV=0) |
+
+and supply, as weak symbols, how to emit a log byte and (for a real OS) how to
+hand a non-libcov exception back to the firmware:
+
+```c
+void libcov_bm_putc(char c);            /* optional: your UART; logging is off the hot path */
+void libcov_bm_chain(libcov_frame *f);  /* a non-RI trap: jump to the OS's own handler */
+```
+
+### 15.3 Generate the patch list from the image
+
+Pick the block / function entry points to instrument and emit an LCV3 patch
+list as a C array (offsets are relative to the module base; sites whose first
+instruction is a branch/jump are skipped automatically):
+
+```
+tools/gen_patchlist_baremetal.py --objdump mips-linux-gnu-objdump \
+    --elf firmware.elf --base 0x80001000 --module fw \
+    --out-c patchlist.c  func_a func_b func_c ...
+```
+
+Compile `patchlist.c` into the blob; it exposes `libcov_bm_patchlist[]` /
+`libcov_bm_patchlist_len`, which `libcov_init()` reads. (No ELF? Point the
+generator at addresses from your disassembler; the on-the-wire LCV3 format is
+documented in [README.md](README.md#patch-list-format-lcv3).)
+
+### 15.4 Load, init, run, read
+
+1. Place the blob in free RAM — over a debug probe, a bootloader command, or by
+   baking it into the image.
+2. Call `libcov_init()` once, **after** the OS has installed its own exception
+   vectors. It arms the sites and installs the libcov trampoline at the vector,
+   saving the firmware's handler to chain non-libcov faults to.
+3. Exercise the firmware. Each armed site raises Reserved Instruction → libcov
+   records an edge, restores the original instruction, and resumes (leapfrog).
+4. Read the bitmap from `libcov_bitmap` (`libcov_map_size` bytes) over your
+   debug probe or the emulator's gdbstub and feed it to a fuzzer like any other
+   coverage map (`libcov_bm_reset()` zeroes it + re-arms between inputs).
+
+### 15.5 Try the worked example
+
+```
+./test/run_validation_baremetal.sh
+```
+
+builds a tiny instrumented image, boots it under stock `qemu-system-mips -M
+malta` (big-endian 24Kc), reads coverage back over the QEMU gdbstub, and asserts
+determinism (a repeated input → identical coverage) and differentiation
+(different inputs → different coverage). It needs the MIPS cross toolchain,
+`qemu-system-mips` and `gdb-multiarch`, skips cleanly if they are absent, and
+depends on no other project.
 
 ---
 

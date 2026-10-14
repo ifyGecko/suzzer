@@ -75,6 +75,29 @@ All backends are validated end-to-end (ST) under `qemu-<arch>-static` by
 `test/run_cross.sh`. MT runtime validation under qemu covers x86_64 and
 aarch64 only; see [Limitations](#limitations).
 
+### Platform backends: Linux userland and baremetal / RTOS
+
+The trap-trampoline mechanism is OS-neutral; *how* libcov takes control on a
+trap is a pluggable **platform** backend (`src/plat.h`, one `plat_<name>.c` per
+build, selected like an arch backend):
+
+| Platform | Takes control via | Injection | Build |
+|---|---|---|---|
+| `linux` (default) | `sigaction(SIGILL)` handler | `LD_PRELOAD` / ELF constructor | the `libcov_*.so` above |
+| `baremetal-mips`  | CPU general-exception vector (Reserved-Instruction filter) | a blob loaded into RAM + `libcov_init()` | `make baremetal` |
+
+The baremetal backend instruments raw firmware / RTOS images that have no
+userland, dynamic linker or libc — coverage is recorded into a free-RAM bitmap
+you read over a debug probe or an emulator's gdbstub. It is board-agnostic: the
+memory map and the UART / exception-chain hooks are the integrator's. See
+**[BAREMETAL.md](BAREMETAL.md)** and the generic walkthrough in
+[HOWTO.md §15](HOWTO.md#15-baremetal).
+
+One MIPS caveat worth repeating: the shipped `MFC0 $0,$0` encoding only faults
+in **user** mode. A baremetal/RTOS image runs in **kernel** mode, where that is
+a legal CP0 read — the baremetal build overrides the encoding with a word
+reserved in every mode (`-DLIBCOV_ARCH_MIPS_ILLEGAL=0x00000038`, DSLL).
+
 ## Build
 
 Prerequisites: `gcc` + `make` to build; `python3` (3.8+), **rizin** and the
@@ -94,6 +117,7 @@ make all-arch THREADING=mt              # MT for all 11 architectures
 make all-variants                       # ST and MT for every architecture
 make test                               # build everything, run every native suite
 make tools                              # opt-in: build/<arch>/libdemalloc.so
+make baremetal                          # freestanding firmware core (PLAT=baremetal-mips)
 ```
 
 Outputs land in `build/<arch>/libcov_<threading>.so`. Plain `make` (either
@@ -1083,6 +1107,7 @@ clears the live bitmap between iterations), and all three viable
 See [TODO.md](TODO.md) for the design backlog. Iteration boundaries,
 multi-module patch lists, multi-threading, re-exec handling and a
 remote (over-IP) fuzzing template (`tools/suzzer-relay.c` +
-`tools/suzzer_brain.py`, HOWTO.md §9 Pattern C and §14.1) are already
-implemented. Still open: daemon lifecycle work, fork-per-connection
+`tools/suzzer_brain.py`, HOWTO.md §9 Pattern C and §14.1) and a baremetal /
+RTOS platform backend (`PLAT=baremetal-mips`; firmware with no OS, see
+[BAREMETAL.md](BAREMETAL.md)) are already implemented. Still open: daemon lifecycle work, fork-per-connection
 daemons (`suzzer-forkserver`), and runtime-selectable N-gram width.
