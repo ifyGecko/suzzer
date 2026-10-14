@@ -37,8 +37,8 @@ const void *libcov_arch_illegal_bytes(uint8_t len) {
                       : (const void *)&k_illegal_w;
 }
 
-uintptr_t libcov_arch_pc_from_uctx(const ucontext_t *uc) {
-    return (uintptr_t)uc->uc_mcontext.__gregs[REG_PC];
+uintptr_t libcov_arch_pc_from_frame(const libcov_frame *f) {
+    return (uintptr_t)libcov_frame_uc(f)->uc_mcontext.__gregs[REG_PC];
 }
 
 static int64_t sext(uint64_t v, unsigned bits) {
@@ -50,7 +50,7 @@ static int64_t sext(uint64_t v, unsigned bits) {
  * compressed C.J, C.JR, C.JALR, C.BEQZ/C.BNEZ, C.NOP. MT patches only the
  * first 2 bytes of a 4-byte instruction (len 2); the upper half is then
  * read from memory. */
-int libcov_arch_emulate(ucontext_t *uc, uintptr_t addr,
+int libcov_arch_emulate(libcov_frame *f, uintptr_t addr,
                         const uint8_t *orig, uint8_t len) {
     if (len != 2 && len != 4) return 0;
     uint16_t h1;
@@ -120,8 +120,9 @@ int libcov_arch_emulate(ucontext_t *uc, uintptr_t addr,
             return 0;
         }
     }
-    if (!uc) return 1;
+    if (!f) return 1;
 
+    ucontext_t *uc = libcov_frame_uc(f);
     unsigned long *x = uc->uc_mcontext.__gregs;        /* x[0] is the PC */
 #define XREG(n) ((n) ? x[(n)] : 0ul)
     uintptr_t pc = next;

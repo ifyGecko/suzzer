@@ -44,8 +44,8 @@ const void *libcov_arch_illegal_bytes(uint8_t len) {
     return k_illegal;
 }
 
-uintptr_t libcov_arch_pc_from_uctx(const ucontext_t *uc) {
-    return (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+uintptr_t libcov_arch_pc_from_frame(const libcov_frame *f) {
+    return (uintptr_t)libcov_frame_uc(f)->uc_mcontext.gregs[REG_RIP];
 }
 
 /* Condition code cc (low nibble of Jcc) against RFLAGS. Even codes are
@@ -70,7 +70,7 @@ static int x86_cond(unsigned cc, uint64_t fl) {
 /* Supported: jmp rel8/rel32, jcc rel8/rel32, endbr64, 2-byte nop
  * (66 90). No prefixes. orig[0..1] is the patched head; the rest of the
  * instruction is read from memory. */
-int libcov_arch_emulate(ucontext_t *uc, uintptr_t addr,
+int libcov_arch_emulate(libcov_frame *f, uintptr_t addr,
                         const uint8_t *orig, uint8_t len) {
     if (len < 2) return 0;
     const uint8_t *code = (const uint8_t *)addr;
@@ -97,7 +97,8 @@ int libcov_arch_emulate(ucontext_t *uc, uintptr_t addr,
     } else {
         return 0;
     }
-    if (!uc) return 1;
+    if (!f) return 1;
+    ucontext_t *uc = libcov_frame_uc(f);
     greg_t *g = uc->uc_mcontext.gregs;
     int taken = cc < 0 || x86_cond((unsigned)cc, (uint64_t)g[REG_EFL]);
     g[REG_RIP] = (greg_t)(taken ? target : next);

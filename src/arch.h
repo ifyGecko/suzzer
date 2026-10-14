@@ -15,8 +15,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include <signal.h>
-#include <ucontext.h>
+#include "plat.h"   /* libcov_frame -- the platform's view of trapped state */
 
 extern const char    *libcov_arch_name;
 extern const uint8_t  libcov_min_patch_len;  /* smallest patchable insn (bytes) */
@@ -39,8 +38,8 @@ void libcov_arch_write_illegal(void *dst, uint8_t len);
  * arm/disarm) and by libcov.c's init-time trap self-test. */
 const void *libcov_arch_illegal_bytes(uint8_t len);
 
-/* PC of the trapped instruction (faulting address). */
-uintptr_t libcov_arch_pc_from_uctx(const ucontext_t *uc);
+/* PC of the trapped instruction (faulting address), read from the frame. */
+uintptr_t libcov_arch_pc_from_frame(const libcov_frame *f);
 
 /* Execute a boundary marker's original instruction in software.
  *
@@ -48,8 +47,8 @@ uintptr_t libcov_arch_pc_from_uctx(const ucontext_t *uc);
  * bytes of the instruction beyond `len` are read from `addr` itself (x86
  * patches only a 2-byte head; the tail is never modified).
  *
- * With uc == NULL: return 1 if the instruction is one this backend can
- * emulate, else 0 (called at init to decide per marker). With uc != NULL:
+ * With f == NULL: return 1 if the instruction is one this backend can
+ * emulate, else 0 (called at init to decide per marker). With f != NULL:
  * perform it on the trapped context -- update the PC (and any register
  * the instruction writes) -- and return 1.
  *
@@ -60,7 +59,7 @@ uintptr_t libcov_arch_pc_from_uctx(const ucontext_t *uc);
  * emulated is never disarmed, so a peer
  * thread can never pass it untrapped (see boundary.c). Backends without
  * support return 0 and markers fall back to disarm + deferred re-arm. */
-int libcov_arch_emulate(ucontext_t *uc, uintptr_t addr,
+int libcov_arch_emulate(libcov_frame *f, uintptr_t addr,
                         const uint8_t *orig, uint8_t len);
 
 #endif

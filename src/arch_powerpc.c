@@ -34,14 +34,15 @@ const void *libcov_arch_illegal_bytes(uint8_t len) {
     return &k_illegal;
 }
 
-uintptr_t libcov_arch_pc_from_uctx(const ucontext_t *uc) {
-    return (uintptr_t)uc->uc_mcontext.uc_regs->gregs[PT_NIP];
+uintptr_t libcov_arch_pc_from_frame(const libcov_frame *f) {
+    return (uintptr_t)libcov_frame_uc(f)->uc_mcontext.uc_regs->gregs[PT_NIP];
 }
 
 /* See arch_ppc_emulate.h for the supported forms. */
-int libcov_arch_emulate(ucontext_t *uc, uintptr_t addr,
+int libcov_arch_emulate(libcov_frame *f, uintptr_t addr,
                         const uint8_t *orig, uint8_t len) {
-    if (!uc) return ppc_emulate(NULL, addr, orig, len);
+    if (!f) return ppc_emulate(NULL, addr, orig, len);
+    ucontext_t *uc = libcov_frame_uc(f);
     unsigned long *g = (unsigned long *)uc->uc_mcontext.uc_regs->gregs;
     struct ppc_regs r = { &g[PT_NIP], &g[PT_LNK], &g[PT_CTR], &g[PT_CCR] };
     return ppc_emulate(&r, addr, orig, len);

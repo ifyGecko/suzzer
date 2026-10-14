@@ -31,16 +31,16 @@ const void *libcov_arch_illegal_bytes(uint8_t len) {
     return &k_illegal;
 }
 
-uintptr_t libcov_arch_pc_from_uctx(const ucontext_t *uc) {
-    return (uintptr_t)uc->uc_mcontext.pc;
+uintptr_t libcov_arch_pc_from_frame(const libcov_frame *f) {
+    return (uintptr_t)*libcov_frame_pcptr((libcov_frame *)f);
 }
 
 /* Marker emulation: markers are block-entry (prologue) instructions on
  * MIPS, never branches; arch_mips_emulate.h performs the register-only
  * ones. Others fall back to disarm + deferred re-arm (see arch.h). */
-int libcov_arch_emulate(ucontext_t *uc, uintptr_t addr,
+int libcov_arch_emulate(libcov_frame *f, uintptr_t addr,
                         const uint8_t *orig, uint8_t len) {
     (void)addr;
-    if (!uc) return mips_emulate(NULL, NULL, orig, len, 1);
-    return mips_emulate(uc->uc_mcontext.gregs, &uc->uc_mcontext.pc, orig, len, 1);
+    if (!f) return mips_emulate(NULL, NULL, orig, len, 1);
+    return mips_emulate(libcov_frame_gregs(f), libcov_frame_pcptr(f), orig, len, 1);
 }

@@ -37,8 +37,8 @@ const void *libcov_arch_illegal_bytes(uint8_t len) {
                       : (const void *)&k_illegal_thumb;
 }
 
-uintptr_t libcov_arch_pc_from_uctx(const ucontext_t *uc) {
-    return (uintptr_t)uc->uc_mcontext.arm_pc;
+uintptr_t libcov_arch_pc_from_frame(const libcov_frame *f) {
+    return (uintptr_t)libcov_frame_uc(f)->uc_mcontext.arm_pc;
 }
 
 /* Condition field against CPSR.NZCV (same bit positions as AArch64). */
@@ -78,7 +78,7 @@ static uint32_t it_put(uint32_t cpsr, unsigned it) {
  * of a 32-bit instruction is read from memory): B T1-T4, CBZ/CBNZ, BL,
  * NOP, NOP.W. BLX (state switch) is not. Inside an IT block the IT
  * condition is applied and ITSTATE advanced, as the CPU would. */
-int libcov_arch_emulate(ucontext_t *uc, uintptr_t addr,
+int libcov_arch_emulate(libcov_frame *f, uintptr_t addr,
                         const uint8_t *orig, uint8_t len) {
     uintptr_t next, target = 0;
     unsigned cond = 14;            /* AL */
@@ -148,8 +148,9 @@ int libcov_arch_emulate(ucontext_t *uc, uintptr_t addr,
     } else {
         return 0;
     }
-    if (!uc) return 1;
+    if (!f) return 1;
 
+    ucontext_t *uc = libcov_frame_uc(f);
     mcontext_t *m = &uc->uc_mcontext;
     uint32_t cpsr = (uint32_t)m->arm_cpsr;
     if (len == 2) {

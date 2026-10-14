@@ -57,8 +57,9 @@ static void disarm_failed(int signo) {
 }
 
 static void trap_body(int signo, siginfo_t *info, void *uctx) {
-    ucontext_t *uc = (ucontext_t *)uctx;
-    uintptr_t pc = libcov_arch_pc_from_uctx(uc);
+    libcov_frame frame;
+    libcov_frame_from_uctx(&frame, uctx);
+    uintptr_t pc = libcov_arch_pc_from_frame(&frame);
 
     struct patch_entry *e = patch_lookup(pc);
     if (!e) {
@@ -87,7 +88,7 @@ static void trap_body(int signo, siginfo_t *info, void *uctx) {
             patch_arm_unsynced(last);
         g_last_restored = NULL;
         boundary_on_trap(pc, e);
-        libcov_arch_emulate(uc, pc, e->orig, e->len);
+        libcov_arch_emulate(&frame, pc, e->orig, e->len);
         patch_sync_batch_end();
         return;
     }
