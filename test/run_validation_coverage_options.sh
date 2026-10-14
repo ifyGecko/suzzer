@@ -635,7 +635,7 @@ fi
 # ----------------------------------------------------------------------
 section "T18: LIBCOV_BOUNDARY_INIT_GRACE -- drops first N marker fires before publish"
 # Send 5 inputs to target_loop; in begin-only mode 5 inputs fire 6 marker
-# hits (iter 0..4 at the top of each iteration + post-loop flush).
+# hits (one at the top of each of the 5 loop passes + a post-loop flush).
 # Without grace: gen_current ends at 6 (allowing for jitter we accept >=5).
 # With grace=2: first 2 fires drop, then 4 publish -> gen_current = 4.
 INPUTS=$'42\n99\n-3\nabc\nhello\n'

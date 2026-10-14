@@ -815,7 +815,7 @@ doesn't leak.
 
 The first `N-1` emits per thread XOR with zero-initialised window
 slots, biasing toward low buckets; this is the same warmup bias AFL
-already exhibits at iter-1 and is harmless in practice.
+already exhibits at the first iteration and is harmless in practice.
 
 Consumers (`test/fuzz_driver.c`, `test/shm_bitmap.py`) don't need to
 know `N` or the model -- a bucket is a saturating counter either way,

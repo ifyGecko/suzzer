@@ -161,7 +161,7 @@
  *   regardless of N -- consumers of the bitmap do not need to know N.
  *   The first (N-1) emits per thread XOR with zero-initialised window
  *   slots, biasing toward low buckets; this is the same warmup bias AFL
- *   already exhibits at iter-1 and is harmless in practice.
+ *   already exhibits at the first iteration and is harmless in practice.
  *
  *   Override at build: -DLIBCOV_NGRAM_N=4
  *   Override in source: edit the value next to the #define below.
