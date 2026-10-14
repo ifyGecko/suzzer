@@ -34,6 +34,11 @@ ARCH := $(shell uname -m)
 endif
 
 THREADING ?= st
+
+# Platform/runtime backend (like ARCH picks an ISA backend): one
+# src/plat_<name>.c + one LIBCOV_PLAT_* define. linux = userland (default);
+# baremetal-mips = freestanding firmware profile (added in a later phase).
+PLAT ?= linux
 ifeq ($(filter $(THREADING),st mt),)
 $(error THREADING must be 'st' or 'mt', got '$(THREADING)')
 endif
@@ -131,6 +136,14 @@ else
   LDLIBS_EXTRA :=
 endif
 
+# Map PLAT to its backend source and compile-time selector.
+ifeq ($(PLAT),linux)
+  PLAT_SRC := src/plat_linux.c
+  CFLAGS   += -DLIBCOV_PLAT_LINUX
+else
+  $(error PLAT=$(PLAT) not supported for the .so build; the firmware core is built by `make baremetal`)
+endif
+
 # User pass-through for tunables overrides. Example:
 #   make EXTRA_CFLAGS='-DLIBCOV_ARCH_MIPS_ILLEGAL=0xDEADBEEFu'
 # CFLAGS is the toolchain baseline (already overridable); EXTRA_CFLAGS is
@@ -139,7 +152,7 @@ CFLAGS += $(EXTRA_CFLAGS)
 
 BUILD := build/$(ARCH)
 
-COMMON_SRC := src/libcov.c src/util.c src/config.c src/sink_shm.c src/boundary.c
+COMMON_SRC := src/libcov.c src/util.c src/config.c src/sink_shm.c src/boundary.c $(PLAT_SRC)
 SRC := $(COMMON_SRC) $(PATCH_SRC) $(HANDLER_SRC) $(EXTRA_SRC) $(ARCH_SRC)
 
 # Object files go into a threading-suffixed subdir to keep ST and MT builds
@@ -156,7 +169,7 @@ LIB := $(BUILD)/libcov_$(THREADING).so
 # default goal: `make` would just rebuild libcov.o.
 .DEFAULT_GOAL := all
 
-.PHONY: all clean test test-targets all-arch all-variants native print-vars tools tools-clean
+.PHONY: all clean test test-targets all-arch all-variants native print-vars tools tools-clean baremetal
 
 all: $(LIB) test-targets
 
@@ -191,7 +204,8 @@ NATIVE_SUITES := run_validation run_validation_mt run_validation_boundary \
                  run_validation_o2pie run_validation_marker_emulation \
                  run_validation_reexec run_validation_modules \
                  run_validation_patch_mode run_validation_paired \
-                 run_validation_docs run_validation_relay
+                 run_validation_docs run_validation_relay \
+                 run_validation_baremetal
 
 test:
 ifneq ($(ARCH),$(shell uname -m))
@@ -238,6 +252,47 @@ print-vars:
 	@echo "ARCH=$(ARCH) BACKEND=$(BACKEND) THREADING=$(THREADING)"
 	@echo "SRC=$(SRC)"
 	@echo "LIB=$(LIB)"
+
+# ---- baremetal-mips: freestanding firmware coverage core -------------------
+# A separate build from the userland .so: no libc, no LD_PRELOAD, a custom
+# linker script and an objcopy to a raw blob. Driven by `make baremetal`;
+# the PLAT variable stays "linux" for the .so path above. The core here is
+# the OS-free subset (ISA decode/emulate + the baremetal plat); the coverage
+# wiring (sink/patch/dispatch) joins it in later phases.
+BM_CROSS    := mips-linux-gnu-
+BM_CC       := $(BM_CROSS)gcc
+BM_BUILD    := build/baremetal-mips
+BM_CFLAGS   := -O2 -g -Wall -Wextra -Wno-unused-parameter \
+               -ffreestanding -fno-builtin -fno-stack-protector \
+               -fno-pic -mno-abicalls -mabi=32 -march=mips32r2 -EB -G0 \
+               -DLIBCOV_PLAT_BAREMETAL_MIPS -DLIBCOV_THREADING_ST \
+               -Isrc $(EXTRA_CFLAGS)
+BM_CORE_SRC := src/arch_mips.c src/core_bm.c src/plat_baremetal_mips.c
+BM_ASM_SRC  := src/plat_baremetal_mips_vector.S
+BM_OBJ      := $(patsubst src/%.c,$(BM_BUILD)/%.o,$(BM_CORE_SRC)) \
+               $(patsubst src/%.S,$(BM_BUILD)/%.o,$(BM_ASM_SRC))
+BM_LDSCRIPT := src/baremetal_mips.ld
+BM_ELF      := $(BM_BUILD)/libcov_core.elf
+BM_BIN      := $(BM_BUILD)/libcov_core.bin
+
+baremetal: $(BM_BIN)
+
+$(BM_BUILD):
+	mkdir -p $@
+
+$(BM_BUILD)/%.o: src/%.c | $(BM_BUILD)
+	$(BM_CC) $(BM_CFLAGS) -c $< -o $@
+
+$(BM_BUILD)/%.o: src/%.S | $(BM_BUILD)
+	$(BM_CC) $(BM_CFLAGS) -c $< -o $@
+
+$(BM_ELF): $(BM_OBJ) $(BM_LDSCRIPT) | $(BM_BUILD)
+	$(BM_CC) $(BM_CFLAGS) -nostdlib -nostartfiles -no-pie -static -Wl,-T,$(BM_LDSCRIPT) -o $@ $(BM_OBJ)
+
+$(BM_BIN): $(BM_ELF)
+	$(BM_CROSS)objcopy -O binary $< $@
+	@echo "baremetal core: $(BM_BIN) ($$(stat -c%s $(BM_BIN)) bytes)"
+
 
 # Auto-generated header dependencies (-MMD -MP in the compile rule).
 # Editing a header rebuilds every object that includes it. .d files live
