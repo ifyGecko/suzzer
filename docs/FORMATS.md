@@ -57,7 +57,7 @@ offset align8(modules_offset + modules_size)
 | 16 | 4 | `modules_offset` | file offset of the name table |
 | 20 | 4 | `modules_size` | name table bytes, 1..4096 |
 
-**`threading`** says which libcov build may load the list. MT lists contain only sites the MT runtime can patch atomically (naturally aligned 2- or 4-byte words), and ST lists may contain any site. libcov refuses a list whose hint is neither ANY nor its own variant. Other consumers can ignore the field. They should prefer ANY or ST lists, which hold every site the generator selected.
+**`threading`** says which libcov build may load the list. MT lists contain only sites the MT runtime can patch atomically: naturally aligned 2- or 4-byte words, or on x86 2-byte sites that don't cross a 16-byte boundary. ST lists may contain any site. libcov refuses a list whose hint is neither ANY nor its own variant. Other consumers can ignore the field. They should prefer ANY or ST lists, which hold every site the generator selected.
 
 **`flags`**: writers set only the bits defined here. Readers **ignore bits they don't know**. They must not reject a file for them.
 

@@ -111,6 +111,7 @@ static int write_site(struct patch_entry *e, const void *bytes, int illegal) {
 }
 
 int patch_arm(struct patch_entry *e) {
+    if (e->dead) return -1;   /* patch_arm_all declined it; never write it */
     ensure_pagesize();
     if (write_site(e, NULL, 1) < 0) return -1;
     e->patched = 1;
@@ -118,6 +119,7 @@ int patch_arm(struct patch_entry *e) {
 }
 
 int patch_disarm(struct patch_entry *e) {
+    if (e->dead) return 0;    /* never armed: nothing to restore */
     ensure_pagesize();
     if (write_site(e, e->orig, 0) < 0) return -1;
     e->patched = 0;
@@ -141,6 +143,10 @@ size_t patch_arm_all(void) {
     size_t armed = 0, skipped = 0, validate_fail = 0;
     for (size_t i = 0; i < n; i++) {
         struct patch_entry *e = &t[i];
+        /* Every `continue` below leaves the entry dead: never armed later
+         * (boundary REARM=all would otherwise write a stale entry, and its
+         * disarm would then restore the list's wrong bytes). */
+        e->dead = 1;
         if (self_lo && e->addr >= self_lo && e->addr < self_hi) {
             libcov_logf("patch: refusing self-patch at 0x%lx", (unsigned long)e->addr);
             skipped++;
@@ -157,8 +163,10 @@ size_t patch_arm_all(void) {
             validate_fail++;
             continue;
         }
+        e->dead = 0;
         if (patch_arm(e) != 0) {
             libcov_logf("patch: arm failed at 0x%lx: %s", (unsigned long)e->addr, strerror(errno));
+            e->dead = 1;
             continue;
         }
         armed++;

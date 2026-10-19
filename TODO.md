@@ -357,6 +357,26 @@ the MT stress test fail against the pre-fix code.
 
 ---
 
+## Fixed 2026-10-19
+
+- **MT leapfrog SIGSEGV on x86 (flaky, ~1 run in 250).** A peer thread
+  fetching a site while another rewrote it took its two bytes from two
+  instruction-fetch blocks and ran a torn mix (`0f 06`, CLTS -> #GP),
+  though the `movw` store itself is atomic. MT x86 sites must now stay
+  inside one 16-byte block: the generator skips other candidates and
+  `libcov_mt` refuses them at init (`fetch_unsafe=`). `gen_boundary.py`
+  applies the same filter (from `--patchlist`'s threading hint, or
+  `--threading mt`), so markers still land on patched sites; a marker
+  whose branch straddles a block walks back to a non-emulated
+  instruction (`target_markers`' m_zero on x86 MT). Design.md §6.2,
+  §17.2; `run_validation_mt.sh` checks both.
+- **`LIBCOV_BOUNDARY_REARM=all` armed entries init had refused.** A stale
+  entry (bytes mismatch) got UD2 written over the target's real bytes,
+  and the next trap "restored" the list's wrong bytes, silently changing
+  what the target computed. Entries `patch_arm_all` declines are now
+  `dead`: never armed or disarmed later, and a trap there is not
+  libcov's. `run_validation_boundary.sh` checks every re-arm policy.
+
 ## P0
 
 - [ ] **Instruction-modification rules across CPUs.** Design

@@ -61,7 +61,7 @@ per-backend tunables header (see [Tunables](#tunables)).
 
 | Backend           | Default trap insn        | Patch len | Notes                                   |
 |-------------------|--------------------------|-----------|-----------------------------------------|
-| x86_64            | UD2 (`0F 0B`)            | 2         | Head-only; MT sites can't span a 64B line |
+| x86_64            | UD2 (`0F 0B`)            | 2         | Head-only; MT sites can't span a 16B fetch block |
 | aarch64           | UDF #0 (`0x00000000`)    | 4         |                                         |
 | arm (ARM mode)    | UDF `0xE7F000F0`         | 4         |                                         |
 | arm (Thumb mode)  | UDF.N `0xDE00`           | 2         | Per-function bits=16 detection          |

@@ -47,7 +47,8 @@ import tempfile
 sys.dont_write_bytecode = True  # no tools/__pycache__ from the import below
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gen_patchlist import (default_strategy, fix_elfv1_nop_entries,  # noqa: E402
-                           op_class, pick_entry, pick_terminator)
+                           mt_addr_safe, mt_atomic_width, op_class, pick_entry,
+                           pick_terminator)
 from rz_resolve import (NotFound, Image, add_image_args,  # noqa: E402
                         image_from_args, resolve_to_offset)
 
@@ -168,7 +169,20 @@ def local_entry(fn_addr, fns):
     return fn_addr + 8 if (fn_addr + 8) in starts else fn_addr
 
 
-def first_bb_site(binary, fn_addr, strategy, is_mips):
+def mt_candidate_filter(arch, bits):
+    """The candidate filter gen_patchlist.py --threading mt applies in the
+    terminator walk-back, so a marker lands where that list put the site.
+    Only x86's rejects real instructions (it keeps a site's 2 bytes inside
+    one instruction-fetch block); on the fixed-width ISAs it is an
+    alignment check every instruction passes, so no per-function bits
+    (Thumb) are needed."""
+    if arch != "x86":
+        return None
+    width = mt_atomic_width(arch, bits)
+    return lambda insn: mt_addr_safe(arch, int(insn["offset"]), width)
+
+
+def first_bb_site(binary, fn_addr, strategy, is_mips, ok=None):
     """Return the absolute address gen_patchlist.py would patch for the
     first basic block of the function at fn_addr under `strategy`.
 
@@ -210,7 +224,7 @@ def first_bb_site(binary, fn_addr, strategy, is_mips):
         in_slot = bool(prev) and op_class(prev[0].get("type")) is not None
         pick = pick_entry(insns, in_slot)
     else:
-        pick = pick_terminator(insns)
+        pick = pick_terminator(insns, ok)
     return int(pick["offset"]) if pick else None
 
 
@@ -227,6 +241,12 @@ def patchlist_offsets(path):
         if midx == 0:
             out.add(off)
     return out
+
+
+def patchlist_threading(path):
+    """The LCV3 header's threading hint: 0 ANY, 1 ST, 2 MT."""
+    with open(path, "rb") as f:
+        return f.read(13)[12]
 
 
 KIND_MAP = {"begin": 0, "end": 1}
@@ -291,6 +311,10 @@ def main():
                     help="marker site selection; must match the patch list's "
                          "gen_patchlist.py --strategy (auto = arch default: "
                          "entry on MIPS, terminator elsewhere)")
+    ap.add_argument("--threading", choices=["st", "mt"], default=None,
+                    help="the patch list's gen_patchlist.py --threading, so "
+                         "markers land on the same sites (default: the hint "
+                         "in --patchlist, else st)")
     ap.add_argument("--force", action="store_true",
                     help="write a begin-only sidecar that uses depth_filter=zero "
                          "anyway (it has no effect without END markers)")
@@ -301,12 +325,15 @@ def main():
     IMAGE = image_from_args(ap, args)
     check_inputs(args.binary)
     patched = patchlist_offsets(args.patchlist) if args.patchlist else None
+    threading = args.threading or (
+        "mt" if args.patchlist and patchlist_threading(args.patchlist) == 2 else "st")
 
     baddr, arch, bits = get_image_info(args.binary)
     strategy = (args.strategy if args.strategy != "auto"
                 else default_strategy(arch, bits))
     if arch == "mips" and strategy == "terminator":
         sys.exit("error: --strategy terminator is unsafe on MIPS (delay slots); use entry")
+    ok = mt_candidate_filter(arch, bits) if threading == "mt" else None
     fns, syms, all_fns = get_function_addrs(args.binary)
     if args.verbose:
         print(f"image base: 0x{baddr:x} strategy={strategy}", file=sys.stderr)
@@ -321,7 +348,7 @@ def main():
             sys.exit(f"error: {e}")
         if arch == "ppc" and bits == 64:
             fn_addr = local_entry(fn_addr, fns)
-        site = first_bb_site(args.binary, fn_addr, strategy, arch == "mips")
+        site = first_bb_site(args.binary, fn_addr, strategy, arch == "mips", ok)
         if site is None:
             sys.exit(f"could not find a first-BB {strategy} site for {name} @ 0x{fn_addr:x}")
         offset = site - baddr

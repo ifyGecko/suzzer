@@ -278,7 +278,7 @@ fi
 # ----------------------------------------------------------------------
 section "T5: LIBCOV_MODE=leapfrog -- max hit per bucket >= 2 on loops"
 # Under THREADING=mt on x86_64, gen_patchlist.py's --threading mt path
-# requires a single naturally-aligned, non-cache-line-straddling 2-byte
+# requires a single 2-byte write that doesn't straddle a 16-byte fetch block
 # write per site. That filter typically excludes the variable-length jcc
 # at the loop-body BB terminator on target_simple, so leapfrog re-tripping
 # is not observable on this target under MT. MT leapfrog multi-hits ARE
@@ -661,7 +661,7 @@ echo "   grace=0 gen_current=$G0   grace=2 gen_current=$G2"
 if [[ "$G0" -eq 0 && "$G2" -eq 0 && "$THREADING" == "mt" ]]; then
     # Under MT on x86_64, gen_patchlist --threading mt may filter out
     # iter_begin's BB terminator if it doesn't meet the 2-byte aligned /
-    # no-cache-line-straddle constraint. Without that site patched, no
+    # no-fetch-block-straddle constraint. Without that site patched, no
     # marker fires happen and the grace test is moot. The boundary
     # mechanism itself is exercised under MT by run_validation_boundary.sh
     # against per-arch hardware where the iter_begin terminator survives.

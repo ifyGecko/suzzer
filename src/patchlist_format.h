@@ -55,6 +55,12 @@
  * `touched` is set while the entry sits in boundary.c's REARM=touched
  * queue, so each disarmed site is queued at most once.
  *
+ * `dead` is set by patch_arm_all on every entry it declined to arm (a
+ * self-patch, a stale entry, an MT-unsafe x86 site, a failed write).
+ * patch_arm/patch_disarm refuse a dead entry, so no later path (leapfrog,
+ * boundary REARM=all, a marker's pending re-arm) can write it, and the
+ * handlers treat a trap there as not libcov's.
+ *
  * `site_id` is a dense identifier in [0, count) assigned at config_load
  * time as the file record index, BEFORE the table is sorted by addr (the
  * sort carries it along). It is the bitmap bucket base under the site-id
@@ -70,6 +76,7 @@ struct patch_entry {
     uint8_t   marker;
     uint8_t   touched;
     uint8_t   emulate;
+    uint8_t   dead;
     uint32_t  site_id;
 };
 

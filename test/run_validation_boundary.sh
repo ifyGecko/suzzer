@@ -231,4 +231,47 @@ print("   OK: pipe refused with a warning")
 PYEOF
 
 echo
+echo ">> a stale entry stays unarmed under every re-arm policy"
+# patch_arm_all refuses an entry whose bytes don't match the list. The
+# boundary re-arm must not arm it later either: REARM=all once did, and the
+# next trap's disarm then wrote the list's wrong bytes into the target,
+# silently changing what it computed.
+python3 - "$LCV" "$TARGET" "$WORK/stale.lcv" <<'PYEOF'
+import struct, subprocess, sys
+lcv, target, out = sys.argv[1:]
+d = bytearray(open(lcv, "rb").read())
+n = struct.unpack_from("<I", d, 8)[0]
+mod_off, mod_size = struct.unpack_from("<II", d, 16)
+base = struct.unpack_from("<Q", d, (mod_off + mod_size + 7) & ~7)[0] if d[13] & 1 else 0
+syms = subprocess.run(["nm", "-S", target], capture_output=True, text=True, check=True).stdout
+lo, size = next((int(f[0], 16), int(f[1], 16)) for f in map(str.split, syms.splitlines())
+                if len(f) == 4 and f[3] == "classify")
+for i in range(n):
+    o = 24 + 14 * i
+    off, ln = struct.unpack_from("<QB", d, o)
+    if lo <= base + off < lo + size:
+        d[o + 10:o + 10 + ln] = bytes(b ^ 0xff for b in d[o + 10:o + 10 + ln])
+        break
+else:
+    sys.exit("FAIL: no site in classify to make stale")
+open(out, "wb").write(d)
+PYEOF
+printf '42\n99\n-3\n7\n0\n' | "$TARGET" > "$WORK/stale.bare" 2>&1
+for rearm in none touched all; do
+    rc=0
+    printf '42\n99\n-3\n7\n0\n' | LIBCOV_PATCHLIST="$WORK/stale.lcv" LIBCOV_BOUNDARY_LIST="$LCVB" \
+        LIBCOV_BOUNDARY_REARM=$rearm LIBCOV_MODE=leapfrog LIBCOV_SHM_PATH="$WORK/stale.shm" \
+        LIBCOV_LOG="$WORK/stale.$rearm.log" LD_PRELOAD="$LIB" \
+        timeout "$RUN_TIMEOUT" "$TARGET" > "$WORK/stale.$rearm" 2>&1 || rc=$?
+    rm -f "$WORK/stale.shm"
+    [[ $rc -eq 0 ]] || { echo "FAIL: REARM=$rearm with a stale entry exited rc=$rc" >&2; exit 1; }
+    grep -q 'stale=1$' "$WORK/stale.$rearm.log" \
+        || { echo "FAIL: REARM=$rearm: $(grep 'armed=' "$WORK/stale.$rearm.log")" >&2; exit 1; }
+    cmp -s "$WORK/stale.bare" "$WORK/stale.$rearm" \
+        || { echo "FAIL: REARM=$rearm: a stale entry changed the target's output" >&2;
+             diff "$WORK/stale.bare" "$WORK/stale.$rearm" | head >&2; exit 1; }
+done
+echo "   OK: output unchanged with REARM=none, touched and all"
+
+echo
 echo "ALL BOUNDARY VALIDATIONS PASSED ($ARCH)"

@@ -215,7 +215,7 @@ struct patchlist_header_v3 {
 ```
 
 The `threading` byte enforces variant-correctness: an MT-generated
-patch list (per-arch atomic-width records, x86 cache-line-safe sites
+patch list (per-arch atomic-width records, x86 fetch-block-safe sites
 only) given to `libcov_st.so` (or vice-versa) is refused at init with
 a clear log line rather than producing subtly-wrong coverage.
 
@@ -445,7 +445,7 @@ Every backend raises `LIBCOV_TRAP_SIGNO` (= `SIGILL` by default).
 
 | Backend          | Default trap insn        | Min len | Max len | Special handling                          |
 |------------------|--------------------------|---------|---------|-------------------------------------------|
-| x86_64           | UD2 (`0F 0B`)            | 2       | 2       | Head-only; tail never touched; MT sites can't straddle a 64-byte line |
+| x86_64           | UD2 (`0F 0B`)            | 2       | 2       | Head-only; tail never touched; MT sites can't straddle a 16-byte fetch block |
 | aarch64          | UDF #0 (`0x00000000`)    | 4       | 4       | Fixed                                     |
 | arm (ARM mode)   | UDF (`0xE7F000F0`)       | 2       | 4       | Per-site dispatch on len                  |
 | arm (Thumb mode) | UDF.N (`0xDE00`)         | 2       | 4       | len=2 selects Thumb encoding              |
@@ -457,8 +457,9 @@ Every backend raises `LIBCOV_TRAP_SIGNO` (= `SIGILL` by default).
 
 Every backend uses the same source and encoding for ST and MT. The only
 threading difference is in the generator: `--threading mt` drops x86
-sites whose 2-byte write would straddle a cache line, and unaligned sites
-on fixed-width ISAs.
+sites whose 2 bytes would straddle a 16-byte instruction-fetch block, and
+unaligned sites on fixed-width ISAs. `libcov_mt` also refuses such x86
+sites at init, for lists that still have them.
 
 ### 6.2 Per-backend rationale
 
@@ -467,8 +468,12 @@ the 286. Both ST and MT write only the 2-byte UD2 head. The trap fires
 before the tail is decoded, so the tail bytes of the original
 instruction are never touched, and disarm restores just the head. Under
 MT, a 2-byte store is single-copy-atomic as long as it doesn't cross a
-64-byte cache line (Intel SDM Vol 3 Sec 8.1.1); the generator enforces
-that. Instructions shorter than 2 bytes can't hold UD2 and get no site.
+64-byte cache line (Intel SDM Vol 3 Sec 8.1.1). That is not enough: a
+peer's instruction fetch reads aligned 16-byte (Intel) or 32-byte (AMD)
+blocks, and can take a site's two bytes from two fetches when they cross
+a block, running a mix of old and new (`0f` + a jmp's `06` = CLTS ->
+SIGSEGV). So MT sites must not cross a 16-byte boundary; the generator
+and `libcov_mt` both enforce that (§17.2). Instructions shorter than 2 bytes can't hold UD2 and get no site.
 
 **aarch64 / UDF #0**: the all-zero word *is* `UDF #0` (Permanently
 Undefined, `0x0000iiii` with imm16 = 0) and raises SIGILL. (Not to be
@@ -1450,7 +1455,7 @@ site sees either the old or the new instruction, never a mix of bytes.
 The atomic store needs the site's bytes to fit one store: aligned on
 fixed-width ISAs, within one 64-byte line on x86. The generator's
 `--threading mt` only emits such sites; any other site goes through the
-fallback below.
+fallback below. On x86 the fetch side asks for more (below the table).
 
 `pwrite(/proc/self/mem)` used to be the primary path. It tears: the
 kernel copies through `memcpy`, which stores 2-4 byte lengths byte by
@@ -1542,15 +1547,29 @@ single-copy-atomic on the host CPU:
 |----------------------------------------------|--------------------|------------------------------------|
 | aarch64, arm-ARM, mips, mips64, ppc, ppc64   | 4 bytes            | ARM ARM B2.2.1; MIPS, Power ISA    |
 | arm-Thumb, riscv64                           | 2 bytes            | Aligned half-word stores by ISA    |
-| x86_64                                       | 2 bytes (UD2 head) | Intel SDM Vol 3 Sec 8.1.1 (aligned, or unaligned within one cache line) |
+| x86_64                                       | 2 bytes (UD2 head) | Intel SDM Vol 3 Sec 8.1.1 (aligned, or unaligned within one cache line); fetch: within one 16-byte block |
 
 For x86 specifically, the patch is the leading 2-byte UD2 only; the
 remaining bytes of the original variable-length instruction are never
 touched. Sites need not be 2-aligned: an unaligned 16-bit store is
 still atomic when both bytes are in one 64-byte cache line, and
-`write_bytes()` uses a plain `movw` for it. The generator's
-`--threading mt` mode skips only candidates whose write would straddle
-a line, so x86 MT instruments the same sites as ST in practice.
+`write_bytes()` uses a plain `movw` for it.
+
+The store being atomic does not make the *fetch* atomic. Instruction
+fetch reads aligned blocks (16 bytes on Intel's legacy decoder, 32 on
+AMD Zen), so a peer fetching a site whose two bytes cross a block can
+take them from two fetches, one before the write and one after, and run
+a mix: UD2's `0f` with the second byte of `eb 06` is `0f 06` (CLTS, a
+privileged instruction: #GP -> SIGSEGV). `run_validation_mt`'s leapfrog
+run hit exactly that about once in 250 runs on a Zen 4, always at the
+one site that crossed a 32-byte boundary, and never in 3000 runs without
+it. Both sides now keep an x86 MT site's 2 bytes inside one 16-byte
+block, which is also inside any larger block and the cache line:
+`--threading mt` skips other candidates (the terminator walk-back
+usually finds another instruction in the block, so `target_simple_mt`
+keeps all its sites), and `libcov_mt` refuses them at init
+(`fetch_unsafe=` in its `armed=` log line) for older MT lists and ANY
+lists.
 
 ### 17.3 Threading-hint enforcement
 

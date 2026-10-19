@@ -10,7 +10,9 @@
  * contract (Intel SDM Vol 3 Sec 8.1.1): a 2-byte store is atomic when
  * aligned or, P6 onward, when it doesn't cross a cache line. patch_mt.c
  * and the generator's --threading mt mode accept any site whose 2 bytes
- * stay within one 64-byte line.
+ * stay within one 16-byte instruction-fetch block (and so one line): a
+ * fetch across blocks can mix old and new bytes even when the store is
+ * atomic.
  *
  * All tunable values come from src/tunables_x86_64.h -- edit there or
  * pass -D flags.

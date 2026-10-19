@@ -27,9 +27,10 @@ Threading-mode selection (--threading):
   mt           -- multi-threaded libcov: same widths, plus filtering so
                   every site's write is a single-copy-atomic store. On
                   fixed-width ISAs that means naturally aligned. On x86
-                  any address works except one whose 2-byte write would
-                  straddle a 64-byte cache line (Intel guarantees atomicity
-                  for unaligned 16-bit stores only within a line).
+                  any address works except one whose 2 bytes cross a
+                  16-byte boundary: the store is atomic within a cache
+                  line, but instruction fetch reads aligned 16/32-byte
+                  blocks, so a peer could run a torn mix of old and new.
 
 Multi-module instrumentation:
   The positional `binary` is always module index 0 (typically the main
@@ -495,8 +496,8 @@ def mt_atomic_width(arch, fn_bits):
     riscv64: 2 (covers both c.unimp and the leading half of a 4-byte zero
              insn, both decode as illegal at the first 2 bytes).
     x86:   2 (UD2 fits in 2 bytes; SDM 8.1.1 guarantees 16-bit stores are
-             atomic when they don't span a cache line, aligned or not --
-             enforced by mt_addr_safe).
+             atomic when they don't span a cache line, aligned or not;
+             mt_addr_safe also keeps them inside one fetch block).
     """
     if arch == "arm":
         return 2 if fn_bits == 16 else 4
@@ -523,12 +524,17 @@ def mt_addr_safe(arch, addr, width):
 
     x86 is the exception: unaligned 16-bit stores are single-copy atomic
     as long as they stay inside one 64-byte cache line (SDM 8.1.1), and
-    libcov_mt's write_bytes() uses a plain `movw` for them. Only a write
-    that spans a line is unsafe. The module load base is page-aligned, so
-    checking the link-time address is equivalent to checking the runtime
-    one. Keep the 64 in sync with LIBCOV_X86_CACHE_LINE in patch_mt.c."""
+    libcov_mt's write_bytes() uses a plain `movw` for them. But a peer
+    thread's instruction fetch reads aligned 16-byte (Intel) or 32-byte
+    (AMD) blocks, and takes a site whose 2 bytes cross a block boundary
+    from two fetches: it can run UD2's first byte with the original's
+    second (`0f 06`, CLTS -> SIGSEGV). So the 2 bytes must stay inside one
+    16-byte block, which also keeps them in one larger block and one line.
+    The module load base is page-aligned, so checking the link-time
+    address is equivalent to checking the runtime one. Keep the 16 in sync
+    with LIBCOV_X86_FETCH_BLOCK in patch_mt.c."""
     if arch == "x86":
-        return (addr & 63) + width <= 64
+        return (addr & 15) + width <= 16
     return addr % width == 0
 
 
@@ -927,7 +933,7 @@ def collect_module_records(args, rz, module_idx, module_name, slicing=None,
                       file=sys.stderr)
             continue
         # Let the terminator walk-back skip candidates MT would reject, so
-        # a line-straddling x86 terminator falls back to an earlier
+        # a block-straddling x86 terminator falls back to an earlier
         # instruction instead of losing the whole block.
         ok = None
         if args.threading == "mt":

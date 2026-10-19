@@ -54,9 +54,22 @@
  *  - x86_64: the backend writes only 2 bytes (UD2 head) and
  *    libcov_max_patch_len is 2 (see tunables_x86_64.h). Intel SDM 8.1.1
  *    guarantees 16-bit stores are atomic when aligned, and (P6 onward)
- *    also when unaligned but contained in one cache line. We therefore
- *    accept any address whose 2 bytes don't span a 64-byte line; the
- *    generator's --threading mt mode applies the same rule.
+ *    also when unaligned but contained in one cache line. That is the
+ *    *store*; instruction fetch is a separate matter (next point).
+ *
+ *  - x86_64 instruction fetch reads code in aligned blocks (16 bytes on
+ *    Intel's legacy decoder, 32 on AMD Zen). A peer fetching a site while
+ *    it is rewritten can take its two bytes from two different fetches
+ *    when they lie in different blocks, and so run a mix of old and new:
+ *    UD2's `0f` with the second byte of `eb 06` (jmp) is `0f 06`, CLTS,
+ *    a privileged instruction -> #GP -> SIGSEGV. That crashed the
+ *    run_validation_mt leapfrog stress about 1 run in 250 on a Zen 4
+ *    (always the one site at a 32-byte boundary), and never once in 3000
+ *    runs without it. A single-copy-atomic store does not prevent it, so
+ *    patch_arm_all refuses (marks dead) any site whose 2 bytes cross a
+ *    16-byte boundary -- which also keeps them inside every larger fetch
+ *    block and cache line. The generator's --threading mt mode applies
+ *    the same rule; the runtime check covers older lists and ANY lists.
  *
  * What we still don't claim:
  *
@@ -75,9 +88,10 @@
  *      - (3a) + (3b) above, so once patch_sync_batch_end() returns every
  *        CPU observes the new bytes (x86: SYNC_CORE's IPI + iret is the
  *        serializing event SDM 8.1.3 asks for).
- *    The residual window is a fetch racing the store itself. In practice
- *    that fetch returns the old or the new word, never a mix; this is the
- *    point the real-hardware MT validation (TODO.md) is meant to confirm.
+ *    The residual window is a fetch racing the store itself. Within one
+ *    fetch block that fetch returns the old or the new word, never a mix
+ *    (the stress above found none); across a block boundary it can mix,
+ *    which is why x86 sites must not straddle one (fetch_safe below).
  */
 #define _GNU_SOURCE
 #include "patch.h"
@@ -208,8 +222,26 @@ static inline void fallback_unlock(void) {
 }
 
 /* x86 cache-line size used for the unaligned-store atomicity rule. 64 on
- * every x86_64 part; the generator uses the same constant. */
+ * every x86_64 part. */
 #define LIBCOV_X86_CACHE_LINE 64
+
+/* x86 instruction-fetch block: a site's 2 bytes must sit in one (header,
+ * "x86_64 instruction fetch"). 16 is the smallest block of any x86_64
+ * front end, and every larger one (32, a 64-byte line) is a multiple of
+ * it. The generator's --threading mt rule uses the same constant. */
+#define LIBCOV_X86_FETCH_BLOCK 16
+
+/* Can a peer thread's instruction fetch see this site's write as a whole?
+ * Fixed-width ISAs: patch_validate/write_bytes already require natural
+ * alignment, which never crosses a block. */
+static int fetch_safe(const struct patch_entry *e) {
+#if defined(__x86_64__)
+    return (e->addr & (LIBCOV_X86_FETCH_BLOCK - 1)) + e->len <= LIBCOV_X86_FETCH_BLOCK;
+#else
+    (void)e;
+    return 1;
+#endif
+}
 
 static int write_bytes(uintptr_t addr, const void *src, size_t len) {
 #if defined(__x86_64__)
@@ -308,6 +340,7 @@ static inline int patch_write_inner(struct patch_entry *e, const void *bytes) {
 }
 
 int patch_arm_unsynced(struct patch_entry *e) {
+    if (e->dead) return -1;   /* patch_arm_all declined it; never write it */
     entry_lock(e);
     int rv = 0;
     if (!e->patched) {
@@ -324,6 +357,7 @@ int patch_arm_unsynced(struct patch_entry *e) {
 }
 
 int patch_disarm_unsynced(struct patch_entry *e) {
+    if (e->dead) return 0;    /* never armed: nothing to restore */
     entry_lock(e);
     int rv = 0;
     if (e->patched) {
@@ -372,9 +406,11 @@ size_t patch_arm_all(void) {
     uintptr_t self_lo, self_hi;
     util_self_range(&self_lo, &self_hi);
 
-    size_t armed = 0, skipped = 0, validate_fail = 0;
+    size_t armed = 0, skipped = 0, validate_fail = 0, fetch_unsafe = 0;
     for (size_t i = 0; i < n; i++) {
         struct patch_entry *e = &t[i];
+        /* Every `continue` below leaves the entry dead: never armed later. */
+        e->dead = 1;
         if (self_lo && e->addr >= self_lo && e->addr < self_hi) {
             libcov_logf("patch_mt: refusing self-patch at 0x%lx", (unsigned long)e->addr);
             skipped++;
@@ -392,16 +428,26 @@ size_t patch_arm_all(void) {
             validate_fail++;
             continue;
         }
+        if (!fetch_safe(e)) {
+            libcov_logf("patch_mt: not arming 0x%lx: its %u bytes cross a %d-byte "
+                        "instruction-fetch block, so a peer thread could run a torn "
+                        "instruction (regenerate the list with --threading mt)",
+                        (unsigned long)e->addr, (unsigned)e->len, LIBCOV_X86_FETCH_BLOCK);
+            fetch_unsafe++;
+            continue;
+        }
+        e->dead = 0;
         if (patch_arm(e) != 0) {
             libcov_logf("patch_mt: arm failed at 0x%lx: %s",
                         (unsigned long)e->addr, strerror(errno));
+            e->dead = 1;
             continue;
         }
         armed++;
     }
     util_maps_free();
-    libcov_logf("patch_mt: armed=%zu skipped=%zu stale=%zu",
-                armed, skipped, validate_fail);
+    libcov_logf("patch_mt: armed=%zu skipped=%zu stale=%zu fetch_unsafe=%zu",
+                armed, skipped, validate_fail, fetch_unsafe);
     return armed;
 }
 

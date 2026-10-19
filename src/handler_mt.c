@@ -61,7 +61,7 @@ static void trap_body(int signo, siginfo_t *info, void *uctx) {
     uintptr_t pc = libcov_arch_pc_from_uctx(uc);
 
     struct patch_entry *e = patch_lookup(pc);
-    if (!e) {
+    if (!e || e->dead) {   /* dead: libcov never armed it, so not our trap */
         libcov_chain_trap(signo, info, uctx);
         return;
     }

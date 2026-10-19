@@ -110,10 +110,22 @@ for th in "${THREADINGS[@]}"; do
     "$ROOT/tools/gen_boundary.py" "$T" "$WORK/$th.lcvb" "${specs[@]}" \
         --patchlist "$WORK/$th.lcv" >/dev/null 2>"$WORK/$th.bnd.log" \
         || fail "gen_boundary ($tgt, $th): $(tail -3 "$WORK/$th.bnd.log")"
+    # Under MT on x86 a marker's branch whose 2 bytes cross a 16-byte
+    # instruction-fetch block can't be a site (src/patch_mt.c), so the
+    # marker walks back to an earlier instruction, which isn't emulated
+    # (m_zero's je sits at +0xf of its 16-aligned function with gcc -O2).
+    # Count the markers placed differently from the ST list (st runs first).
+    walked=0
+    if [[ $th == mt && -f "$WORK/st.lcvb" ]]; then
+        walked=$(python3 -c 'import sys
+r = lambda p: [open(p, "rb").read()[16 + 16 * i:24 + 16 * i] for i in range(int(sys.argv[3]))]
+print(sum(a != b for a, b in zip(r(sys.argv[1]), r(sys.argv[2]))))' \
+            "$WORK/st.lcvb" "$WORK/mt.lcvb" "$NM")
+    fi
 
     for emu in 1 0; do
         tag="$th.emu$emu"
-        want=$([[ $emu == 1 && $EMULATES == 1 ]] && echo "$NM" || echo 0)
+        want=$([[ $emu == 1 && $EMULATES == 1 ]] && echo "$((NM - walked))" || echo 0)
         for mode in leapfrog oneshot; do
             rearm=$([[ $mode == oneshot ]] && echo touched || echo none)
             shm="$WORK/$tag.$mode.shm"

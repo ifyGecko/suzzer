@@ -10,8 +10,9 @@
  * disarm restores the head, so the original instruction is intact. This
  * matches the MT backend's single-store contract (Intel SDM Vol 3 Sec
  * 8.1.1: a 2-byte store is single-copy-atomic when it doesn't cross a
- * cache line), and the generator's --threading mt mode requires sites
- * that don't straddle a 64-byte cache line.
+ * cache line). Under MT the sites must also not straddle a 16-byte
+ * instruction-fetch block (patch_mt.c), which the generator's
+ * --threading mt mode and libcov_mt's init both enforce.
  */
 #ifndef LIBCOV_TUNABLES_X86_64_H
 #define LIBCOV_TUNABLES_X86_64_H
