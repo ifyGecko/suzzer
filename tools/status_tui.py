@@ -36,6 +36,8 @@ Two ways to feed it (pick one; the renderer never changes):
        hangs          total hangs              hangs_unique    distinct hangs
                       (suzzer_brain.py counts an executor's HANG and TIMEOUT
                       reports here, apart from crashes)
+       hangs_saved    hang inputs kept (optional; suzzer_brain.py keeps each
+                      distinct hang input, so this can exceed hangs_unique)
        stage          current stage string, e.g. "havoc + splice"
        config         object of free-form label:value for the "run config" box
                       (every entry is shown)
@@ -178,7 +180,8 @@ class Status:
         "edges": "edges", "map_size": "map_size", "sites": "sites",
         "new_edges": "new_edges", "crashes": "crashes",
         "crashes_unique": "crashes_unique", "hangs": "hangs",
-        "hangs_unique": "hangs_unique", "stage": "stage",
+        "hangs_unique": "hangs_unique", "hangs_saved": "hangs_saved",
+        "stage": "stage",
     }
 
     def __init__(self):
@@ -195,6 +198,7 @@ class Status:
         self.crashes_unique = 0
         self.hangs = 0
         self.hangs_unique = 0
+        self.hangs_saved = None
         self.stage = "—"
         self.config = {}
         self.finished = False
@@ -264,7 +268,17 @@ class Status:
         return max(self.crashes_unique, self._crash_evs)
 
     def uniq_hangs(self):
+        # With hangs_saved in the feed, the hang events are saved inputs, not
+        # distinct keys: keep the two apart (hangs_label).
+        if self.hangs_saved is not None:
+            return self.hangs_unique
         return max(self.hangs_unique, self._hang_evs)
+
+    def hangs_label(self):
+        uh = self.uniq_hangs()
+        if self.hangs_saved is not None and self.hangs_saved != uh:
+            return f"{fmt_n(self.hangs)}  ({uh} unique, {self.hangs_saved} saved)"
+        return f"{fmt_n(self.hangs)}  ({uh} unique)"
 
     def cycles_done(self):
         if self.cycles is not None:
@@ -400,7 +414,7 @@ def render(st, w, h, title="fuzzer status :: afl-style", source=None,
         rows.append((f"  status : running{feed}", "ok"))
 
     pct = 100.0 * st.edges / st.map_size if st.map_size else 0.0
-    uc, uh = st.uniq_crashes(), st.uniq_hangs()
+    uc = st.uniq_crashes()
     cur = st.current_rate()
 
     lw = (tw * 56) // 100          # wider left column (afl-style asymmetry)
@@ -425,7 +439,7 @@ def render(st, w, h, title="fuzzer status :: afl-style", source=None,
         _field("cycles done", fmt_n(st.cycles_done()), 14),
         _field("corpus count", fmt_n(st.corpus), 14),
         _field("saved crashes", f"{fmt_n(st.crashes)}  ({uc} unique)", 14),
-        _field("saved hangs", f"{fmt_n(st.hangs)}  ({uh} unique)", 14),
+        _field("saved hangs", st.hangs_label(), 14),
     ], lw, rw)]
 
     rows += [(ln, "") for ln in _pair("map coverage", [
@@ -452,7 +466,7 @@ def render(st, w, h, title="fuzzer status :: afl-style", source=None,
         _field("new-cov finds", fmt_n(st.finds), 14),
         _field("total crashes", f"{fmt_n(st.crashes)}  ({uc} unique)", 14),
         _field("dup crashes", dups, 14),
-        _field("total hangs", f"{fmt_n(st.hangs)}  ({uh} unique)", 14),
+        _field("total hangs", st.hangs_label(), 14),
     ], "latest findings", [
         _field("find", st.last_msg.get("find", none), 5),
         _field("crash", st.last_msg.get("crash", none), 5),

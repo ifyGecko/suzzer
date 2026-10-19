@@ -12,7 +12,7 @@ This document specifies the four formats suzzer shares with programs other than 
 
 Three companion artifacts sit next to this document:
 
-- **`src/lcv_formats.h`**: the C definitions of every struct and constant below. It is header-only, depends only on `<stdint.h>`, and is C11-clean under `-std=c11 -Wall -Wextra -Werror -Wshadow -Wstrict-prototypes -Wmissing-prototypes`. Copy it; don't include it from a suzzer checkout. `LCV_FORMATS_REV` names the revision.
+- **`src/lcv_formats.h`**: the C definitions of every struct and constant below. It is header-only, depends only on `<stdint.h>`, and is C11-clean under `-std=c11 -Wall -Wextra -Werror -Wshadow -Wstrict-prototypes -Wmissing-prototypes`. Copy it at a pinned commit, or read it from a suzzer checkout your build is given; either way check the format versions it defines at compile time. `LCV_FORMATS_REV` names the revision.
 - **`test/vectors/`**: conformance vectors for the bucket formula ([§5.6](#56-conformance-vectors)).
 - **`test/fake_executor.py`**: a minimal SZR1 executor written from §4, used by `test/run_validation_brain.sh`.
 
@@ -280,6 +280,7 @@ As in LCVS, `MT` and `LIVE_EMPTY` describe libcov, and another executor sets the
 
 ### 4.4 Lockstep
 
+- **HELLO when ready.** An executor may connect and send HELLO only once it can take inputs (an emulator booting its firmware first, say). The reference brain waits `--hello-timeout` (600 s) for HELLO, then `--io-timeout` for each reply.
 - **Each INPUT gets exactly one reply**, COVERAGE or CRASH, carrying the INPUT's `id`. The brain sends the next INPUT only after the reply. Ids are chosen by the brain, start at 1 and are never 0.
 - **Unsolicited INIT snapshot**: before replying to the first INPUT, an executor **may** send one COVERAGE frame with `id = 0` and `kind = INIT` (1), its startup coverage. It is not a reply. The brain logs it and keeps waiting for the real reply. `suzzer-relay` doesn't send one.
 - **COVERAGE**: `kind` is a slot flag (`1` INIT, `2` ITER, `4` GAP; `0` = nothing was published, sent with an all-zero bitmap so lockstep still advances). The brain scores only `ITER`. `gen` is the executor's generation counter, opaque to the brain. `map_size` equals HELLO's.

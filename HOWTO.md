@@ -1166,7 +1166,8 @@ in another terminal or in the background, then start the relay within its
 it** (`--iters N` caps the run only if you ask; default 0 = open-ended). It
 keeps a **resumable on-disk corpus** under `<out>/corpus` (reloaded on the next
 start) and a built-in-seed fallback if `--seeds` is missing/empty.
-`--io-timeout` (default 60 s) bounds the wait for each relay reply.
+`--io-timeout` (default 60 s) bounds the wait for each executor reply, and
+`--hello-timeout` (default 600 s) the wait for its HELLO once it has connected.
 
 ```bash
 # Brain (off-device), backgrounded so the relay can be started next.
@@ -1292,9 +1293,13 @@ published:
   - SZR1 (§4): the brain protocol.
   - The coverage bucket formula (§5).
 - **[src/lcv_formats.h](src/lcv_formats.h)**: every struct and constant,
-  header-only, `<stdint.h>` only, strict-C11 clean. **Copy it** into your
-  tree at a pinned suzzer commit (with that commit's hash); don't include it
-  from a suzzer checkout.
+  header-only, `<stdint.h>` only, strict-C11 clean. Either copy it into your
+  tree at a pinned suzzer commit (with that commit's hash), or read it from
+  a suzzer checkout your build is pointed at, and check the format versions
+  it defines (`LIBCOV_VERSION`, `LIBCOV_BOUNDARY_VERSION`,
+  `LIBCOV_SHM_VERSION`, `SZR_PROTO_VERSION`) at compile time so a format
+  change stops your build instead of being misread. Either way, nothing
+  links libcov or needs suzzer built.
 - **[test/vectors/](test/vectors/)**: conformance vectors. Replay each
   `sequence.bin` through your implementation of FORMATS.md §5 and compare
   with `expected.bin`. Byte-identical maps for the schemes you claim mean your
@@ -1314,6 +1319,10 @@ For a target that isn't a Linux process:
 - The brain saves hangs and timeouts under `<out>/hangs/` and doesn't
   minimize them unless `--minimize-timeouts` is set. A reason the brain
   doesn't know is still saved as a crash, keyed by `(reason, status)`.
+- Send HELLO when you are ready to take the first input: the brain waits up
+  to `--hello-timeout` (600 s) for it after you connect, then `--io-timeout`
+  for each reply. An emulator can connect, boot its firmware, and only then
+  say HELLO.
 - In HELLO, send a short ASCII arch string (`mips32be`, `rv32`, ...) and a
   `ring_size` of 1 if you deliver one snapshot per input. Set the scheme bits
   for the formula you implement. Leave `MT`/`LIVE_EMPTY` clear unless they

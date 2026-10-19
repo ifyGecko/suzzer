@@ -4,7 +4,9 @@
 
 Make suzzer's on-disk, shared-memory and wire formats into a **documented, versioned contract** that other coverage producers can implement without linking libcov.
 
-The first consumer is the ember firmware emulator (see `ember_todo.md`). An emulator, a QEMU plugin or a hardware-trace decoder could then:
+**Status: S0–S6 are done** (commit 8fb13ae, "Publish suzzer's formats as a contract for other executors"). This file is kept as the record of what the contract promises.
+
+The first consumer is the ember firmware emulator (its plan lived in ember's tree). An emulator, a QEMU plugin or a hardware-trace decoder could then:
 - read suzzer's site lists,
 - produce bitmaps with the same meaning as libcov's,
 - and be driven by `suzzer_brain.py`.
@@ -16,7 +18,7 @@ suzzer's own purpose doesn't change: coverage for embedded Linux userland withou
 - **No consumer-specific code.** Nothing in suzzer names ember (or any other consumer) in code, build or tests. Changes are justified by being generic.
 - **Backward compatible.** Existing patch lists, boundary files, LCVS readers and brain/relay pairs keep working. Each change is additive or covered by a version check.
 - **libcov runtime unaffected.** No behaviour or performance change. All validation suites (`test/run_all.sh`, cross-arch runs) stay green.
-- **Consumers vendor, they don't link.** A consumer copies the format header and test vectors at a pinned commit. Nothing here may require a consumer to build suzzer.
+- **Consumers don't link.** A consumer copies the format header and test vectors at a pinned commit, or reads them from a suzzer checkout it is given. Nothing here may require a consumer to build suzzer.
 
 ---
 

@@ -21,7 +21,11 @@
 #   6. not score the INIT snapshot (the final edge count is exactly the
 #      union of the inputs' coverage), keep every distinct hang input, and
 #      minimize a fault only to inputs with the same status (fault PC);
-#   7. exit with an error when a reply carries the wrong id.
+#   7. exit with an error when a reply carries the wrong id;
+#   8. reject a frame of length 0, a CRASH frame cut short and a HELLO of
+#      another protocol version, naming the problem;
+#   9. wait --hello-timeout, not --io-timeout, for a HELLO that comes late
+#      (an executor that boots before it says HELLO), and give up after it.
 #
 # Needs only python3; no target, no libcov.
 set -euo pipefail
@@ -216,6 +220,30 @@ EXEC_ARGS=(); BRAIN_RC_OK=0
 [[ $BRAIN_RC -ne 0 ]] || fail "brain accepted a reply with the wrong id"
 grep -q "lockstep broken" "$WORK/badid.brain.log" || fail "no lockstep error: $(cat "$WORK/badid.brain.log")"
 echo "   OK: brain exits $BRAIN_RC (lockstep broken)"
+
+echo ">> 8. malformed frames and a foreign protocol version are refused"
+for m in "--zero-frame:frame length 0" "--short-crash:CRASH payload is 9 bytes" \
+         "--proto 2:protocol version 2"; do
+    flag=${m%%:*}; want=${m#*:}
+    read -r -a EXEC_ARGS <<<"$flag"; BRAIN_RC_OK=1
+    run_session "bad${flag//[- ]/}" --iters 1
+    EXEC_ARGS=(); BRAIN_RC_OK=0
+    log="$WORK/bad${flag//[- ]/}.brain.log"
+    [[ $BRAIN_RC -ne 0 ]] || fail "brain accepted $flag"
+    grep -q "$want" "$log" || fail "$flag: no '$want' in: $(cat "$log")"
+    echo "   OK: $flag refused ($want)"
+done
+
+echo ">> 9. a late HELLO waits --hello-timeout, not --io-timeout"
+EXEC_ARGS=(--hello-delay 2)
+run_session latehello --iters 3 --io-timeout 1 --hello-timeout 20
+grep -q "HELLO proto=1" "$WORK/latehello.brain.log" || fail "late HELLO not accepted"
+EXEC_ARGS=(--hello-delay 3); BRAIN_RC_OK=1
+run_session nohello --iters 3 --hello-timeout 1
+EXEC_ARGS=(); BRAIN_RC_OK=0
+[[ $BRAIN_RC -ne 0 ]] && grep -q "no HELLO within 1s (--hello-timeout)" "$WORK/nohello.brain.log" \
+    || fail "--hello-timeout not enforced: $(cat "$WORK/nohello.brain.log")"
+echo "   OK: HELLO after 2 s accepted with --io-timeout 1; --hello-timeout 1 gives up"
 
 echo
 echo "ALL BRAIN/EXECUTOR VALIDATIONS PASSED"

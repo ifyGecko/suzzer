@@ -46,7 +46,8 @@ Usage:
   suzzer_brain.py --listen HOST:PORT --seeds DIR [--out DIR]
                   [--iters N] [--max-size N] [--no-minimize]
                   [--minimize-timeouts]
-                  [--seed-rng N] [--accept-timeout S] [--io-timeout S] [--quiet]
+                  [--seed-rng N] [--accept-timeout S] [--hello-timeout S]
+                  [--io-timeout S] [--quiet]
 
 Start it first (backgrounded, or in another terminal), then start the
 executor (e.g. suzzer-relay) within --accept-timeout seconds. A missing or
@@ -74,6 +75,9 @@ SLOT_INIT, SLOT_ITER, SLOT_GAP = 1, 2, 4
 CRASH_EXIT, CRASH_SIGNAL, CRASH_DELIVERY, CRASH_MALFORMED = 1, 2, 3, 4
 CRASH_GUEST_FAULT, CRASH_ORACLE, CRASH_HANG, CRASH_TIMEOUT = 5, 6, 7, 8
 HELLO_ARCH_MAX = 64
+SZR_PROTO_VERSION = 1
+SZR_FRAME_MAX = 64 << 20          # suzzer-relay's limit (FORMATS.md 4.1)
+SZR_HELLO_HDR_LEN, SZR_COVERAGE_HDR_LEN, SZR_CRASH_LEN = 12, 21, 13
 
 CRASH_NAMES = {
     CRASH_EXIT: "EXIT", CRASH_SIGNAL: "SIGNAL", CRASH_DELIVERY: "DELIVERY",
@@ -111,8 +115,16 @@ def recvn(sock, n):
     return buf
 
 
+class ProtocolError(Exception):
+    """The executor broke the SZR1 framing or a frame's layout."""
+
+
 def recv_frame(sock):
     (length,) = struct.unpack(">I", recvn(sock, 4))
+    # length counts the type byte, so 0 is not a frame; past the limit the
+    # stream is most likely out of sync (FORMATS.md 4.1).
+    if length < 1 or length > SZR_FRAME_MAX + 1:
+        raise ProtocolError("frame length %d (must be 1..%d)" % (length, SZR_FRAME_MAX + 1))
     body = recvn(sock, length)
     return body[0], body[1:]        # type, payload
 
@@ -145,6 +157,10 @@ def main():
     ap.add_argument("--accept-timeout", type=float, default=15.0,
                     help="seconds to wait for the executor (e.g. "
                          "suzzer-relay) to connect")
+    ap.add_argument("--hello-timeout", type=float, default=600.0,
+                    help="seconds to wait for the executor's HELLO once it has "
+                         "connected (0 = forever; default 600: an emulator may "
+                         "boot its firmware before it says HELLO)")
     ap.add_argument("--io-timeout", type=float, default=60.0,
                     help="seconds to wait for each executor reply (0 = forever)")
     ap.add_argument("--status-file",
@@ -231,16 +247,36 @@ def main():
     except socket.timeout:
         sys.exit("brain: no executor connected within %gs (--accept-timeout)"
                  % args.accept_timeout)
-    conn.settimeout(args.io_timeout or None)
     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     log("executor connected from %s:%d" % peer)
 
-    if recvn(conn, 4) != SZR_MAGIC:
-        sys.exit("brain: bad magic from executor")
-    ftype, payload = recv_frame(conn)
+    conn.settimeout(args.hello_timeout or None)
+    try:
+        if recvn(conn, 4) != SZR_MAGIC:
+            sys.exit("brain: bad magic from executor")
+        ftype, payload = recv_frame(conn)
+    except socket.timeout:
+        sys.exit("brain: executor sent no HELLO within %gs (--hello-timeout)"
+                 % args.hello_timeout)
+    except (ConnectionError, ProtocolError) as e:
+        sys.exit("brain: before HELLO: %s" % e)
+    conn.settimeout(args.io_timeout or None)
+    if ftype == SZR_BYE:
+        sys.exit("brain: executor said BYE before HELLO (it could not start)")
     if ftype != SZR_HELLO:
         sys.exit("brain: expected HELLO, got type %d" % ftype)
+    if len(payload) < SZR_HELLO_HDR_LEN:
+        sys.exit("brain: HELLO payload is %d bytes (needs %d)"
+                 % (len(payload), SZR_HELLO_HDR_LEN))
     ver, flags, map_size, ring_size, arch_len = struct.unpack(">HHIHH", payload[:12])
+    if ver != SZR_PROTO_VERSION:
+        sys.exit("brain: executor speaks SZR1 protocol version %d; this brain speaks %d"
+                 % (ver, SZR_PROTO_VERSION))
+    if len(payload) < SZR_HELLO_HDR_LEN + arch_len:
+        sys.exit("brain: HELLO arch_len %d overruns its %d-byte payload"
+                 % (arch_len, len(payload)))
+    if map_size == 0:
+        sys.exit("brain: HELLO map_size is 0")
     # Free-form ASCII (<= 64 bytes): only logged and recorded in run_config.
     arch = payload[12:12 + arch_len].decode("ascii", "replace")
     if arch_len > HELLO_ARCH_MAX:
@@ -299,6 +335,7 @@ def main():
             "new_edges": edges - baseline_edges[0] if baseline_edges[0] is not None else 0,
             "crashes": crashes, "crashes_unique": len(crash_sigs),
             "hangs": hangs, "hangs_unique": len(hang_sigs),
+            "hangs_saved": len(hang_inputs),
             "stage": stage[0], "finished": finished, "config": run_config,
         }) + "\n")
 
@@ -336,9 +373,18 @@ def main():
             if ftype == SZR_BYE:
                 raise ExecutorBye()
             if ftype == SZR_CRASH:
+                if len(payload) < SZR_CRASH_LEN:
+                    raise ProtocolError("CRASH payload is %d bytes (needs %d)"
+                                        % (len(payload), SZR_CRASH_LEN))
                 cid, reason, status = struct.unpack(">QBi", payload[:13])
             elif ftype == SZR_COVERAGE:
+                if len(payload) < SZR_COVERAGE_HDR_LEN:
+                    raise ProtocolError("COVERAGE payload is %d bytes (needs %d)"
+                                        % (len(payload), SZR_COVERAGE_HDR_LEN))
                 cid, _gen, kind, msz = struct.unpack(">QQBI", payload[:21])
+                if msz != map_size or len(payload) < SZR_COVERAGE_HDR_LEN + msz:
+                    raise ProtocolError("COVERAGE map_size %d with %d bitmap bytes "
+                                        "(HELLO said %d)" % (msz, len(payload) - 21, map_size))
                 if cid == 0 and kind == SLOT_INIT:
                     # Unsolicited startup snapshot (id 0): not a reply to
                     # this input; the reply is still to come.
@@ -493,6 +539,8 @@ def main():
                  % args.io_timeout)
     except ConnectionError as e:
         sys.exit("brain: %s" % e)
+    except ProtocolError as e:
+        sys.exit("brain: protocol error from the executor: %s" % e)
     except ExecutorBye:
         log("executor said BYE; ending the session")
         executor_bye = True
@@ -505,10 +553,12 @@ def main():
         except OSError:
             pass
     total = sum(1 for b in cumulative if b)
-    log("done: execs=%d new_cov=%d crashes=%d (unique=%d) hangs=%d (unique=%d) "
-        "corpus=%d edges=%d"
+    # Hangs are deduplicated by input, not by (reason, status): unique counts
+    # the keys, saved the distinct inputs kept under hangs/.
+    log("done: execs=%d new_cov=%d crashes=%d (unique=%d) hangs=%d (unique=%d, "
+        "saved=%d) corpus=%d edges=%d"
         % (execs, new_cov, crashes, len(crash_sigs), hangs, len(hang_sigs),
-           len(corpus), total))
+           len(hang_inputs), len(corpus), total))
     emit_status(finished=True)
     if status_fp:
         status_fp.close()

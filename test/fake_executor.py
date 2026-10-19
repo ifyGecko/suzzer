@@ -18,18 +18,23 @@ INIT snapshot (id 0), then answers every INPUT according to its first byte:
 
 Test modes: --bad-id answers every INPUT with the wrong id;
 --bye-after-crash sends BYE instead of the reply to the first INPUT after
-a CRASH (where the brain's minimizer probes).
+a CRASH (where the brain's minimizer probes); --hello-delay S waits S
+seconds after connecting before HELLO (an emulator booting first);
+--proto N says protocol version N in HELLO; --zero-frame answers the first
+INPUT with a frame of length 0, --short-crash with a CRASH frame cut short.
 
 Every INPUT it receives is appended (hex, one per line) to --record, so a
 test can see what the brain sent, e.g. whether it minimized an input.
 
 Usage: fake_executor.py --brain HOST:PORT --record FILE [--map-size N]
-                        [--bad-id] [--bye-after-crash]
+                        [--bad-id] [--bye-after-crash] [--hello-delay S]
+                        [--proto N] [--zero-frame] [--short-crash]
 """
 import argparse
 import socket
 import struct
 import sys
+import time
 
 # SZR1 (docs/FORMATS.md)
 MAGIC = b"SZR1"
@@ -73,15 +78,20 @@ def main():
     ap.add_argument("--map-size", type=int, default=512)
     ap.add_argument("--bad-id", action="store_true")
     ap.add_argument("--bye-after-crash", action="store_true")
+    ap.add_argument("--hello-delay", type=float, default=0.0)
+    ap.add_argument("--proto", type=int, default=1)
+    ap.add_argument("--zero-frame", action="store_true")
+    ap.add_argument("--short-crash", action="store_true")
     a = ap.parse_args()
     host, _, port = a.brain.rpartition(":")
     s = socket.create_connection((host, int(port)), timeout=30)
     rec = open(a.record, "w", buffering=1)
 
     s.sendall(MAGIC)
+    time.sleep(a.hello_delay)
     arch = b"fake32"
     flags = FLAG_SCHEME | (1 << NGRAM_SHIFT)          # site-id, N=1, no rotate
-    send(s, HELLO, struct.pack(">HHIHH", 1, flags, a.map_size, 1, len(arch)) + arch)
+    send(s, HELLO, struct.pack(">HHIHH", a.proto, flags, a.map_size, 1, len(arch)) + arch)
     init = bytearray(a.map_size)
     init[300] = 1
     send(s, COVERAGE, coverage(0, 1, KIND_INIT, init))  # unsolicited, id 0
@@ -102,6 +112,12 @@ def main():
         first = data[0] if data else None
         if a.bad_id:
             ident += 1
+        if a.zero_frame:
+            s.sendall(struct.pack(">I", 0))
+            break
+        if a.short_crash:
+            send(s, CRASH, struct.pack(">QB", ident, GUEST_FAULT))
+            break
         if first == ord("Q") or (a.bye_after_crash and crashed):
             send(s, BYE)
             break
