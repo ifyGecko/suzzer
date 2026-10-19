@@ -1,0 +1,13 @@
+{
+  "model": "site",
+  "ngram_n": 8,
+  "rotate": 0,
+  "map_size": 4096,
+  "sequence_format": "u32le site_id",
+  "reset_record": "ffffffff",
+  "lcvs_scheme_flags": "0x808",
+  "emits": 6986,
+  "resets": 9,
+  "nonzero": 3224,
+  "saturated": 2
+}

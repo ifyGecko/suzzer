@@ -1,0 +1,16 @@
+{
+  "model": "pc",
+  "ngram_n": 4,
+  "rotate": 1,
+  "map_size": 4096,
+  "map_bits": 12,
+  "rot_amounts": [1, 4, 7],
+  "sequence_format": "u64le pc, u8 module_idx",
+  "reset_record": "ffffffffffffffffff",
+  "module_bases": ["0x400000", "0x7f3a5c000000", "0x10000000"],
+  "lcvs_scheme_flags": "0x438",
+  "emits": 6986,
+  "resets": 9,
+  "nonzero": 3230,
+  "saturated": 2
+}

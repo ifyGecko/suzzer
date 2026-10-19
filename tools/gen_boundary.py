@@ -31,6 +31,9 @@ Usage:
 
 Example:
   ./gen_boundary.py build/x86_64/target_loop /tmp/loop.lcvb iter_begin:begin
+
+Raw images take the same --raw --base --arch --bits --endian [--symbols]
+options as gen_patchlist.py; offsets are then relative to --base.
 """
 import argparse
 import json
@@ -39,12 +42,17 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 
 sys.dont_write_bytecode = True  # no tools/__pycache__ from the import below
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gen_patchlist import (default_strategy, fix_elfv1_nop_entries,  # noqa: E402
                            op_class, pick_entry, pick_terminator)
-from rz_resolve import NotFound, resolve_to_offset  # noqa: E402
+from rz_resolve import (NotFound, Image, add_image_args,  # noqa: E402
+                        image_from_args, resolve_to_offset)
+
+# How to open the binary (raw image flags, --symbols); set by main().
+IMAGE = Image()
 
 
 def check_inputs(binary):
@@ -60,8 +68,15 @@ def check_inputs(binary):
 def rizin(binary, cmds):
     # stderr is captured, not discarded: shown when rizin fails, dropped
     # (it is mostly analysis chatter) when it succeeds.
-    p = subprocess.run(["rizin", "-q", "-c", "; ".join(cmds), binary],
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # The commands go through a script file (-i): with --symbols the list
+    # can hold one `af` per symbol, which as a single -c string would
+    # overflow the kernel's per-argument limit.
+    with tempfile.NamedTemporaryFile("w", suffix=".rz") as script:
+        script.write("\n".join(cmds) + "\n")
+        script.flush()
+        p = subprocess.run(["rizin", "-q", *IMAGE.rizin_flags(), "-i", script.name,
+                            binary], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if p.returncode != 0:
         err = p.stderr.decode("utf-8", errors="replace").strip()
         tail = "\n".join(err.splitlines()[-10:]) or "(no stderr)"
@@ -82,10 +97,11 @@ def rizin_json(binary, cmds):
 
 
 def get_image_info(binary):
-    info = (rizin_json(binary, ["ij"]) or {}).get("bin")
+    info = IMAGE.info() or (rizin_json(binary, ["ij"]) or {}).get("bin")
     if not info or "baddr" not in info:
         sys.exit(f"error: {binary}: not an ELF, or rizin could not analyse it "
-                 f"(no 'bin' info from 'ij')")
+                 f"(no 'bin' info from 'ij'; for a raw image pass --raw "
+                 f"--base --arch --bits --endian)")
     return int(info["baddr"]), info.get("arch"), int(info.get("bits", 0))
 
 
@@ -98,8 +114,10 @@ def get_function_addrs(binary):
     the .opd function descriptor (data), not the code at dbg.foo."""
     fns = {}
     all_fns = []
-    raw = rizin_json(binary, ["aaa", "aflj"]) or []
+    # --symbols: make every named address a function before listing them.
+    raw = rizin_json(binary, ["aaa", *IMAGE.post_aaa(), "aflj"]) or []
     raw = fix_elfv1_nop_entries(lambda c: rizin_json(binary, [c]), raw)
+    raw = IMAGE.name_functions(raw)
     for f in raw:
         name = f.get("name", "")
         if name:
@@ -114,6 +132,8 @@ def get_function_addrs(binary):
         vaddr = s.get("vaddr")  # imports lack vaddr
         if name and vaddr:
             syms[name] = int(vaddr)
+    for addr, name in IMAGE.symbols.items():
+        syms.setdefault("sym." + name, addr)
     return fns, syms, all_fns
 
 
@@ -160,7 +180,10 @@ def first_bb_site(binary, fn_addr, strategy, is_mips):
     Under "entry" (MIPS) it's the function's first instruction (second,
     if it is a delay slot). Either way, "execution reached this address" means "the
     function was entered." """
-    blocks = rizin_json(binary, ["aaa", f"afbj @ {fn_addr}"]) or []
+    # A --symbols function rizin didn't find on its own must be defined in
+    # this fresh session too (only this one is needed here).
+    define = [f"af @ {fn_addr}"] if IMAGE.symbols else []
+    blocks = rizin_json(binary, ["aaa", *define, f"afbj @ {fn_addr}"]) or []
     if not blocks:
         return None
     # The function's *entry* basic block is the one starting at fn_addr.
@@ -272,7 +295,10 @@ def main():
                     help="write a begin-only sidecar that uses depth_filter=zero "
                          "anyway (it has no effect without END markers)")
     ap.add_argument("--verbose", "-v", action="store_true")
+    add_image_args(ap)
     args = ap.parse_args()
+    global IMAGE
+    IMAGE = image_from_args(ap, args)
     check_inputs(args.binary)
     patched = patchlist_offsets(args.patchlist) if args.patchlist else None
 

@@ -363,6 +363,36 @@ PLT and are not followed).
     --root main --root 'libmultimod_helper.so!helper_classify'
 ```
 
+### Raw firmware images (no ELF)
+
+A bootloader, RTOS image or flash dump has no ELF headers, so tell both
+generators what rizin would otherwise read from them:
+
+- `--raw --base ADDR --arch ARCH --bits N --endian big|little`. `ARCH` is a
+  rizin arch name (`mips`, `arm`, `riscv`, `ppc`, ...). `--base` is the load
+  address. It becomes module 0's link base in the patch list's base table
+  ([docs/FORMATS.md](docs/FORMATS.md) §1.5), so record offsets are
+  `address − base`.
+- `--symbols FILE` names the functions: `nm` output, `ADDR NAME` lines, or a
+  Ghidra symbol-table CSV export. Names become `sym.NAME`, usable with
+  `--root`, `--cutoff`, `--include-pat` and as boundary marker names.
+  Without it, every function is a heuristic `fcn.*`, which is skipped unless
+  you pass `--include-fcn`.
+
+The safety rules are the same as for ELFs: the MIPS entry strategy, no delay
+slots, the overlap checks, `--threading mt` alignment filtering.
+`--threading` defaults to `any` for a raw image (header hint ANY). `orig[]`
+is the image's own bytes (`--endian` only tells the disassembler how to
+read them). libcov itself doesn't
+load raw images. These lists are for other executors, e.g. an emulator.
+
+```bash
+./tools/gen_patchlist.py fw.bin /tmp/fw.lcv --raw --base 0x80010000 \
+    --arch mips --bits 32 --endian big --symbols fw.nm --root fw_entry
+./tools/gen_boundary.py fw.bin /tmp/fw.lcvb handle:begin --patchlist /tmp/fw.lcv \
+    --raw --base 0x80010000 --arch mips --bits 32 --endian big --symbols fw.nm
+```
+
 ### Other useful flags
 
 - `--strategy {auto,entry,terminator}`: per-block site selection. Leave `auto`
@@ -626,7 +656,8 @@ It defaults `LIBCOV_BOUNDARY_RING=16`, prints `OVERRUN`/`MISSING` lines, and
 ### Writing your own reader — the seqlock protocol
 
 The shm header is `struct libcov_shm_header` (see
-[`src/boundary.h`](src/boundary.h); 72 bytes on x86_64). Read `bitmap_offset`
+[`src/lcv_formats.h`](src/lcv_formats.h); 72 bytes on every target;
+specified in [docs/FORMATS.md](docs/FORMATS.md) §3). Read `bitmap_offset`
 and `ring_offset` from it. To read generation `g` safely:
 
 1. Read `hdr->gen_current` (acquire): the highest generation *assigned*. It
@@ -670,7 +701,8 @@ file** (`LIBCOV_SHM_PATH`) and optionally signals an **eventfd**
 coverage. There is no *in-library* network transport, but there **is a shipped
 over-IP template**: the on-device relay [`tools/suzzer-relay.c`](tools/suzzer-relay.c)
 and the off-device reference brain [`tools/suzzer_brain.py`](tools/suzzer_brain.py),
-talking TCP (Pattern C below; driven in §14.1, protocol in Design.md §24).
+talking TCP (Pattern C below; driven in §14.1, protocol in
+[docs/FORMATS.md](docs/FORMATS.md) §4 and Design.md §24).
 
 The usual split: the **target runs on a device** (embedded board, VM, remote
 host); the **fuzzer brain runs elsewhere** and needs the bitmap. Pick a
@@ -828,7 +860,7 @@ make test
 ```
 
 Builds both library variants and every test target (`all mt multimod
-o2pie`), runs all 18 **native** suites one after another, and prints a
+o2pie`), runs all 20 **native** suites one after another, and prints a
 PASS/FAIL summary (failing-suite logs are kept). It refuses to run when
 `ARCH` is not the host arch. Each suite uses its own `mktemp -d`, so you can
 safely run suites concurrently by hand; `make test` itself is sequential.
@@ -981,7 +1013,7 @@ python3 tools/suzzer_brain.py --listen 0.0.0.0:7000 --seeds ./corpus --out ./out
     -- $PWD/build/x86_64/target_netd /tmp/netd.port
 # 6. Watch it live, afl-style: have the brain write a status feed and render it.
 #    Add `--status-file /tmp/fuzz.jsonl` to the brain (step 4), then:
-python3 tools/status_tui.py --input /tmp/fuzz.jsonl --artifacts ./out/crashes
+python3 tools/status_tui.py --input /tmp/fuzz.jsonl
 ```
 
 **Fuzzing essentials the demos below don't show (do these):**
@@ -1156,7 +1188,13 @@ by crash signature** so one bug does not pile up hundreds of files; and it
 persists every new-coverage input to `./out/corpus/`. One `INPUT` gets exactly
 one `COVERAGE` or `CRASH` reply
 (lockstep); the relay also answers a malformed `INPUT` with a `CRASH` frame
-(reason 4, saved by the brain as `crash_<id>_r4_s0`) rather than dropping it, so the brain never waits forever. `--shm` follows the
+(reason 4, saved by the brain as `crash_r4_s0_<hash>`) rather than dropping it, so the brain never waits forever.
+Inputs an executor reports as `HANG` or `TIMEOUT` go to `./out/hangs/`
+instead, counted apart from crashes and not minimized (each probe would cost
+a full timeout; `--minimize-timeouts` opts in). Every distinct hang input is
+kept, up to `--max-hangs` (default 64), because a hang's status says little
+about which one it is. A finding is always written before it is minimized,
+so it survives the executor going away mid-minimization. `--shm` follows the
 same naming rule as `LIBCOV_SHM_PATH` (§10). To point it at your own daemon, give the relay your binary and a
 boundary sidecar for your handler's entry/exit, and make sure the daemon binds
 a port it writes to `--port-file` (or adapt the relay's delivery to your
@@ -1180,19 +1218,26 @@ relay's `deliver`.
   Other flags: `--max-size`, `--seed-rng`, `--splice-from`, `--splice-prob`,
   `--weights`, `--trace`, `--selftest`.
 - **Status board — [`tools/status_tui.py`](tools/status_tui.py).** A generic,
-  target-agnostic afl/afl++-style live status screen (the boxed process-timing /
-  overall-results / map-coverage / findings panels, plus a coverage chart and an
-  event feed). It is a **template you copy**: it reads a simple JSON-lines status
-  feed (one object per line — `t`, `execs`, `corpus`, `edges`, `map_size`,
-  `crashes`, `crashes_unique`, `config{}`, and `event{}` entries; full key list
-  in the file header), so any fuzzer that prints those lines gets the board for
-  free — or you replace the one small parser (see the "ADAPT ME" block) to read
-  your own log format, keeping `render()` unchanged. suzzer's reference brain
-  emits the feed directly:
+  target-agnostic afl/afl++-style static status screen: the boxed process-timing /
+  overall-results / map-coverage / stage-progress / findings panels, a run-config
+  box showing every `config{}` entry, and a static log of the latest events. It
+  has **no hotkeys**: it redraws every `--refresh` seconds (default 1), marks the
+  run `STALLED` when the feed stops updating or `RUN FINISHED` when it ends, and
+  exits on Ctrl-C. It is a **template you copy**: it reads a simple JSON-lines
+  status feed (one object per line — `t`, `execs`, `corpus`, `edges`,
+  `map_size`, `crashes`, `crashes_unique`, `config{}`, and `event{}` entries;
+  full key list in the file header), so any fuzzer that prints those lines gets
+  the board for free — or you replace the one small parser (see the "ADAPT ME"
+  block) to read your own log format, keeping `render()` unchanged. suzzer's
+  reference brain emits the feed directly. Its `config{}` carries the target
+  `arch`, coverage `scheme`, SZR1 `proto` and `ring` size, the `executor` peer, the
+  `listen` address, the `out` dir, the `seeds`/`resumed` counts, `max_size`,
+  `minimize`, and `iters_limit` when set. `stage` reads `baseline i/N` while the
+  corpus is replayed, and `new_edges` counts edges found beyond that baseline.
   ```bash
   # produce a feed from the reference brain, render it live:
   python3 tools/suzzer_brain.py --listen … --seeds … --status-file /tmp/fuzz.jsonl &
-  python3 tools/status_tui.py --input /tmp/fuzz.jsonl --artifacts ./out/crashes
+  python3 tools/status_tui.py --input /tmp/fuzz.jsonl
   # or just see the layout with no fuzzer at all:
   python3 tools/status_tui.py --demo         # synthetic data
   python3 tools/status_tui.py --selftest     # render checks, exits 0
@@ -1227,6 +1272,61 @@ relay's `deliver`.
   coverage region exists, `1` attach/dlopen failed, `2` usage error, `3`
   dlopen worked but libcov looks **inert** (no region; re-run with `-L
   <log>` and `-e LIBCOV_REQUIRE=1`). See its README for details.
+
+<a name="14-3-executor"></a>
+### 14.3 Writing your own executor
+
+`suzzer-relay` is one **executor**: the program that runs each input and
+reports coverage. An emulator, a QEMU plugin, a bare-metal harness or a
+hardware-trace decoder can be another one and still use suzzer's generators
+and brain, without linking libcov or building suzzer. Everything it needs is
+published:
+
+- **[docs/FORMATS.md](docs/FORMATS.md)**: the specification.
+  - LCV3 (§1): the sites to instrument. Record order is the site id, and the
+    module base table turns offsets back into addresses with no
+    `/proc/self/maps`.
+  - LCVB1 (§2): where an iteration begins and ends.
+  - LCVS (§3): the shared-memory region, if you want `fuzz_driver`-style
+    readers to work.
+  - SZR1 (§4): the brain protocol.
+  - The coverage bucket formula (§5).
+- **[src/lcv_formats.h](src/lcv_formats.h)**: every struct and constant,
+  header-only, `<stdint.h>` only, strict-C11 clean. **Copy it** into your
+  tree at a pinned suzzer commit (with that commit's hash); don't include it
+  from a suzzer checkout.
+- **[test/vectors/](test/vectors/)**: conformance vectors. Replay each
+  `sequence.bin` through your implementation of FORMATS.md §5 and compare
+  with `expected.bin`. Byte-identical maps for the schemes you claim mean your
+  bitmaps mean what libcov's do, so corpora carry over between the two.
+  [test/vectors_check.py](test/vectors_check.py) is a short reference.
+- **[test/fake_executor.py](test/fake_executor.py)**: a ~150-line SZR1
+  executor to start from. `test/run_validation_brain.sh` runs it against
+  the brain.
+
+For a target that isn't a Linux process:
+
+- Report failures with the executor-neutral crash reasons:
+  - `GUEST_FAULT` (5): `status` = faulting PC or a cause code;
+  - `ORACLE` (6): an assert/crash check fired;
+  - `HANG` (7): no forward progress;
+  - `TIMEOUT` (8): the per-input budget ran out.
+- The brain saves hangs and timeouts under `<out>/hangs/` and doesn't
+  minimize them unless `--minimize-timeouts` is set. A reason the brain
+  doesn't know is still saved as a crash, keyed by `(reason, status)`.
+- In HELLO, send a short ASCII arch string (`mips32be`, `rv32`, ...) and a
+  `ring_size` of 1 if you deliver one snapshot per input. Set the scheme bits
+  for the formula you implement. Leave `MT`/`LIVE_EMPTY` clear unless they
+  apply.
+- Optionally send your startup coverage as an unsolicited COVERAGE frame
+  with `id` 0 and kind INIT before the first reply. Then answer every INPUT
+  with exactly one COVERAGE (kind ITER) or CRASH carrying its id.
+- Reset the N-gram history before each input (FORMATS.md §5.3).
+- To match libcov's maps, emit the way libcov's default `leapfrog` mode does
+  (FORMATS.md §5.7):
+  - skip a site that was also the last site to emit, so tight self-loops
+    count once;
+  - count a boundary marker's own hit before resetting the history.
 
 ---
 

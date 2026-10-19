@@ -156,7 +156,8 @@ LIB := $(BUILD)/libcov_$(THREADING).so
 # default goal: `make` would just rebuild libcov.o.
 .DEFAULT_GOAL := all
 
-.PHONY: all clean test test-targets all-arch all-variants native print-vars tools tools-clean
+.PHONY: all clean test test-targets all-arch all-variants native print-vars tools tools-clean \
+        formats-check vectors vectors-check
 
 all: $(LIB) test-targets
 
@@ -191,7 +192,8 @@ NATIVE_SUITES := run_validation run_validation_mt run_validation_boundary \
                  run_validation_o2pie run_validation_marker_emulation \
                  run_validation_reexec run_validation_modules \
                  run_validation_patch_mode run_validation_paired \
-                 run_validation_docs run_validation_relay
+                 run_validation_docs run_validation_relay \
+                 run_validation_brain run_validation_formats
 
 test:
 ifneq ($(ARCH),$(shell uname -m))
@@ -201,10 +203,39 @@ endif
 	@# included .d file once became the default goal).
 	@$(MAKE) --no-print-directory -n 2>/dev/null | grep -q -- '-C test' \
 	    || { echo "FAIL: plain 'make' no longer builds 'all'" >&2; exit 1; }
+	$(MAKE) --no-print-directory formats-check
+	$(MAKE) --no-print-directory vectors-check
 	$(MAKE) --no-print-directory THREADING=st native
 	$(MAKE) --no-print-directory THREADING=mt native
 	$(MAKE) --no-print-directory -C test ARCH=$(ARCH) BUILD=$(abspath $(BUILD)) all mt multimod o2pie
 	./test/run_all.sh $(NATIVE_SUITES)
+
+# src/lcv_formats.h is vendored by other executors: it must compile on its
+# own with the strictest flags a known consumer uses, no libcov CFLAGS, and
+# only the compiler's own headers on the include path (-nostdinc + the
+# freestanding <stdint.h>), so an accidental libc include fails the build.
+FORMATS_STRICT_CFLAGS := -std=c11 -Wall -Wextra -Werror -Wshadow \
+                         -Wstrict-prototypes -Wmissing-prototypes
+FORMATS_ISOLATE := -ffreestanding -nostdinc \
+                   -isystem $(shell $(CC) -print-file-name=include)
+
+formats-check: | $(BUILD)
+	$(CC) $(FORMATS_STRICT_CFLAGS) -c test/formats_strict.c -o $(BUILD)/formats_strict.o
+	$(CC) $(FORMATS_STRICT_CFLAGS) $(FORMATS_ISOLATE) -c test/formats_strict.c \
+	    -o $(BUILD)/formats_strict_isolated.o
+
+# Conformance vectors for the coverage bucket formula (test/vectors/),
+# generated from src/sink.h itself. `make vectors` rewrites them -- only do
+# that for an intended formula change, which breaks every consumer's
+# bitmaps. vectors-check (run by `make test`) fails if the committed copy no
+# longer matches the runtime, then replays them through the independent
+# Python implementation. Host compiler only (needs a 64-bit host).
+vectors:
+	./test/gen_vectors.sh test/vectors
+
+vectors-check:
+	./test/gen_vectors.sh --check test/vectors
+	python3 test/vectors_check.py test/vectors
 
 # Opt-in build of the auxiliary tooling LD_PRELOADs (currently
 # libdemalloc.so). Independent of THREADING and intentionally NOT

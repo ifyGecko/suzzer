@@ -1,42 +1,17 @@
 /*
- * patchlist_format.h -- on-disk patch-list wire format + runtime patch_entry.
+ * patchlist_format.h -- the LCV3 patch list as libcov's runtime sees it.
  *
- * Format: LCV3. Single-version, no backward-compat readers retained.
+ * The on-disk format itself (header and record structs, magic, version,
+ * LIBCOV_TH_*, header flags, module tables) is defined in lcv_formats.h,
+ * the header-only contract other executors vendor; docs/FORMATS.md is its
+ * specification. This file adds only what libcov needs at runtime: the
+ * patch_entry table built from the records, and the loader.
  *
- *   struct patchlist_header_v3 {
- *       char     magic[4];        // "LCV3"
- *       uint32_t version;         // 3
- *       uint32_t count;           // number of records that follow the header
- *       uint8_t  threading;       // 0=ANY, 1=ST, 2=MT
- *       uint8_t  flags;           // reserved, must be 0
- *       uint8_t  module_count;    // 1..255 entries in the name table
- *       uint8_t  reserved;
- *       uint32_t modules_offset;  // file offset of the module-name table
- *       uint32_t modules_size;    // total bytes in the name table
- *   };
- *
- * Layout in file:
- *   [header_v3]
- *   [count * struct patchlist_record]
- *   [module name table: module_count NUL-terminated basenames concatenated]
- *
- * The module name table can sit immediately after the records (typical) or
- * anywhere else in the file (modules_offset is authoritative). Each name is
- * the basename of a loaded ELF (e.g. "target_simple", "libfoo.so") and is
- * resolved at init through /proc/self/maps. Record.module_idx is an index
- * into this table; the runtime resolves one load base per module name and
- * uses base[module_idx] + offset for each entry's absolute address.
- *
- * All multi-byte fields are little-endian on disk regardless of target endian.
- *
- * Record:
- *
- *   struct patchlist_record {
- *       uint64_t offset;       // from libcov_module_bases[module_idx]
- *       uint8_t  len;          // bytes to patch and restore (2 or 4)
- *       uint8_t  module_idx;   // index into the name table
- *       uint8_t  orig[4];      // first `len` bytes are meaningful
- *   } __attribute__((packed)); // 14 bytes
+ * Header flags: bit 0 (LCV_FLAG_MODULE_BASES) says a u64 link-base table
+ * follows the name table; the other bits must be 0, and readers ignore bits
+ * they don't know. config_load reads the base table only to log a mismatch
+ * against the actual mapping (debug aid); offsets are always resolved
+ * against the runtime base from /proc/self/maps.
  *
  * `len` is per-record so back-to-back 2-byte ISAs (arm-Thumb, riscv64-C)
  * can coexist with 4-byte ISAs in the same list without one site's arm
@@ -53,44 +28,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define LIBCOV_MAGIC   "LCV3"
-#define LIBCOV_VERSION 3u
-
-/* Threading hint stored in the header. */
-#define LIBCOV_TH_ANY 0u
-#define LIBCOV_TH_ST  1u
-#define LIBCOV_TH_MT  2u
-
-/* Maximum bytes ever written by libcov_arch_write_illegal across all
- * supported arches. Sized so a single naturally-aligned 4-byte write
- * covers fixed-width 4-byte ISAs (aarch64/arm-ARM/mips/ppc/riscv64), and
- * 2-byte writes (x86 UD2, arm-Thumb, riscv64-C) fit with room to spare. */
-#define LIBCOV_PATCH_ORIG_MAX 4u
-
-/* Caps on the module name table. 255 modules is plenty for typical
- * targets (executable + a handful of shared libs). 4 KiB total name
- * bytes leaves room for fully-qualified long basenames if ever needed. */
-#define LIBCOV_MAX_MODULES         255u
-#define LIBCOV_MAX_MODULES_BYTES   4096u
-
-struct patchlist_header_v3 {
-    char     magic[4];
-    uint32_t version;
-    uint32_t count;
-    uint8_t  threading;
-    uint8_t  flags;
-    uint8_t  module_count;
-    uint8_t  reserved;
-    uint32_t modules_offset;
-    uint32_t modules_size;
-} __attribute__((packed));
-
-struct patchlist_record {
-    uint64_t offset;
-    uint8_t  len;
-    uint8_t  module_idx;
-    uint8_t  orig[LIBCOV_PATCH_ORIG_MAX];
-} __attribute__((packed));
+#include "lcv_formats.h"
 
 /* Runtime entry built from a record + module base. Sorted by addr; built
  * once at init, never resized, so reads are safe in a signal handler.

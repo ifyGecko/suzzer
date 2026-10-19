@@ -98,6 +98,12 @@ Output layout matches src/patchlist_format.h:
   record (14 bytes):       u64 offset, u8 len, u8 module_idx, u8 orig[4]
   name table:              module_count NUL-terminated basenames at
                            modules_offset
+  module bases:            module_count x u64 link base (rizin baddr) at
+                           align8(modules_offset + modules_size); present
+                           when header flags bit 0 (LCV_FLAG_MODULE_BASES)
+                           is set, which is the default (--no-module-bases
+                           leaves it out). Old readers ignore it.
+See docs/FORMATS.md for the full specification.
 
 Usage:
   # single module (the main executable):
@@ -110,6 +116,11 @@ Usage:
   ./gen_patchlist.py <binary> <out.lcv> \\
         --module libfoo.so:/path/to/libfoo.so \\
         --module libasdf.so:/path/to/libasdf.so
+
+  # raw firmware image (no ELF): give rizin the load address, arch, width
+  # and byte order; name functions from an nm / Ghidra symbols export:
+  ./gen_patchlist.py fw.bin <out.lcv> --raw --base 0x80010000 \\
+        --arch mips --bits 32 --endian big --symbols fw.nm
 
   # selective (instrument only the slice rooted at parse_request,
   # but don't recurse into the logging or crypto subsystems):
@@ -129,7 +140,8 @@ import sys
 
 import rzpipe
 
-from rz_resolve import NotFound, resolve_to_offset
+from rz_resolve import (NotFound, Image, add_image_args, image_from_args,
+                        resolve_to_offset)
 
 
 # Functions excluded from instrumentation by default: PLT/import
@@ -156,6 +168,9 @@ assert LCV3_RECORD_STRUCT.size == 14
 LCV3_HEADER_STRUCT = struct.Struct("<4sIIBBBBII")
 assert LCV3_HEADER_STRUCT.size == 24
 
+# Header flags (LCV_FLAG_* in src/lcv_formats.h).
+LCV_FLAG_MODULE_BASES = 1 << 0
+
 
 # rizin still emits a few ANSI CSI sequences (clear-line etc.) even from
 # rzpipe with default settings; strip them before raw-JSON decoding of
@@ -164,8 +179,11 @@ assert LCV3_HEADER_STRUCT.size == 24
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
-def open_rizin(binary):
+def open_rizin(binary, image=None):
     """Open a persistent rizin session and run analysis exactly once.
+
+    `image` (rz_resolve.Image) loads a raw image with its --base/--arch/
+    --bits/--endian and makes every --symbols address a function.
 
     All subsequent queries reuse the cached analysis, which is the whole
     point of the rzpipe rewrite -- the previous shell-subprocess version
@@ -179,8 +197,9 @@ def open_rizin(binary):
     if shutil.which("rizin") is None:
         sys.exit("error: rizin not found on PATH (needed to analyse the binary; "
                  "see HOWTO.md \"Prerequisites\")")
+    image = image or Image()
     try:
-        rz = rzpipe.open(binary)
+        rz = rzpipe.open(binary, flags=image.rizin_flags())
     except Exception as e:
         sys.exit(f"error: failed to open {binary} with rizin: {e}")
     # Silence ANSI/colour from cmd() output; cmdj() is unaffected.
@@ -188,18 +207,23 @@ def open_rizin(binary):
     # A non-ELF (or anything rizin can't load) has no "bin" info; without
     # this check it surfaces much later as "no patch sites selected".
     b = (rz.cmdj("ij") or {}).get("bin") or {}
-    if not b.get("arch"):
+    if not image.raw and not b.get("arch"):
         try:
             rz.quit()
         except Exception:
             pass
         sys.exit(f"error: {binary}: not an ELF, or rizin could not analyse it "
-                 f"(no 'bin' info from 'ij')")
+                 f"(no 'bin' info from 'ij'; for a raw image pass --raw "
+                 f"--base --arch --bits --endian)")
     rz.cmd("aaa")
+    for c in image.post_aaa():
+        rz.cmd(c)
     return rz
 
 
-def get_bin_info(rz):
+def get_bin_info(rz, image=None):
+    if image is not None and image.raw:
+        return image.info()
     info = rz.cmdj("ij") or {}
     b = info.get("bin", {})
     return {
@@ -210,9 +234,11 @@ def get_bin_info(rz):
     }
 
 
-def get_all_functions(rz):
-    """Unfiltered function list from `aflj`. Caller filters via regex."""
-    return fix_elfv1_nop_entries(rz.cmdj, rz.cmdj("aflj") or [])
+def get_all_functions(rz, image=None):
+    """Unfiltered function list from `aflj`, --symbols names applied.
+    Caller filters via regex."""
+    fns = fix_elfv1_nop_entries(rz.cmdj, rz.cmdj("aflj") or [])
+    return image.name_functions(fns) if image is not None else fns
 
 
 def fix_elfv1_nop_entries(cmdj, fns):
@@ -751,7 +777,8 @@ def resolve_slice_specs(specs, module_idx, all_fns, found, stubs, flag, verbose)
     return out
 
 
-def collect_module_records(args, rz, module_idx, module_name, slicing=None):
+def collect_module_records(args, rz, module_idx, module_name, slicing=None,
+                           image=None):
     """Walk one module's functions and return its patch records.
 
     Returns (records, mt_skipped_alignment). Each record is a tuple
@@ -762,6 +789,7 @@ def collect_module_records(args, rz, module_idx, module_name, slicing=None):
     `slicing` carries the parsed --root / --cutoff specs and the per-spec
     "resolved in" maps shared across modules (see run()). With
     --print-reachable the slice is printed and no records are returned.
+    `image` describes a raw image / --symbols (module 0 only).
     """
     inc = re.compile(args.include_pat) if args.include_pat else None
     exc_pats = []
@@ -771,7 +799,7 @@ def collect_module_records(args, rz, module_idx, module_name, slicing=None):
         exc_pats.append(args.exclude_pat)
     exc = re.compile("|".join(f"(?:{pat})" for pat in exc_pats)) if exc_pats else None
 
-    info = get_bin_info(rz)
+    info = get_bin_info(rz, image)
     baddr = info["baddr"]
     arch  = info["arch"]
     bits  = info["bits"]
@@ -789,7 +817,7 @@ def collect_module_records(args, rz, module_idx, module_name, slicing=None):
 
     # One canonical `aflj` snapshot, reused for filtering, slice
     # resolution, and PPC64 dual-entry lookup.
-    all_fns_raw = get_all_functions(rz)
+    all_fns_raw = get_all_functions(rz, image)
     fns = filter_functions(all_fns_raw, inc, exc)
     if inc:
         report_include_matches(fns, args.include_pat, module_name, args.verbose)
@@ -994,28 +1022,42 @@ def runtime_module_name(name, path):
     return name
 
 
-def write_lcv3(output_path, module_names, records, threading_hint):
-    """Pack module records + name table into the LCV3 wire format."""
+def write_lcv3(output_path, module_names, records, threading_hint,
+               module_bases=None):
+    """Pack module records + name table into the LCV3 wire format.
+
+    module_bases: one link base per module, written as the u64 table after
+    the name table (and LCV_FLAG_MODULE_BASES set); None leaves both out."""
     name_blob = b"".join(n.encode("utf-8") + b"\x00" for n in module_names)
     header_size  = LCV3_HEADER_STRUCT.size
     records_size = LCV3_RECORD_STRUCT.size * len(records)
     modules_offset = header_size + records_size
     modules_size   = len(name_blob)
+    flags = 0
+    bases_blob = b""
+    if module_bases is not None:
+        assert len(module_bases) == len(module_names)
+        flags |= LCV_FLAG_MODULE_BASES
+        end = modules_offset + modules_size
+        pad = (-end) % 8                  # table sits at align8(end)
+        bases_blob = b"\x00" * pad + b"".join(struct.pack("<Q", b)
+                                              for b in module_bases)
 
     with open(output_path, "wb") as f:
         f.write(LCV3_HEADER_STRUCT.pack(
             b"LCV3", 3, len(records),
-            threading_hint, 0, len(module_names), 0,
+            threading_hint, flags, len(module_names), 0,
             modules_offset, modules_size))
         for offset, size, module_idx, orig in records:
             padded = orig + b"\x00" * (LCV3_ORIG_LEN - len(orig))
             f.write(LCV3_RECORD_STRUCT.pack(offset, size, module_idx, padded))
         f.write(name_blob)
+        f.write(bases_blob)
 
 
 def run(args):
     """Collect records from every requested module and emit an LCV3 file."""
-    threading_hint = TH_MT if args.threading == "mt" else TH_ST
+    threading_hint = {"mt": TH_MT, "st": TH_ST, "any": TH_ANY}[args.threading]
 
     # Module index 0 is always the positional `binary`. Additional
     # `--module name:path` flags become module indices 1, 2, ... in the
@@ -1046,15 +1088,18 @@ def run(args):
     }
 
     all_records = []
+    module_bases = []
     total_skipped = 0
     for module_idx, (name, path) in enumerate(module_specs):
         if args.verbose:
             print(f"opening rizin on module[{module_idx}] '{name}' ({path})",
                   file=sys.stderr)
-        rz = open_rizin(path)
+        image = args.image if module_idx == 0 else None
+        rz = open_rizin(path, image)
         try:
+            module_bases.append(get_bin_info(rz, image)["baddr"])
             records, skipped = collect_module_records(args, rz, module_idx,
-                                                      name, slicing)
+                                                      name, slicing, image)
         finally:
             try:
                 rz.quit()
@@ -1092,12 +1137,17 @@ def run(args):
             hint = (" Check --include-pat: rizin names functions with debug "
                     "info 'dbg.NAME' and others 'sym.NAME' (run with -v to "
                     "see what matched).")
+        if args.raw and not args.include_fcn:
+            hint += (" A raw image's functions are all heuristic fcn.* unless "
+                     "--symbols names them; pass --symbols FILE or "
+                     "--include-fcn.")
         sys.exit(f"error: no patch sites selected; not writing {args.output}."
                  f"{hint} Pass --allow-empty to write an empty patch list "
                  f"anyway.")
 
     write_lcv3(args.output, [n for n, _ in module_specs], all_records,
-               threading_hint)
+               threading_hint,
+               None if args.no_module_bases else module_bases)
 
     skipped_note = (f", skipped {total_skipped} mt-unsafe sites"
                     if total_skipped else "")
@@ -1143,9 +1193,11 @@ def main():
     ap.add_argument("--strategy", choices=["auto", "entry", "terminator"],
                     default="auto",
                     help="per-block patch site selection (auto = arch default)")
-    ap.add_argument("--threading", choices=["st", "mt"], default="st",
-                    help="target libcov threading variant (st default, mt for "
-                         "thread-safe runtime)")
+    ap.add_argument("--threading", choices=["st", "mt", "any"], default=None,
+                    help="target libcov threading variant: st (default), mt "
+                         "for the thread-safe runtime (keeps only sites it "
+                         "can patch atomically), or any (no MT filtering, "
+                         "header hint ANY; --raw only, and its default)")
     ap.add_argument("--root", action="append", default=[],
                     metavar="SYM_OR_ADDR",
                     help="instrument only the call-graph slice reachable from "
@@ -1177,8 +1229,23 @@ def main():
                     help="write the patch list even when no sites were "
                          "selected (by default that is an error: an empty "
                          "list makes libcov silently record nothing)")
+    ap.add_argument("--no-module-bases", action="store_true",
+                    help="leave out the per-module link-base table (header "
+                         "flags bit 0) that consumers without "
+                         "/proc/self/maps use to turn offsets back into "
+                         "addresses; libcov does not need it")
     ap.add_argument("--verbose", "-v", action="store_true")
+    add_image_args(ap)
     args = ap.parse_args()
+    args.image = image_from_args(ap, args)
+    if args.raw and args.module:
+        ap.error("--raw describes the positional binary only; --module takes ELFs "
+                 "and can't be combined with it")
+    if args.threading is None:
+        args.threading = "any" if args.raw else "st"
+    elif args.threading == "any" and not args.raw:
+        ap.error("--threading any is for raw images (--raw); libcov loads an ANY "
+                 "list in either variant, so an ELF list must say st or mt")
 
     if (args.cutoff or args.max_depth is not None or args.print_reachable) \
             and not args.root:

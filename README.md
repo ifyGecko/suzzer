@@ -715,7 +715,8 @@ refused unless `--force`.
 
 ## Shm header layout
 
-`struct libcov_shm_header` (defined in `src/boundary.h`):
+`struct libcov_shm_header` (defined in `src/lcv_formats.h`; specified in
+[docs/FORMATS.md](docs/FORMATS.md) §3 with the seqlock protocol):
 
 ```c
 char     magic[4]    = "LCVS";
@@ -727,6 +728,7 @@ uint32_t flags;           // bit0 = boundaries active, bit1 = MT-variant libcov,
                           // bit2 = live bitmap not maintained (read the ring),
                           // bit3 = scheme bits valid, bit4 = hashed-PC model,
                           // bit5 = N-gram rotation, bits 8..11 = LIBCOV_NGRAM_N
+uint32_t pad0;            // 0
 uint64_t gen_current;     // atomic; highest generation assigned (see seqlock step 1)
 uint64_t gen_init;        // gen at which init snapshot was captured
 uint64_t bitmap_offset;   // shm-base relative
@@ -745,7 +747,7 @@ bits existed), `fuzz_driver` prints a `driver: scheme ...` line, and
 `suzzer-relay` forwards them in its HELLO.
 
 The struct is 72 bytes on every target (`_Static_assert` in
-`src/boundary.h`). Fields are written in the target's byte order. Drivers
+`src/lcv_formats.h`). Fields are written in the target's byte order. Drivers
 should read `map_size`, `bitmap_offset` and `ring_offset` from the header
 rather than hard-coding them.
 
@@ -868,8 +870,11 @@ src/
   config.c            LCV3 mmap loader; per-module base resolution from
                       /proc/self/maps; sorted patch_entry table (endian-safe);
                       threading-hint enforcement
-  patchlist_format.h  on-disk LCV3 wire format + runtime patch_entry struct
-                      (renamed from config.h; not a tunables file)
+  lcv_formats.h       header-only definitions of every published format
+                      (LCV3, LCVB1, LCVS, SZR1); only <stdint.h>, strict
+                      C11. Other executors copy it; see docs/FORMATS.md
+  patchlist_format.h  runtime patch_entry struct + loader API (the LCV3
+                      format itself is in lcv_formats.h; renamed from config.h)
   tunables.h          project-wide knobs (trap signo default SIGILL, bitmap size,
                       log buf); every knob -D-overridable
   tunables_<arch>.h   per-backend knobs (illegal encoding(s), instruction-width
@@ -948,6 +953,13 @@ test/
   run_validation_paired.sh    BEGIN/END markers, init/iter/gap counts
   run_validation_relay.sh     remote fuzzing template end to end on loopback
                               (suzzer-relay + suzzer_brain.py + target_netd)
+  run_validation_brain.sh     the brain against fake_executor.py, an SZR1
+                              executor written from docs/FORMATS.md (crash
+                              reasons, hangs, INIT/BYE handling)
+  run_validation_formats.sh   formats_reader.py (written from docs/FORMATS.md)
+                              reads real LCV3/LCVB1/LCVS output
+  gen_vectors.sh/.c           coverage-formula conformance vectors (test/vectors/)
+                              from src/sink.h; vectors_check.py re-derives them
   run_validation_docs.sh      runs HOWTO.md recipes 1-3/6 and the README slicing
                               example straight from the docs (x86_64 only)
   run_validation_demalloc.sh  libdemalloc (not part of `make test`)
@@ -965,11 +977,15 @@ tools/
                       whose callee never returns still report -- vs entry,
                       Thumb-aware, delay-slot-aware,
                       ppc64 local-entry-aware); --threading st|mt;
-                      --module name:path adds auxiliary modules
+                      --module name:path adds auxiliary modules; writes each
+                      module's link base (--no-module-bases to omit);
+                      --raw --base --arch --bits --endian [--symbols] for
+                      raw firmware images (HOWTO §5)
   gen_boundary.py     rizin-based LCVB1 sidecar generator; resolves symbol
                       names to their first-BB site (terminator, or entry
-                      on MIPS)
-  rz_resolve.py       shared SYM_OR_ADDR resolver used by both generators
+                      on MIPS); same --raw/--symbols options
+  rz_resolve.py       shared SYM_OR_ADDR resolver and raw-image/--symbols
+                      options used by both generators
   mutate.py           generic AFL++-style mutation engine (library + CLI):
                       stdlib-only, weighted havoc + splice, AFL-format
                       dictionaries, user-defined StructuredInsert
@@ -982,15 +998,17 @@ tools/
                       guard pages, canary, bounded UAF/double-free
                       quarantine); `make tools` -> build/<arch>/libdemalloc.so
   suzzer-relay.c      on-device coverage relay for remote (over-IP) fuzzing;
-  relay_proto.h       `make -C tools relay`. Wire protocol in relay_proto.h.
+  relay_proto.h       `make -C tools relay`. One SZR1 executor; the protocol
+                      is in docs/FORMATS.md §4 (constants: src/lcv_formats.h).
   suzzer_brain.py     off-device reference fuzzing brain, strong by default:
                       mutate + score + resumable on-disk corpus + crash
                       dedup/minimize; runs until stopped; --status-file writes
                       a JSON-lines feed for status_tui.py. Pairs with
                       suzzer-relay. See HOWTO §14.1 and Recipe 1
-  status_tui.py       generic, target-agnostic afl/afl++-style live status
+  status_tui.py       generic, target-agnostic afl/afl++-style static status
                       board (boxed timing/results/coverage/findings panels +
-                      coverage chart + event feed). A copy-me template: reads a
+                      run config + event log; no hotkeys, redraws until
+                      Ctrl-C). A copy-me template: reads a
                       JSON-lines status feed (any fuzzer can emit it; or swap
                       the one parser for your log format, keeping render()).
                       --demo / --selftest / --dump; see HOWTO §14.2
@@ -1000,13 +1018,17 @@ tools/
                       arches are stubs; inject_procmem is a stub). Separate
                       build: `make -C tools/inject`. See tools/inject/README.md
 HOWTO.md              step-by-step operational guide (build -> generate -> run -> read)
+docs/FORMATS.md       specification of LCV3, LCVB1, LCVS, SZR1 and the coverage
+                      bucket formula, for other executors (see HOWTO §14.3)
 TODO.md               deferred design work (daemons, transport, etc.)
 ```
 
 ## Validation
 
 `make test` builds both library variants and every test target (`all mt
-multimod o2pie`), then runs all 18 native suites (the list is
+multimod o2pie`), checks that `src/lcv_formats.h` compiles on its own with
+strict C11 flags and that the committed `test/vectors/` still match
+`src/sink.h` (`make vectors-check`), then runs all 20 native suites (the list is
 `NATIVE_SUITES` in the Makefile) one after another, and prints a PASS/FAIL
 summary (logs of failing suites are kept). It refuses to run when `ARCH`
 isn't the host arch. Each suite uses its own `mktemp -d`, so you can run

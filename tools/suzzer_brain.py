@@ -2,12 +2,13 @@
 """suzzer_brain.py -- off-device coverage-guided fuzzing brain.
 
 Reference "brain" for the remote fuzzing template, and a worked example of a
-*strong-by-default* coverage-guided loop. The relay (tools/suzzer-relay.c)
-dials in from the device; everything below runs off-device:
+*strong-by-default* coverage-guided loop. An executor dials in -- normally
+suzzer-relay (tools/suzzer-relay.c) on the device, but any program that
+speaks SZR1 (docs/FORMATS.md) will do; everything below runs off-device:
 
   - mutates inputs with tools/mutate.py (Engine);
-  - sends each input to the relay, which delivers it to the target daemon and
-    returns one COVERAGE (or CRASH) frame;
+  - sends each input to the executor, which runs it (suzzer-relay: delivers
+    it to the target daemon) and returns one COVERAGE (or CRASH) frame;
   - folds the returned bitmap into a cumulative map, keeps inputs that reached
     new coverage, and saves + triages crashing inputs.
 
@@ -21,7 +22,14 @@ choices; do not strip them back out):
   * Saves each crash as the **full input plus a .info sidecar** (reason,
     status, size, hex) so it can be replayed, and **deduplicates** by crash
     signature so one bug does not fill the directory with hundreds of copies.
+    Hangs and timeouts (an executor's HANG / TIMEOUT reasons) go to
+    <out>/hangs, counted apart from crashes; every distinct hang input is
+    kept (up to --max-hangs), since (reason, status) says little about one.
+    A finding is written before it is minimized, so it survives a lost
+    executor.
   * **Minimizes** a newly-found crash (bounded block-dropping) before saving.
+    Not hangs/timeouts: every probe of one costs a full timeout
+    (--minimize-timeouts opts in).
   * Default `--max-size` is 64 KB -- a real input budget, not a 1 KB stub.
     (The 64 KB is an input-size cap; it is unrelated to the coverage map size.)
 
@@ -29,18 +37,20 @@ Pair it with the heap oracle: start the relay with libdemalloc co-loaded in
 its --libcov argument (a colon list), so heap overflows/UAFs that would die
 silently become visible CRASH frames.
 
-Protocol: tools/relay_proto.h. The relay decodes the shm header on the device,
-so this never parses a foreign-ABI header -- it receives map_size plus raw
-uint8 counters.
+Protocol: SZR1, specified in docs/FORMATS.md (constants in src/lcv_formats.h).
+The executor decodes any shm header on its side, so this never parses a
+foreign-ABI header -- it receives map_size plus raw uint8 counters. Crash
+reasons it does not know are kept as opaque crashes, keyed by (reason, status).
 
 Usage:
   suzzer_brain.py --listen HOST:PORT --seeds DIR [--out DIR]
                   [--iters N] [--max-size N] [--no-minimize]
+                  [--minimize-timeouts]
                   [--seed-rng N] [--accept-timeout S] [--io-timeout S] [--quiet]
 
-Start it first (backgrounded, or in another terminal), then start
-suzzer-relay within --accept-timeout seconds. A missing or empty --seeds
-directory falls back to built-in seeds (plus any resumed corpus).
+Start it first (backgrounded, or in another terminal), then start the
+executor (e.g. suzzer-relay) within --accept-timeout seconds. A missing or
+empty --seeds directory falls back to built-in seeds (plus any resumed corpus).
 """
 import argparse
 import hashlib
@@ -57,11 +67,38 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mutate import Engine  # noqa: E402
 
-# ---- protocol (mirror of tools/relay_proto.h) --------------------------
+# ---- protocol (mirror of src/lcv_formats.h, SZR1 section) -------------
 SZR_MAGIC = b"SZR1"
 SZR_HELLO, SZR_INPUT, SZR_COVERAGE, SZR_CRASH, SZR_BYE = 1, 2, 3, 4, 5
 SLOT_INIT, SLOT_ITER, SLOT_GAP = 1, 2, 4
 CRASH_EXIT, CRASH_SIGNAL, CRASH_DELIVERY, CRASH_MALFORMED = 1, 2, 3, 4
+CRASH_GUEST_FAULT, CRASH_ORACLE, CRASH_HANG, CRASH_TIMEOUT = 5, 6, 7, 8
+HELLO_ARCH_MAX = 64
+
+CRASH_NAMES = {
+    CRASH_EXIT: "EXIT", CRASH_SIGNAL: "SIGNAL", CRASH_DELIVERY: "DELIVERY",
+    CRASH_MALFORMED: "MALFORMED", CRASH_GUEST_FAULT: "GUEST_FAULT",
+    CRASH_ORACLE: "ORACLE", CRASH_HANG: "HANG", CRASH_TIMEOUT: "TIMEOUT",
+}
+# status is a PC / oracle id / cause code for these: shown in hex.
+HEX_STATUS = (CRASH_GUEST_FAULT, CRASH_ORACLE)
+# No forward progress / budget exceeded: saved under hangs/, not crashes/.
+HANG_REASONS = (CRASH_HANG, CRASH_TIMEOUT)
+
+
+def crash_name(reason):
+    """Symbolic name of a crash reason; unknown ones stay opaque ('r<N>')."""
+    return CRASH_NAMES.get(reason, "r%d" % reason)
+
+
+def fmt_status(reason, status):
+    if reason in HEX_STATUS:
+        return "0x%x" % (status & 0xffffffff)
+    return "%d" % status
+
+
+class ExecutorBye(Exception):
+    """The executor sent BYE: a clean end of the session."""
 
 
 def recvn(sock, n):
@@ -69,7 +106,7 @@ def recvn(sock, n):
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
         if not chunk:
-            raise ConnectionError("relay closed the connection")
+            raise ConnectionError("executor closed the connection")
         buf += chunk
     return buf
 
@@ -89,7 +126,8 @@ def main():
     ap.add_argument("--listen", required=True, help="HOST:PORT to listen on")
     ap.add_argument("--seeds", required=True, help="directory of seed inputs")
     ap.add_argument("--out", default=None,
-                    help="output dir (holds crashes/ and the resumable corpus/)")
+                    help="output dir (holds crashes/, hangs/ and the resumable "
+                         "corpus/)")
     ap.add_argument("--iters", type=int, default=0,
                     help="stop after N mutated execs (0 = run until stopped)")
     ap.add_argument("--max-size", type=int, default=65536,
@@ -97,11 +135,18 @@ def main():
                          "budget, not a protocol limit -- do not shrink to ~1KB)")
     ap.add_argument("--no-minimize", dest="minimize", action="store_false",
                     help="skip crash minimization (on by default)")
+    ap.add_argument("--minimize-timeouts", action="store_true",
+                    help="also minimize HANG/TIMEOUT inputs (off by default: "
+                         "every probe costs the executor a full timeout)")
+    ap.add_argument("--max-hangs", type=int, default=64,
+                    help="save at most N distinct HANG/TIMEOUT inputs "
+                         "(default 64)")
     ap.add_argument("--seed-rng", type=int, default=0xC0FFEE)
     ap.add_argument("--accept-timeout", type=float, default=15.0,
-                    help="seconds to wait for the relay to connect")
+                    help="seconds to wait for the executor (e.g. "
+                         "suzzer-relay) to connect")
     ap.add_argument("--io-timeout", type=float, default=60.0,
-                    help="seconds to wait for each relay reply (0 = forever)")
+                    help="seconds to wait for each executor reply (0 = forever)")
     ap.add_argument("--status-file",
                     help="append a JSON-lines status feed here for a live "
                          "status board (watch with tools/status_tui.py --input)")
@@ -116,8 +161,10 @@ def main():
                  % args.listen)
     out = args.out or os.path.join(os.getcwd(), "suzzer_out")
     crash_dir = os.path.join(out, "crashes")
+    hang_dir = os.path.join(out, "hangs")
     corpus_dir = os.path.join(out, "corpus")
     os.makedirs(crash_dir, exist_ok=True)
+    os.makedirs(hang_dir, exist_ok=True)
     os.makedirs(corpus_dir, exist_ok=True)
 
     def log(*a):
@@ -170,38 +217,45 @@ def main():
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
-    # ---- accept one relay ----
+    # ---- accept one executor ----
     lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     lsock.bind((host, int(port)))
     lsock.listen(1)
     lsock.settimeout(args.accept_timeout)
     # Print the bound port so a caller that passed :0 can discover it.
-    log("listening on %s:%d" % (host, lsock.getsockname()[1]))
+    listen_addr = "%s:%d" % (host, lsock.getsockname()[1])
+    log("listening on %s" % listen_addr)
     try:
         conn, peer = lsock.accept()
     except socket.timeout:
-        sys.exit("brain: no relay connected within %gs (--accept-timeout)"
+        sys.exit("brain: no executor connected within %gs (--accept-timeout)"
                  % args.accept_timeout)
     conn.settimeout(args.io_timeout or None)
     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    log("relay connected from %s:%d" % peer)
+    log("executor connected from %s:%d" % peer)
 
     if recvn(conn, 4) != SZR_MAGIC:
-        sys.exit("brain: bad magic from relay")
+        sys.exit("brain: bad magic from executor")
     ftype, payload = recv_frame(conn)
     if ftype != SZR_HELLO:
         sys.exit("brain: expected HELLO, got type %d" % ftype)
     ver, flags, map_size, ring_size, arch_len = struct.unpack(">HHIHH", payload[:12])
+    # Free-form ASCII (<= 64 bytes): only logged and recorded in run_config.
     arch = payload[12:12 + arch_len].decode("ascii", "replace")
-    if flags & 0x4:   # SZR_HELLO_FLAG_SCHEME (relay_proto.h)
+    if arch_len > HELLO_ARCH_MAX:
+        log("NOTE: HELLO arch string is %d bytes (spec: <= %d)"
+            % (arch_len, HELLO_ARCH_MAX))
+    if flags & 0x4:   # SZR_HELLO_FLAG_SCHEME (src/lcv_formats.h)
         ngram = (flags >> 8) & 0xf
         scheme = "n=%d model=%s rotate=%d" % (
             ngram, "pc" if flags & 0x8 else "site",
             1 if flags & 0x10 else 0)
         if ngram < 3:
-            log("NOTE: coverage scheme is n=%d; for fuzzing rebuild libcov with "
-                "-DLIBCOV_NGRAM_N=3 -DLIBCOV_NGRAM_ROTATE=1 (path-sensitive)" % ngram)
+            log("NOTE: coverage scheme is n=%d; an N>=3 scheme with rotation is "
+                "more path-sensitive for fuzzing, if the executor supports one "
+                "(libcov: rebuild with -DLIBCOV_NGRAM_N=3 -DLIBCOV_NGRAM_ROTATE=1)"
+                % ngram)
     else:
         scheme = "unknown"
     log("HELLO proto=%d arch=%s map_size=%d ring=%d flags=0x%x scheme=%s"
@@ -215,14 +269,23 @@ def main():
 
     engine = Engine(rng, corpus=splice_donor, max_size=args.max_size)
 
-    execs = new_cov = crashes = 0
+    execs = new_cov = crashes = hangs = 0
     crash_sigs = {}        # (reason, status) -> count; the dedup key
+    hang_sigs = {}         # same, for HANG / TIMEOUT
     next_id = [1]
 
     # ---- optional JSON-lines status feed (for tools/status_tui.py) -------
     start = time.monotonic()
     status_fp = open(args.status_file, "a", buffering=1) if args.status_file else None
     last_status = [0.0]
+    stage = ["baseline 0/%d" % len(corpus)]
+    baseline_edges = [None]   # edges after the corpus replay; new_edges counts past it
+    run_config = {"arch": arch, "scheme": scheme, "proto": ver, "ring": ring_size,
+                  "executor": "%s:%d" % peer, "listen": listen_addr, "out": out,
+                  "seeds": len(seeds), "resumed": len(resumed),
+                  "max_size": args.max_size, "minimize": str(bool(args.minimize))}
+    if args.iters:
+        run_config["iters_limit"] = args.iters
 
     def emit_status(finished=False):
         if not status_fp:
@@ -233,11 +296,10 @@ def main():
             "t": round(el, 1), "execs": execs,
             "execs_per_sec": round(execs / el, 1) if el > 0 else 0.0,
             "corpus": len(corpus), "edges": edges, "map_size": map_size,
-            "new_edges": edges, "crashes": crashes,
-            "crashes_unique": len(crash_sigs), "stage": "havoc + splice",
-            "finished": finished,
-            "config": {"arch": arch, "max_size": args.max_size,
-                       "minimize": str(bool(args.minimize))},
+            "new_edges": edges - baseline_edges[0] if baseline_edges[0] is not None else 0,
+            "crashes": crashes, "crashes_unique": len(crash_sigs),
+            "hangs": hangs, "hangs_unique": len(hang_sigs),
+            "stage": stage[0], "finished": finished, "config": run_config,
         }) + "\n")
 
     def emit_event(kind, msg, edges=None):
@@ -269,22 +331,43 @@ def main():
         ident = next_id[0]
         next_id[0] += 1
         send_frame(conn, SZR_INPUT, struct.pack(">QI", ident, len(data)) + data)
-        ftype, payload = recv_frame(conn)
-        if ftype == SZR_CRASH:
-            _cid, reason, status = struct.unpack(">QBi", payload[:13])
-            return ("crash", reason, status)
-        if ftype != SZR_COVERAGE:
-            return ("other", None)
-        _cid, _gen, kind, msz = struct.unpack(">QQBI", payload[:21])
-        if kind != SLOT_ITER:      # only score per-request (ITER) coverage
-            return ("other", None)
-        return ("iter", payload[21:21 + msz])
+        while True:
+            ftype, payload = recv_frame(conn)
+            if ftype == SZR_BYE:
+                raise ExecutorBye()
+            if ftype == SZR_CRASH:
+                cid, reason, status = struct.unpack(">QBi", payload[:13])
+            elif ftype == SZR_COVERAGE:
+                cid, _gen, kind, msz = struct.unpack(">QQBI", payload[:21])
+                if cid == 0 and kind == SLOT_INIT:
+                    # Unsolicited startup snapshot (id 0): not a reply to
+                    # this input; the reply is still to come.
+                    log("executor sent its INIT snapshot (%d edges); not scored"
+                        % sum(1 for b in payload[21:21 + msz] if b))
+                    continue
+            else:
+                log("ignoring unexpected frame type %d (%d bytes)"
+                    % (ftype, len(payload)))
+                continue
+            if cid != ident:
+                sys.exit("brain: executor answered input id=%d with id=%d "
+                         "(lockstep broken: one reply per INPUT, echoing its id)"
+                         % (ident, cid))
+            if ftype == SZR_CRASH:
+                return ("crash", reason, status)
+            if kind != SLOT_ITER:      # only score per-request (ITER) coverage
+                return ("other", None)
+            return ("iter", payload[21:21 + msz])
 
-    def minimize(data, reason):
-        """Bounded block-dropping: shrink `data` while it still crashes with
-        the same reason. A readable tmin, not an optimal one."""
+    def minimize(data, reason, status):
+        """Bounded block-dropping: shrink `data` while it still fails with
+        the same (reason, status) -- for GUEST_FAULT / ORACLE the status (a
+        PC or oracle id) is the bug's identity. A readable tmin, not an
+        optimal one."""
         if not args.minimize or len(data) <= 1:
             return data
+        if reason in HANG_REASONS and not args.minimize_timeouts:
+            return data                   # each probe would cost a timeout
         best = data
         chunk = max(1, len(best) // 2)
         budget = 200                      # cap re-sends so minimize stays cheap
@@ -293,34 +376,79 @@ def main():
             while i < len(best) and budget > 0:
                 cand = best[:i] + best[i + chunk:]
                 budget -= 1
-                if cand and probe(cand)[:2] == ("crash", reason):
+                if cand and probe(cand) == ("crash", reason, status):
                     best = cand           # drop kept the crash
                 else:
                     i += chunk
             chunk //= 2
         return best
 
-    def save_crash(data, reason, status):
-        nonlocal crashes
-        crashes += 1
-        sig = (reason, status)
-        n = crash_sigs.get(sig, 0) + 1
-        crash_sigs[sig] = n
-        if n > 1:                         # already have this bug -> don't flood
-            log("CRASH id=%d reason=%d status=%d dup (count=%d, not saved)"
-                % (crashes, reason, status, n))
-            return
-        data = minimize(data, reason)
-        name = "crash_r%d_s%d_%s" % (reason, status,
-                                     hashlib.sha1(data).hexdigest()[:12])
-        with open(os.path.join(crash_dir, name), "wb") as f:
+    def write_finding(where, prefix, data, reason, status):
+        """Write one finding plus its .info sidecar; return the file name."""
+        rname, st = crash_name(reason), fmt_status(reason, status)
+        name = "%s_r%d_s%d_%s" % (prefix, reason, status,
+                                  hashlib.sha1(data).hexdigest()[:12])
+        with open(os.path.join(where, name), "wb") as f:
             f.write(data)
-        with open(os.path.join(crash_dir, name + ".info"), "w") as f:
-            f.write("reason=%d\nstatus=%d\nlen=%d\nsig=r%d/s%d\nhex=%s\n"
-                    % (reason, status, len(data), reason, status, data.hex()))
-        log("CRASH id=%d reason=%d status=%d NEW len=%d (saved %s)"
-            % (crashes, reason, status, len(data), name))
-        emit_event("crash", "r%d/s%d %s" % (reason, status, name))
+        with open(os.path.join(where, name + ".info"), "w") as f:
+            f.write("reason=%d\nreason_name=%s\nstatus=%d\n"
+                    % (reason, rname, status))
+            if reason in HEX_STATUS:
+                f.write("status_hex=%s\n" % st)
+            f.write("len=%d\nsig=r%d/s%d\nhex=%s\n"
+                    % (len(data), reason, status, data.hex()))
+        return name
+
+    def drop_finding(where, name):
+        for n in (name, name + ".info"):
+            try:
+                os.unlink(os.path.join(where, n))
+            except OSError:
+                pass
+
+    hang_inputs = set()    # sha1 of every hang/timeout input already saved
+
+    def save_crash(data, reason, status):
+        nonlocal crashes, hangs
+        is_hang = reason in HANG_REASONS
+        if is_hang:
+            hangs += 1
+            nth, sigs, where, label, ev = hangs, hang_sigs, hang_dir, "HANG", "hang"
+        else:
+            crashes += 1
+            nth, sigs, where, label, ev = crashes, crash_sigs, crash_dir, "CRASH", "crash"
+        sig = (reason, status)
+        n = sigs.get(sig, 0) + 1
+        sigs[sig] = n
+        rname, st = crash_name(reason), fmt_status(reason, status)
+        if is_hang:
+            # (reason, status) says little about a hang (TIMEOUT's status is
+            # usually the budget), so keep every distinct input, up to a cap.
+            h = hashlib.sha1(data).digest()
+            if h in hang_inputs or len(hang_inputs) >= args.max_hangs:
+                log("%s id=%d reason=%d(%s) status=%s not saved (%s)"
+                    % (label, nth, reason, rname, st,
+                       "already saved" if h in hang_inputs
+                       else "--max-hangs %d reached" % args.max_hangs))
+                return
+            hang_inputs.add(h)
+        elif n > 1:                       # already have this bug -> don't flood
+            log("%s id=%d reason=%d(%s) status=%s dup (count=%d, not saved)"
+                % (label, nth, reason, rname, st, n))
+            return
+        prefix = "hang" if is_hang else "crash"
+        # Save the input as found first: minimizing re-sends it to the
+        # executor, and a BYE, a timeout or a dropped connection there must
+        # not lose the finding.
+        name = write_finding(where, prefix, data, reason, status)
+        small = minimize(data, reason, status)
+        if small != data:
+            drop_finding(where, name)
+            name = write_finding(where, prefix, small, reason, status)
+            data = small
+        log("%s id=%d reason=%d(%s) status=%s NEW len=%d (saved %s)"
+            % (label, nth, reason, rname, st, len(data), name))
+        emit_event(ev, "%s r%d/s%s %s" % (rname, reason, st, name))
 
     def run_one(data):
         nonlocal execs, new_cov
@@ -342,11 +470,15 @@ def main():
     try:
         # ---- baseline: run the resumed corpus once ----
         emit_status()
-        for s in list(corpus):
+        replay = list(corpus)
+        for i, s in enumerate(replay, 1):
             if stop["flag"]:
                 break
+            stage[0] = "baseline %d/%d" % (i, len(replay))
             run_one(s)
             maybe_status()
+        baseline_edges[0] = sum(1 for b in cumulative if b)
+        stage[0] = "havoc + splice"
         # ---- fuzz: mutate corpus entries until stopped (or --iters) ----
         mutated = 0
         while not stop["flag"]:
@@ -357,18 +489,26 @@ def main():
             mutated += 1
             maybe_status()
     except socket.timeout:
-        sys.exit("brain: relay sent no reply within %gs (--io-timeout)"
+        sys.exit("brain: executor sent no reply within %gs (--io-timeout)"
                  % args.io_timeout)
     except ConnectionError as e:
         sys.exit("brain: %s" % e)
+    except ExecutorBye:
+        log("executor said BYE; ending the session")
+        executor_bye = True
+    else:
+        executor_bye = False
 
-    try:
-        send_frame(conn, SZR_BYE)
-    except OSError:
-        pass
+    if not executor_bye:
+        try:
+            send_frame(conn, SZR_BYE)
+        except OSError:
+            pass
     total = sum(1 for b in cumulative if b)
-    log("done: execs=%d new_cov=%d crashes=%d (unique=%d) corpus=%d edges=%d"
-        % (execs, new_cov, crashes, len(crash_sigs), len(corpus), total))
+    log("done: execs=%d new_cov=%d crashes=%d (unique=%d) hangs=%d (unique=%d) "
+        "corpus=%d edges=%d"
+        % (execs, new_cov, crashes, len(crash_sigs), hangs, len(hang_sigs),
+           len(corpus), total))
     emit_status(finished=True)
     if status_fp:
         status_fp.close()

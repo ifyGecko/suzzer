@@ -1183,7 +1183,7 @@ make ARCH=aarch64         # cross-build for aarch64
 make all-arch             # every ARCH (11 architectures, 8 backends)
 make all-variants         # ST and MT for every ARCH
 make native               # library only, no test targets
-make test                 # build both variants + all test targets, run 18 native suites
+make test                 # build both variants + all test targets, run 20 native suites
 make tools                # opt-in libdemalloc.so
 make print-vars           # resolved ARCH/BACKEND/THREADING/SRC/LIB
 make clean                # rm -rf build
@@ -1271,7 +1271,7 @@ For the host arch, runs four checks:
 4. **Output unchanged**: target stdout under libcov equals target stdout
    without libcov.
 
-`make test` runs 18 native suites one after another through
+`make test` runs 20 native suites one after another through
 `test/run_all.sh` (the `NATIVE_SUITES` list in the Makefile):
 
 - run_validation, _mt, _boundary, _boundary_mt, _multimod, _signals
@@ -1821,7 +1821,9 @@ hit a marker keep emitting into the shared bitmap at `bitmap_offset`.
 libcov writes only to a local shm region (§9, §20–§21). Over-IP fuzzing is an
 out-of-process template, not a library feature: a small C relay on the device
 and a Python brain off-device, one TCP connection between them. HOWTO.md §14.1
-is the operator's guide; this is the design.
+is the operator's guide; this is the design. The wire protocol (SZR1) is
+specified normatively in docs/FORMATS.md §4, in terms of an *executor* (the
+relay is one) and a brain, so other executors can stand in for the relay.
 
 **Components.**
 - `src/ring_reader.h` — header-only client-side ring reader (attach, seqlock

@@ -75,32 +75,9 @@ static unsigned parse_ring_size(void) {
     return (unsigned)v;
 }
 
-static size_t next_pow2(size_t v) {
-    size_t p = 1;
-    while (p < v) p <<= 1;
-    return p;
-}
-
-/* Pick the live-bitmap byte length. Site-id model: next_pow2(n*FUDGE),
- * clamped to [1<<MIN, 1<<MAX] for the fudge term, but never below
- * next_pow2(n) so every site_id fits the mask (the N=1 zero-collision
- * guarantee) even when the fudge would exceed the cap. Hashed-PC model:
- * the legacy compile-time constant. */
+/* The live-bitmap byte length: sink_map_size_for (sink.h). */
 static size_t compute_map_size(size_t n_sites) {
-#if LIBCOV_COVERAGE_MODEL_SITE
-    if (n_sites == 0) n_sites = 1;
-    size_t floor_min  = (size_t)1u << LIBCOV_MAP_MIN_POW2;
-    size_t cap        = (size_t)1u << LIBCOV_MAP_MAX_POW2;
-    size_t hard_floor = next_pow2(n_sites);
-    size_t sz         = next_pow2(n_sites * (size_t)LIBCOV_MAP_FUDGE);
-    if (sz > cap)        sz = cap;
-    if (sz < floor_min)  sz = floor_min;
-    if (sz < hard_floor) sz = hard_floor;   /* honoured even above the cap */
-    return sz;
-#else
-    (void)n_sites;
-    return (size_t)1u << LIBCOV_MAP_SIZE_POW2;
-#endif
+    return sink_map_size_for(n_sites);
 }
 
 #if LIBCOV_COVERAGE_MODEL_SITE

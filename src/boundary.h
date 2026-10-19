@@ -31,108 +31,28 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "lcv_formats.h"
 #include "patchlist_format.h"
 
-/* ---- on-disk sidecar format -------------------------------------------- */
-
-#define LIBCOV_BOUNDARY_MAGIC   "LCVB"
-#define LIBCOV_BOUNDARY_VERSION 1u
-
-#define LIBCOV_BOUNDARY_KIND_BEGIN 0
-#define LIBCOV_BOUNDARY_KIND_END   1
-
-struct lcvb_header {
-    char     magic[4];
-    uint32_t version;
-    uint32_t count;
-    uint32_t flags;     /* bit0 = paired (begin+end), reserved otherwise */
-} __attribute__((packed));
-
-struct lcvb_record {
-    uint64_t offset;        /* from target module base */
-    uint8_t  kind;          /* BEGIN or END */
-    uint8_t  depth_filter;  /* 0 = any depth, 1 = depth-zero only */
-    uint8_t  reserved[6];
-} __attribute__((packed));
-
-/* ---- shm layout (extends sink_shm.c) ---------------------------------- *
+/* ---- formats ------------------------------------------------------------ *
+ *
+ * The LCVB1 sidecar (struct lcvb_header / lcvb_record, LIBCOV_BOUNDARY_*)
+ * and the LCVS shm region (struct libcov_shm_header, struct
+ * libcov_ring_slot_hdr, every LIBCOV_SHM_* / LIBCOV_SLOT_* constant) are
+ * defined in lcv_formats.h, the header-only contract out-of-process drivers
+ * vendor; docs/FORMATS.md specifies them.
  *
  *   offset                       contents
- *   0                            struct libcov_shm_header (72 B after alignment)
+ *   0                            struct libcov_shm_header (72 B)
  *   bitmap_offset                live bitmap, map_size bytes
  *   ring_offset                  RING slots; each slot is slot_stride bytes
  *
  * Driver reads gen_current with acquire ordering, picks slot
  * ring[gen % ring_size] for the generation it wants (readable while
  * gen_current - gen < ring_size), and verifies slot_gen == gen pre- and
- * post-memcpy to detect torn reads. */
-
-#define LIBCOV_SHM_MAGIC        "LCVS"
-#define LIBCOV_SHM_VERSION      1u
-#define LIBCOV_SHM_FLAG_ACTIVE  (1u << 0)  /* boundaries active */
-#define LIBCOV_SHM_FLAG_MT      (1u << 1)  /* MT-variant libcov */
-/* Set when the live bitmap at bitmap_offset is NOT maintained and a driver
- * must read the ring instead. Set in ST boundary mode (emits go straight into
- * ring slots; the bitmap_offset region stays zero). Clear in MT boundary mode
- * (bitmap_offset accumulates non-worker/pre-first-boundary coverage) and with
- * boundaries off (bitmap_offset is the cumulative map). */
-#define LIBCOV_SHM_FLAG_LIVE_EMPTY (1u << 2)
-/* Coverage scheme the region's bucket indices were built with, stamped at
- * sink_init so a reader can tell maps from differently built libraries
- * apart. SCHEME says the bits below are valid (regions from older builds
- * leave it clear); MODEL_PC means the hashed-PC model (clear = site-id);
- * ROTATE mirrors LIBCOV_NGRAM_ROTATE; bits 8..11 hold LIBCOV_NGRAM_N. */
-#define LIBCOV_SHM_FLAG_SCHEME     (1u << 3)
-#define LIBCOV_SHM_FLAG_MODEL_PC   (1u << 4)
-#define LIBCOV_SHM_FLAG_ROTATE     (1u << 5)
-#define LIBCOV_SHM_NGRAM_SHIFT     8
-#define LIBCOV_SHM_NGRAM_MASK      (0xfu << LIBCOV_SHM_NGRAM_SHIFT)
-#define LIBCOV_SHM_NGRAM(flags) \
-    (((flags) & LIBCOV_SHM_NGRAM_MASK) >> LIBCOV_SHM_NGRAM_SHIFT)
-
-struct libcov_shm_header {
-    char     magic[4];
-    uint16_t version;
-    uint16_t ring_size;
-    uint32_t map_size;
-    uint32_t slot_stride;     /* bytes per ring slot (slot hdr + bitmap) */
-    uint32_t flags;
-    uint64_t gen_current;     /* atomic: highest gen assigned; its slot may
-                               * not be stamped yet (readers check slot_gen) */
-    uint64_t gen_init;        /* gen when init snapshot was captured (0 = none) */
-    uint64_t bitmap_offset;   /* shm-base relative */
-    uint64_t ring_offset;     /* shm-base relative */
-    /* atomic: MT publishes libcov dropped because a publisher RING gens
-     * ahead already held the slot (that generation never reached the
-     * ring). Always 0 under ST. Readers compare it across a run. */
-    uint32_t publish_dropped;
-    /* The process that created the region: pid and its start time (clock
-     * ticks since boot, low 32 bits). exec keeps both, so an in-place
-     * re-exec recognises its own region and attaches instead of zeroing
-     * it; another live process leaves it alone (sink_shm.c). */
-    uint32_t owner_pid;
-    uint32_t owner_start;
-    uint8_t  reserved[4];
-};
-/* The layout is an ABI with out-of-process drivers: fields only ever take
- * over reserved bytes. */
-_Static_assert(sizeof(struct libcov_shm_header) == 72, "shm header is 72 bytes");
-_Static_assert(__builtin_offsetof(struct libcov_shm_header, publish_dropped) == 56,
-               "publish_dropped sits at offset 56");
-_Static_assert(__builtin_offsetof(struct libcov_shm_header, owner_pid) == 60,
-               "owner_pid sits at offset 60");
-
-struct libcov_ring_slot_hdr {
-    uint64_t slot_gen;        /* atomic: 0 = empty/in-progress; otherwise gen */
-    uint64_t tid;
-    uint64_t ns;              /* CLOCK_MONOTONIC at publish */
-    uint64_t flags;           /* LIBCOV_SLOT_FLAG_*: what the snapshot holds */
-};
-
-/* Ring slot flags: exactly one is set on every published slot (written
- * before slot_gen is stamped, so a reader that validated the stamp sees
- * them). A fuzzer that wants one snapshot per input keeps ITER slots.
+ * post-memcpy to detect torn reads (ring_reader.h: rr_read_slot).
  *
+ * Which slot flag libcov stamps when:
  *   INIT  coverage from startup to the first boundary (hdr->gen_init).
  *   ITER  one iteration: in begin-only mode every later BEGIN publishes
  *         the iteration it ends; in paired mode an END publishes the
@@ -141,11 +61,10 @@ struct libcov_ring_slot_hdr {
  *   GAP   paired mode only: a BEGIN at depth 0 publishes what ran since the
  *         previous END -- the harness between iterations, not an input.
  *
- * Slots from libcov builds before these flags existed carry 0. */
-#define LIBCOV_SLOT_FLAG_INIT (1u << 0)
-#define LIBCOV_SLOT_FLAG_ITER (1u << 1)
-#define LIBCOV_SLOT_FLAG_GAP  (1u << 2)
-/* followed by MAP_SIZE bytes of bitmap */
+ * LIVE_EMPTY is set in ST boundary mode (emits go straight into ring slots;
+ * the bitmap_offset region stays zero), clear in MT boundary mode
+ * (bitmap_offset accumulates non-worker/pre-first-boundary coverage) and
+ * with boundaries off (bitmap_offset is the cumulative map). */
 
 /* ---- public API ------------------------------------------------------- */
 

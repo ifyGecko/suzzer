@@ -52,7 +52,7 @@ static int cmp_entry(const void *a, const void *b) {
  * on error. */
 static size_t parse_header(const char *bytes, size_t size,
                            uint32_t *count_out, uint8_t *threading_out,
-                           uint8_t *module_count_out,
+                           uint8_t *flags_out, uint8_t *module_count_out,
                            uint32_t *modules_offset_out,
                            uint32_t *modules_size_out) {
     if (size < sizeof(struct patchlist_header_v3)) {
@@ -70,7 +70,9 @@ static size_t parse_header(const char *bytes, size_t size,
     }
     *count_out          = rd_u32le(bytes + 8);
     *threading_out      = (uint8_t)bytes[12];
-    /* bytes[13] = flags, must be 0 (reserved). */
+    /* Bit 0 (LCV_FLAG_MODULE_BASES) is defined; writers leave the others
+     * 0 and readers ignore bits they don't know. */
+    *flags_out          = (uint8_t)bytes[13];
     *module_count_out   = (uint8_t)bytes[14];
     /* bytes[15] = reserved. */
     *modules_offset_out = rd_u32le(bytes + 16);
@@ -142,11 +144,12 @@ int config_load(const char *path) {
     const char *hbytes = map;
     uint32_t count = 0;
     uint8_t  threading = LIBCOV_TH_ANY;
+    uint8_t  hflags = 0;
     uint8_t  module_count = 0;
     uint32_t modules_offset = 0;
     uint32_t modules_size = 0;
     size_t recs_off = parse_header(hbytes, (size_t)st.st_size,
-                                   &count, &threading,
+                                   &count, &threading, &hflags,
                                    &module_count,
                                    &modules_offset, &modules_size);
     if (recs_off == 0) { munmap(map, st.st_size); return -1; }
@@ -224,6 +227,30 @@ int config_load(const char *path) {
         }
         libcov_module_bases[m] = b;
         libcov_logf("config: module[%u] '%s' base=0x%lx", m, name, (unsigned long)b);
+    }
+
+    /* LCV_FLAG_MODULE_BASES: the generator recorded each module's link
+     * base. libcov always uses the mapped base above; the recorded one is
+     * only compared, as a debug aid -- a non-PIE module (non-zero link
+     * base) mapped elsewhere means the offsets will not land on the
+     * instructions the list was generated from. A table that doesn't fit
+     * the file is ignored like an unknown flag. */
+    if (hflags & LCV_FLAG_MODULE_BASES) {
+        uint64_t tab = LCV_MODULE_BASES_OFFSET(modules_offset, modules_size);
+        if (tab <= (uint64_t)st.st_size &&
+            (uint64_t)module_count * 8u <= (uint64_t)st.st_size - tab) {
+            for (unsigned m = 0; m < module_count; m++) {
+                uint64_t link = rd_u64le(hbytes + tab + 8u * m);
+                if (link && link != (uint64_t)libcov_module_bases[m])
+                    libcov_logf("config: module[%u] link base 0x%llx (patch list) "
+                                "!= mapped base 0x%lx: non-PIE module loaded "
+                                "elsewhere? offsets assume the link base",
+                                m, (unsigned long long)link,
+                                (unsigned long)libcov_module_bases[m]);
+            }
+        } else {
+            libcov_logf("config: module base table runs past end of file; ignored");
+        }
     }
 
     g_count = count;

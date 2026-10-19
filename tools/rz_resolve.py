@@ -8,12 +8,18 @@ logic here means the same name resolves to the same site in both tools --
 previously each had its own resolver and, e.g., a bare `main` or a
 suffix-only name could land differently.
 
+It also holds the raw-image support both generators share (Image,
+add_image_args, load_symbols): the --raw/--base/--arch/--bits/--endian
+options and the --symbols file that names functions in an image without
+symbols.
+
 `all_fns` is a list of dicts, each at least {"offset": int, "name": str}.
 Optional "size" / "maxbound" (from aflj) bound address lookups: an address
 past the end of the function below it is rejected instead of silently
 landing in whatever function happens to come last.
 """
 
+import os
 import sys
 
 
@@ -146,3 +152,184 @@ def resolve_to_offset(token, all_fns):
         return _resolve_addr(addr, token, all_fns)
 
     raise NotFound(f"could not resolve '{token}' to any function")
+
+
+# ---- raw images (bootloaders, RTOS blobs): shared by both generators ------
+
+class Image:
+    """How to open the positional binary in rizin, and what to tell the
+    generators about it that rizin can't know for a raw image.
+
+    For an ELF (raw=False) only the optional symbols apply. For a raw image
+    every fact rizin would read from ELF headers comes from the command line
+    instead: --base is where the image is loaded (and module 0's link base
+    in the patch list), --arch/--bits/--endian pick the disassembler."""
+
+    def __init__(self, raw=False, base=None, arch=None, bits=None,
+                 endian=None, symbols=None):
+        self.raw, self.base, self.arch = raw, base, arch
+        self.bits, self.endian = bits, endian
+        self.symbols = symbols or {}          # addr -> name (no rizin prefix)
+
+    def rizin_flags(self):
+        """rizin command-line flags that load the image."""
+        if not self.raw:
+            return []
+        return ["-m", "0x%x" % self.base, "-a", self.arch, "-b", str(self.bits),
+                "-E", self.endian]
+
+    def post_aaa(self):
+        """Commands to run right after `aaa`: make sure every symbol from
+        --symbols is an analysed function (a no-op where one exists)."""
+        return ["af @ 0x%x" % a for a in sorted(self.symbols)]
+
+    def info(self):
+        """The ij-like facts for a raw image (None for an ELF)."""
+        if not self.raw:
+            return None
+        return {"arch": self.arch, "bits": self.bits,
+                "endian": "BE" if self.endian == "big" else "LE",
+                "baddr": self.base}
+
+    def name_functions(self, fns):
+        """Rename analysed functions that start at a --symbols address to
+        sym.NAME (in place); returns fns."""
+        for f in fns:
+            name = self.symbols.get(int(f.get("offset", -1)))
+            if name:
+                f["name"] = "sym." + name
+        return fns
+
+
+def add_image_args(ap):
+    """The raw-image / symbols options, shared by both generators."""
+    g = ap.add_argument_group(
+        "raw images",
+        "Analyse a raw binary (bootloader, RTOS image, flash dump) instead of "
+        "an ELF. rizin is given -m BASE -a ARCH -b BITS -E ENDIAN; BASE is "
+        "also module 0's link base in the patch list, so offsets are "
+        "address - BASE.")
+    g.add_argument("--raw", action="store_true",
+                   help="the binary is a raw image (needs --base, --arch, "
+                        "--bits, --endian)")
+    g.add_argument("--base", type=lambda s: int(s, 0), metavar="ADDR",
+                   help="load address of the raw image (e.g. 0x80010000)")
+    g.add_argument("--arch", metavar="ARCH",
+                   help="rizin arch name: mips, arm, riscv, ppc, x86, ...")
+    g.add_argument("--bits", type=int, choices=[16, 32, 64])
+    g.add_argument("--endian", choices=["big", "little"])
+    g.add_argument("--symbols", metavar="FILE",
+                   help="name functions from FILE: `nm` output (ADDR TYPE "
+                        "NAME; text symbols only), ADDR NAME lines, or a "
+                        "Ghidra symbol-table CSV export (Name and Location "
+                        "columns). Names become sym.NAME, for --root, "
+                        "--cutoff and marker names. Works for ELFs too")
+
+
+def image_from_args(ap, args):
+    """Validate the raw-image options and build the Image (or ap.error)."""
+    raw_opts = {"--base": args.base, "--arch": args.arch, "--bits": args.bits,
+                "--endian": args.endian}
+    if args.raw:
+        missing = [k for k, v in raw_opts.items() if v is None]
+        if missing:
+            ap.error("--raw needs " + ", ".join(missing))
+    else:
+        given = [k for k, v in raw_opts.items() if v is not None]
+        if given:
+            ap.error(", ".join(given) + " need --raw")
+    syms = load_symbols(args.symbols) if args.symbols else {}
+    if args.raw and syms:
+        # Only addresses inside the image can be functions of it.
+        try:
+            end = args.base + os.path.getsize(args.binary)
+        except OSError:
+            end = None
+        if end is not None:
+            syms = {a: n for a, n in syms.items() if args.base <= a < end}
+            if not syms:
+                sys.exit(f"error: --symbols {args.symbols}: no symbol falls inside "
+                         f"the image (0x{args.base:x}-0x{end:x}); is --base right?")
+    return Image(args.raw, args.base, args.arch, args.bits, args.endian, syms)
+
+
+# nm symbol types that name code.
+_NM_CODE_TYPES = set("TtWw")
+
+
+def _parse_addr(tok):
+    tok = tok.strip()
+    if ":" in tok:                      # Ghidra "ram:80010000"
+        space, tok = tok.rsplit(":", 1)
+        if space.upper() == "EXTERNAL":  # imports: no address in the image
+            raise ValueError(tok)
+    if tok.lower().startswith("0x"):
+        tok = tok[2:]
+    return int(tok, 16)
+
+
+def load_symbols(path):
+    """Parse a symbols file into {addr: name}. Formats (detected per file):
+      - Ghidra symbol-table CSV export: a header row with a Name column and
+        a Location / Address / Entry Point column (with a Type column, only
+        Function rows are kept);
+      - `nm` output: ADDR TYPE NAME (only code types T t W w are kept;
+        undefined symbols, which have no address, are skipped);
+      - ADDR NAME or NAME ADDR per line.
+    Where several names share an address the first one not starting with
+    '_' wins (else the first). Blank lines and '#' comments are skipped."""
+    import csv
+
+    try:
+        lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
+    except OSError as e:
+        sys.exit(f"error: --symbols {path}: {e}")
+    body = [l for l in lines if l.strip() and not l.lstrip().startswith("#")]
+    pairs = []
+    if body and "," in body[0]:
+        rows = list(csv.reader(body))
+        head = [c.strip().lower() for c in rows[0]]
+        try:
+            ni = head.index("name")
+            ai = next(head.index(c) for c in ("location", "address", "entry point",
+                                              "entry", "addr") if c in head)
+        except (ValueError, StopIteration):
+            sys.exit(f"error: --symbols {path}: CSV needs Name and Location "
+                     f"(or Address) columns, got {rows[0]}")
+        # Ghidra's symbol table lists data labels too; with a Type column,
+        # only functions may become instrumented functions.
+        ti = head.index("type") if "type" in head else None
+        for r in rows[1:]:
+            if ti is not None and (len(r) <= ti or r[ti].strip().lower() != "function"):
+                continue
+            if len(r) > max(ni, ai):
+                try:
+                    pairs.append((_parse_addr(r[ai]), r[ni].strip()))
+                except ValueError:
+                    pass                 # External/no-address rows
+    else:
+        for l in body:
+            f = l.split()
+            try:
+                if len(f) >= 3 and len(f[1]) == 1:
+                    if f[1] in _NM_CODE_TYPES:
+                        pairs.append((_parse_addr(f[0]), f[2]))
+                elif len(f) == 2 and len(f[0]) == 1 and f[0].isalpha():
+                    continue              # nm: undefined (U, w, v): no address
+                elif len(f) == 2:
+                    try:
+                        pairs.append((_parse_addr(f[0]), f[1]))
+                    except ValueError:
+                        pairs.append((_parse_addr(f[1]), f[0]))
+            except ValueError:
+                sys.exit(f"error: --symbols {path}: cannot parse line {l!r}")
+    out = {}
+    for addr, name in pairs:
+        if not name:
+            continue
+        cur = out.get(addr)
+        if cur is None or (cur.startswith("_") and not name.startswith("_")):
+            out[addr] = name
+    if not out:
+        sys.exit(f"error: --symbols {path}: no code symbols found")
+    return out

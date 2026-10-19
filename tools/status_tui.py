@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""status_tui.py -- generic AFL/afl++-style live status screen for a fuzzer.
+"""status_tui.py -- generic AFL/afl++-style static status screen for a fuzzer.
 
 A reusable suzzer component and a worked example: a target-agnostic terminal
 status board (the boxed "process timing / overall results / map coverage / ..."
-panels you know from afl-fuzz, afl++ and honggfuzz), plus a rate/coverage chart
-and an event feed. It is deliberately NOT tied to any particular fuzzer -- you
-point it at a data feed and it renders.
+panels you know from afl-fuzz, afl++ and honggfuzz), plus a run-config box and
+a log of the latest events. It is deliberately NOT tied to any particular
+fuzzer -- you point it at a data feed and it renders.
+
+The screen is static: no hotkeys, no subscreens. It redraws itself every
+--refresh seconds from the feed, flags a run that has stopped updating
+(STALLED) or ended (RUN FINISHED), and exits on Ctrl-C.
 
 It is stdlib-only (curses + json) and self-contained: copy this one file into
 your project, keep `render()` as-is, and either emit the JSON feed below from
@@ -20,20 +24,24 @@ Two ways to feed it (pick one; the renderer never changes):
 
        t              run time, seconds (int/float)
        execs          total executions
-       execs_per_sec  current exec rate            (alias: "rate")
+       execs_per_sec  average exec rate          (alias: "rate"); the current
+                      rate is derived from the last ~10 s of (t, execs) snapshots
        corpus         corpus / queue size
        cycles         queue cycles done (else derived execs//corpus)
        edges          coverage units hit (bitmap tuples / blocks / edges)
        map_size       coverage map size (for the density %)
        sites          instrumented sites (optional)
-       new_edges      cumulative new edges
+       new_edges      edges found beyond the initial corpus (baseline)
        crashes        total crashes            crashes_unique  distinct crashes
        hangs          total hangs              hangs_unique    distinct hangs
+                      (suzzer_brain.py counts an executor's HANG and TIMEOUT
+                      reports here, apart from crashes)
        stage          current stage string, e.g. "havoc + splice"
-       config         object of free-form label:value for the "run config" panel
+       config         object of free-form label:value for the "run config" box
+                      (every entry is shown)
        finished       true when the run is over
        event          {"kind":"find"|"crash"|"hang"|"info", "msg":"...",
-                        "edges":N(optional)}  -- appended to the event feed
+                        "edges":N(optional)}  -- appended to the event log
 
      Example producer (any language): print one line per update, e.g.
        {"t":42,"execs":165607,"execs_per_sec":4.6,"corpus":274,"edges":1921,
@@ -47,15 +55,14 @@ Two ways to feed it (pick one; the renderer never changes):
      that calls the same setters, and pass --format text.
 
 Usage:
-  status_tui.py --input run.jsonl        # curses TUI, follows the feed (tty)
+  status_tui.py --input run.jsonl        # curses board, follows the feed (tty)
+  status_tui.py --input run.jsonl --refresh 2   # redraw every 2 s (default 1)
   status_tui.py --input run.jsonl --dump # one-shot text frame (no curses/CI)
   status_tui.py --input -                # read the JSON feed from stdin (--dump)
   status_tui.py --demo                   # render synthetic data (no feed needed)
   status_tui.py --selftest               # render checks on synthetic data, exit 0
-  status_tui.py --input run.jsonl --artifacts ./crashes   # add a file browser
 
-Keys (TUI):  q quit   a artifacts   g graphs   f freeze follow   r refresh
-             h help    j/k/arrows scroll (subscreens)   Esc back
+Ctrl-C exits. Keys are otherwise ignored.
 """
 import argparse
 import json
@@ -65,7 +72,6 @@ import sys
 import time
 from collections import deque
 
-RAMP = "▁▂▃▄▅▆▇█"
 DEFAULT_MAP = 65536
 
 
@@ -76,6 +82,13 @@ def fmt_n(x):
         return f"{int(x):,}"
     except (TypeError, ValueError):
         return str(x)
+
+
+def fmt_rate(x):
+    try:
+        return f"{float(x):.1f}/sec"
+    except (TypeError, ValueError):
+        return "?"
 
 
 def fmt_dur(sec):
@@ -94,51 +107,13 @@ def fmt_afl_dur(sec):
     return f"{d} days, {h} hrs, {m} min, {s} sec"
 
 
-def fmt_wall(t):
-    return time.strftime("%H:%M:%S", time.localtime(t))
-
-
-# ---- chart helpers -------------------------------------------------------------
-
-def downsample(vals, w, how="max"):
-    if len(vals) <= w:
-        return list(vals)
-    out, step = [], len(vals) / w
-    for i in range(w):
-        a = int(i * step)
-        b = min(len(vals), max(a + 1, int((i + 1) * step)))
-        seg = vals[a:b]
-        out.append(max(seg) if how == "max" else seg[-1])
-    return out
-
-
-def sparkline(vals, w):
-    vals = downsample(list(vals), w, "max")
-    if not vals:
-        return " " * w
-    mx = max(vals) or 1
-    return "".join(RAMP[int(v / mx * (len(RAMP) - 1))] for v in vals)
-
-
-def column_chart(vals, w, h):
-    vals = downsample(list(vals), w, "max")
-    if not vals:
-        return [" " * w] * h
-    mx = max(vals) or 1
-    out = []
-    for r in range(h):
-        need = (h - 1) - r
-        line = []
-        for v in vals:
-            lv = int(v / mx * (h - 1))
-            line.append(RAMP[lv] if lv >= need else " ")
-        out.append("".join(line).rstrip())
-    return out
-
-
-def bar_pct(pct, width):
-    filled = int(round(max(0.0, min(100.0, pct)) / 100.0 * width))
-    return "|" + "#" * filled + " " * (width - filled) + "|"
+def fmt_short_dur(sec):
+    """Compact '0d 01:23:45' for panels too narrow for fmt_afl_dur."""
+    sec = int(max(0, sec))
+    d, rem = divmod(sec, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    return f"{d}d {h:02d}:{m:02d}:{s:02d}"
 
 
 # ---- afl-style boxed panels ----------------------------------------------------
@@ -163,15 +138,26 @@ def _panel(title, fields, width):
     return out
 
 
-def _cols(left, right):
-    lw = len(left[0]) if left else 0
-    rw = len(right[0]) if right else 0
-    n = max(len(left), len(right))
-    out = []
-    for i in range(n):
-        out.append((left[i] if i < len(left) else " " * lw)
-                   + (right[i] if i < len(right) else " " * rw))
-    return out
+def _pair(ltitle, lfields, rtitle, rfields, lw, rw):
+    """Two panels side by side, padded to the same height so the boxes line up."""
+    n = max(len(lfields), len(rfields))
+    lf = lfields + [""] * (n - len(lfields))
+    rf = rfields + [""] * (n - len(rfields))
+    return [a + b for a, b in zip(_panel(ltitle, lf, lw), _panel(rtitle, rf, rw))]
+
+
+def _config_fields(cfg, width):
+    """label : value cells for every config entry; two per row when they fit."""
+    if not cfg:
+        return ["(no config in feed)"]
+    items = [(str(k), str(v)) for k, v in cfg.items()]
+    labw = min(14, max(len(k) for k, _ in items))
+    cells = [_field(k, v, labw) for k, v in items]
+    colw = (width - 3) // 2
+    if width < 80 or any(len(c) > colw - 1 for c in cells):
+        return cells
+    return [cells[i].ljust(colw) + (cells[i + 1] if i + 1 < len(cells) else "")
+            for i in range(0, len(cells), 2)]
 
 
 # ---- generic status model ------------------------------------------------------
@@ -215,19 +201,19 @@ class Status:
         self.last_find_t = None
         self.last_crash_t = None
         self.last_hang_t = None
+        self.last_msg = {}             # event kind -> text of the newest one
         self.finds = 0
         self._crash_evs = 0
         self._hang_evs = 0
         self.find_times = deque(maxlen=4000)
         self.events = deque(maxlen=400)
-        self.cov_hist = deque(maxlen=20000)
-        self.rate_hist = deque(maxlen=20000)
         self._ev_id = 0
-        self.flash = deque()
+        self._snaps = deque(maxlen=64)  # recent distinct (t, execs) snapshots
+        self.last_update_wall = None   # wall-clock time of the newest feed data
         self.have_data = False
 
     # -- feed -------------------------------------------------------------------
-    def apply(self, obj, live=False):
+    def apply(self, obj):
         """Merge one JSON status object (scalars latest-wins; event appended)."""
         if not isinstance(obj, dict):
             return
@@ -243,14 +229,16 @@ class Status:
             self.finished = bool(obj["finished"])
         if touched_snapshot:
             self.have_data = True
-            self.cov_hist.append((self.t, self.edges))
-            self.rate_hist.append((self.t, self.execs_per_sec))
+            if self._snaps and self._snaps[-1][0] == self.t:
+                self._snaps[-1] = (self.t, self.execs)
+            else:
+                self._snaps.append((self.t, self.execs))
         ev = obj.get("event")
         if isinstance(ev, dict):
             self.add_event(ev.get("kind", "info"), ev.get("msg", ""),
-                           ev.get("edges"), live)
+                           ev.get("edges"))
 
-    def add_event(self, kind, msg, edges=None, live=False):
+    def add_event(self, kind, msg, edges=None):
         self.have_data = True
         self._ev_id += 1
         txt = msg
@@ -258,6 +246,7 @@ class Status:
             txt = f"+{edges} edges  {msg}" if msg else f"+{edges} edges"
         ev = Event(self._ev_id, kind, txt, self.t, edges)
         self.events.append(ev)
+        self.last_msg[kind] = txt
         if kind == "find":
             self.finds += 1
             self.find_times.append(self.t)
@@ -268,8 +257,6 @@ class Status:
         elif kind == "hang":
             self._hang_evs += 1
             self.last_hang_t = self.t
-        if live:
-            self.flash.append(ev.id)
         return ev
 
     # -- derived ----------------------------------------------------------------
@@ -291,11 +278,27 @@ class Status:
         n = sum(1 for x in self.find_times if x >= lo)
         return n * 60.0 / 600.0
 
+    def current_rate(self, window=10.0):
+        """execs/sec over roughly the last `window` seconds of snapshots (at
+        least the last two), or None if unknown."""
+        if len(self._snaps) < 2:
+            return None
+        snaps = list(self._snaps)
+        t1, e1 = snaps[-1]
+        try:
+            base = next((s for s in snaps[:-1] if float(s[0]) >= float(t1) - window),
+                        snaps[-2])
+            t0, e0 = base
+            dt = float(t1) - float(t0)
+            return (float(e1) - float(e0)) / dt if dt > 0 else None
+        except (TypeError, ValueError):
+            return None
+
 
 # ---- JSON-lines feed follower --------------------------------------------------
 
 class JsonFeed:
-    """Follows a growing JSON-lines file (or a FIFO); apply()s each line."""
+    """Follows a growing JSON-lines file (or a FIFO); handles each line."""
 
     def __init__(self, path, status):
         self.path = path
@@ -304,7 +307,17 @@ class JsonFeed:
         self.off = 0
         self.buf = b""
 
-    def read_new(self, live=False):
+    def handle_line(self, ln):
+        ln = ln.strip()
+        if not ln:
+            return
+        try:
+            obj = json.loads(ln)
+        except ValueError:
+            return
+        self.st.apply(obj)
+
+    def read_new(self):
         if self.fh is None:
             try:
                 self.fh = open(self.path, "rb", buffering=0)
@@ -318,23 +331,22 @@ class JsonFeed:
         if not data:
             return 0
         self.off += len(data)
+        self.st.last_update_wall = time.time()
         blob = self.buf + data
         parts = blob.split(b"\n")
         self.buf = parts.pop()            # trailing partial line
         for ln in parts:
-            ln = ln.strip()
-            if not ln:
-                continue
-            try:
-                obj = json.loads(ln)
-            except ValueError:
-                continue
-            self.st.apply(obj, live=live)
+            self.handle_line(ln)
         return len(data)
 
     def initial_scan(self):
-        while self.read_new(live=False):
+        while self.read_new():
             pass
+        if self.st.last_update_wall is not None:
+            try:                          # age of existing data = file's mtime
+                self.st.last_update_wall = os.path.getmtime(self.path)
+            except OSError:
+                pass
 
 
 def feed_from_stdin(status):
@@ -343,218 +355,135 @@ def feed_from_stdin(status):
         if not ln:
             continue
         try:
-            status.apply(json.loads(ln), live=False)
+            status.apply(json.loads(ln))
         except ValueError:
             continue
 
 
 # ---- the renderer (keep this; swap only the parser above) ----------------------
 
-FOOTER_KEYS = (" [q]uit  [a]rtifacts  [g]raphs  [f]reeze  [r]efresh  [h]elp")
-
-
 def _clamp(rows, tw, h):
     """Truncate every row to the panel width so nothing overflows the frame."""
     return [(t if len(t) <= tw else t[:tw], a) for t, a in rows[:h]]
 
 
-def _ev_line(st, ev):
-    ts = fmt_dur(ev.t)
-    mark = "*" if ev.id in st.flash else " "
-    return f"{mark} T+{ts:>8}  {ev.text}", {
+def _ev_line(ev):
+    return f"  T+{fmt_dur(ev.t):>8}  {ev.text}", {
         "find": "ok", "crash": "err", "hang": "warn", "info": "dim",
     }.get(ev.kind, "")
 
 
-def render(st, w, h, title="fuzzer status :: afl-style"):
-    """Render the status board as a list of (text, attr) rows."""
+def render(st, w, h, title="fuzzer status :: afl-style", source=None,
+           stall_after=None, now=None):
+    """Render the status board as a list of (text, attr) rows.
+
+    stall_after: seconds without new feed data before the run is flagged
+    STALLED (None disables the check, e.g. for --demo or a drained stdin)."""
+    now = time.time() if now is None else now
     rows = []
     tw = min(max(w - 1, 44), 104)
     rows.append((title.center(tw), "head"))
+    feed = f"    feed : {source}" if source else ""
 
     if not st.have_data:
-        rows.append(("", ""))
-        rows.append((" waiting for status data (no feed lines yet)", "warn"))
-        while len(rows) < h - 1:
-            rows.append(("", ""))
-        rows.append((FOOTER_KEYS, "dim"))
+        rows.append((f"  status : waiting for status data (no feed lines yet){feed}",
+                     "warn"))
         return _clamp(rows, tw, h)
+
+    age = None if st.last_update_wall is None else max(0.0, now - st.last_update_wall)
+    if st.finished:
+        rows.append((f"  status : RUN FINISHED{feed}", "head"))
+    elif stall_after is not None and age is not None and age > stall_after:
+        rows.append((f"  status : STALLED: no feed update for {fmt_dur(age)}{feed}",
+                     "err"))
+    else:
+        rows.append((f"  status : running{feed}", "ok"))
 
     pct = 100.0 * st.edges / st.map_size if st.map_size else 0.0
     uc, uh = st.uniq_crashes(), st.uniq_hangs()
-
-    def ago(t_ev):
-        if t_ev is None:
-            return "none seen yet"
-        return fmt_afl_dur(max(0, st.t - t_ev))
+    cur = st.current_rate()
 
     lw = (tw * 56) // 100          # wider left column (afl-style asymmetry)
     rw = tw - lw
 
-    L = _panel("process timing", [
-        _field("run time", fmt_afl_dur(st.t), 16),
+    def dur(sec):                  # afl's long form, unless it won't fit the box
+        s = fmt_afl_dur(sec)
+        return s if len(s) <= lw - 23 else fmt_short_dur(sec)
+
+    def ago(t_ev):
+        if t_ev is None:
+            return "none seen yet"
+        return dur(max(0, st.t - t_ev))
+
+    rows += [(ln, "") for ln in _pair("process timing", [
+        _field("run time", dur(st.t), 16),
         _field("last new find", ago(st.last_find_t), 16),
         _field("last saved crash", ago(st.last_crash_t), 16),
         _field("last saved hang", ago(st.last_hang_t), 16),
-    ], lw)
-    R = _panel("overall results", [
+        _field("last feed update", "?" if age is None else dur(age), 16),
+    ], "overall results", [
         _field("cycles done", fmt_n(st.cycles_done()), 14),
         _field("corpus count", fmt_n(st.corpus), 14),
         _field("saved crashes", f"{fmt_n(st.crashes)}  ({uc} unique)", 14),
         _field("saved hangs", f"{fmt_n(st.hangs)}  ({uh} unique)", 14),
-    ], rw)
-    rows += [(ln, "") for ln in _cols(L, R)]
+    ], lw, rw)]
 
-    L = _panel("map coverage", [
+    rows += [(ln, "") for ln in _pair("map coverage", [
         _field("map edges", f"{fmt_n(st.edges)} / {fmt_n(st.map_size)}", 12),
-        _field("map density", f"{pct:5.2f}%  {bar_pct(pct, 10)}", 12),
+        _field("map density", f"{pct:.2f}%", 12),
         _field("sites armed", fmt_n(st.sites) if st.sites else "?", 12),
         _field("new edges", fmt_n(st.new_edges), 12),
-    ], lw)
-    R = _panel("stage progress", [
-        _field("now trying", str(st.stage), 13),
-        _field("total execs", fmt_n(st.execs), 13),
-        _field("exec speed", f"{st.execs_per_sec:.1f}/sec"
-               + ("" if st.execs_per_sec > 1.0 else "  (slow!)"), 13),
-        _field("new finds/min", f"{st.finds_per_min():.2f}", 13),
-    ], rw)
-    rows += [(ln, "") for ln in _cols(L, R)]
+    ], "stage progress", [
+        _field("now trying", str(st.stage), 16),
+        _field("total execs", fmt_n(st.execs), 16),
+        _field("exec speed (avg)", fmt_rate(st.execs_per_sec), 16),
+        _field("exec speed (now)", "?" if cur is None else
+               fmt_rate(cur) + ("  (slow!)" if cur <= 1.0 else ""), 16),
+        _field("new finds/min", f"{st.finds_per_min():.2f}", 16),
+    ], lw, rw)]
 
-    cfg_items = list(st.config.items())[:4]
-    labw = max([11] + [len(str(k)) for k, _ in cfg_items])
-    cfg_fields = [_field(str(k), str(v), labw) for k, v in cfg_items]
-    while len(cfg_fields) < 4:
-        cfg_fields.append("")
-    L = _panel("findings in depth", [
+    try:
+        dups = fmt_n(max(0, int(st.crashes) - int(uc)))
+    except (TypeError, ValueError):
+        dups = "?"
+    none = "none seen yet"
+    rows += [(ln, "") for ln in _pair("findings in depth", [
         _field("corpus paths", fmt_n(st.corpus), 14),
         _field("new-cov finds", fmt_n(st.finds), 14),
         _field("total crashes", f"{fmt_n(st.crashes)}  ({uc} unique)", 14),
+        _field("dup crashes", dups, 14),
         _field("total hangs", f"{fmt_n(st.hangs)}  ({uh} unique)", 14),
-    ], lw)
-    R = _panel("run config", cfg_fields, rw)
-    rows += [(ln, "") for ln in _cols(L, R)]
+    ], "latest findings", [
+        _field("find", st.last_msg.get("find", none), 5),
+        _field("crash", st.last_msg.get("crash", none), 5),
+        _field("hang", st.last_msg.get("hang", none), 5),
+        _field("info", st.last_msg.get("info", none), 5),
+    ], lw, rw)]
 
-    if st.finished:
-        rows.append((" RUN FINISHED", "head"))
-
-    if len(st.cov_hist) > 2:
-        vs = [p[1] for p in st.cov_hist]
-        ts = [p[0] for p in st.cov_hist]
-        cw = min(tw - 6, 92)
-        rows.append((f" map coverage over time  T+{fmt_dur(ts[0])}..T+"
-                     f"{fmt_dur(ts[-1])}   {fmt_n(vs[0])} → {fmt_n(vs[-1])} "
-                     f"edges", "dim"))
-        for ln in column_chart(vs, cw, 3):
-            rows.append(("   " + ln, "ok"))
+    rows += [(ln, "") for ln in _panel("run config", _config_fields(st.config, tw - 2), tw)]
 
     rows.append((" last events", "dim"))
-    n_ev = max(1, h - len(rows) - 2)
+    n_ev = max(1, h - len(rows))
     for ev in list(st.events)[-n_ev:]:
-        txt, attr = _ev_line(st, ev)
-        if ev.id in st.flash:
-            attr = "flash"
-        rows.append((txt, attr))
-    while len(rows) < h - 1:
-        rows.append(("", ""))
-    rows.append((FOOTER_KEYS, "dim"))
+        rows.append(_ev_line(ev))
     return _clamp(rows, tw, h)
-
-
-# ---- generic artifacts browser + help -----------------------------------------
-
-def list_dir(d):
-    out = []
-    try:
-        names = os.listdir(d)
-    except OSError:
-        return out
-    for n in names:
-        p = os.path.join(d, n)
-        if os.path.isfile(p):
-            out.append((os.path.getmtime(p), n, os.path.getsize(p)))
-    out.sort(key=lambda r: r[0], reverse=True)
-    return out
-
-
-def build_artifacts(path, w, h, scroll):
-    rows = [(" artifacts  (newest first)   q/esc:back  j/k:scroll", "head")]
-    if not path:
-        rows.append((" (no --artifacts DIR given)", "dim"))
-        return rows + [("", "")] * (h - len(rows))
-    entries = list_dir(path)
-    rows.append((f" {len(entries)} file(s) in {path}", "dim"))
-    rows.append(("", ""))
-    for mtime, name, size in entries[scroll:scroll + (h - len(rows) - 1)]:
-        rows.append((f" {fmt_wall(mtime)}  {name:32s} {size:8d}B", "ok"))
-    rows.append((" -- esc/q back --", "dim"))
-    return rows[:h]
-
-
-def build_graphs(st, w, h):
-    rows = [(" graphs   q/esc:back", "head"), ("", "")]
-
-    def plot(label, series, height, fmt):
-        rows.append((label, "dim"))
-        if len(series) < 2:
-            rows.append(("   (not enough data yet)", "dim"))
-            return
-        vs = [p[1] for p in series]
-        cw = min(w - 10, 90)
-        rows.append((f"   min {fmt(min(vs))}  max {fmt(max(vs))}  "
-                     f"last {fmt(vs[-1])}", "dim"))
-        for ln in column_chart(vs, cw, height):
-            rows.append(("   " + ln, "ok"))
-        rows.append(("", ""))
-
-    plot(" coverage (edges):", list(st.cov_hist), 6, fmt_n)
-    plot(" exec speed (execs/sec):", list(st.rate_hist), 6, lambda v: f"{v:.1f}")
-    rows.append((" -- esc/q back --", "dim"))
-    return rows[:h]
-
-
-HELP_TEXT = [
-    (" status_tui.py -- generic afl-style fuzzer status board", "head"),
-    ("", ""),
-    (" Feed it JSON-lines (one status object per line) via --input FILE/-,",
-     ""),
-    (" or adapt the parser for your own log format (see ADAPT ME in source).",
-     ""),
-    ("", ""),
-    (" panels      process timing | overall results, map coverage | stage",
-     ""),
-    ("              progress, findings in depth | run config (from config{})",
-     ""),
-    (" graphs      coverage + exec-speed history (block charts)", ""),
-    (" events      newest find/crash/hang/info messages; new ones flash once",
-     ""),
-    ("", ""),
-    (" keys        q quit   a artifacts browser (--artifacts DIR)   g graphs",
-     ""),
-    ("              f freeze follow   r refresh   h help   j/k scroll   Esc back",
-     ""),
-]
 
 
 # ---- curses UI -----------------------------------------------------------------
 
 ATTR_MAP = {
     "": (0, 0), "dim": ("dim", 0), "head": ("bold", 7), "ok": (0, 2),
-    "err": ("bold", 3), "warn": ("bold", 4), "flash": ("rev", 6),
+    "err": ("bold", 3), "warn": ("bold", 4),
 }
-ASCII_RAMP = str.maketrans({c: a for c, a in zip(RAMP, ".:-=+*#%")})
 
 
-def run_curses(feed, st, artifacts):
+def run_curses(feed, st, refresh, title, source, stall_after):
+    """Static board: redraw every `refresh` seconds until Ctrl-C. No hotkeys."""
     import curses
 
-    def on_term(_term):
-        scr = curses.initscr()
-        curses.cbreak()
-        curses.noecho()
-        scr.keypad(True)
-        scr.timeout(400)
+    def on_term(scr):
+        scr.timeout(max(50, int(refresh * 1000)))
         try:
-            curses.start_color()
             curses.use_default_colors()
             for i, name in enumerate(("black", "green", "red", "magenta",
                                       "yellow", "cyan", "white"), start=1):
@@ -577,76 +506,30 @@ def run_curses(feed, st, artifacts):
                 flags |= curses.A_BOLD
             elif a == "dim":
                 flags |= curses.A_DIM
-            elif a == "rev":
-                flags |= curses.A_REVERSE
             if pair:
                 flags |= curses.color_pair(pair)
             return flags
 
-        def add(r, txt, a, w):
-            try:
-                scr.addnstr(r, 0, txt, max(0, w - 1), a)
-            except curses.error:
+        while True:
+            if feed is not None:
+                feed.read_new()
+            h, w = scr.getmaxyx()
+            scr.erase()
+            rows = render(st, w, h, title=title, source=source,
+                          stall_after=stall_after)
+            for r, (txt, a) in enumerate(rows[:h]):
                 try:
-                    scr.addnstr(r, 0, txt.translate(ASCII_RAMP), max(0, w - 1), a)
+                    scr.addnstr(r, 0, txt, max(0, w - 1), attr(a))
                 except curses.error:
                     pass
-
-        def draw(rows, w, h):
-            scr.erase()
-            for r, (txt, a) in enumerate(rows[:h]):
-                add(r, txt, attr(a), w)
             scr.refresh()
+            scr.getch()        # timed wait only: picks up resizes, keys are ignored
+            curses.flushinp()
 
-        frozen = False
-        screen = "main"
-        scroll = {"artifacts": 0}
-        while True:
-            h, w = scr.getmaxyx()
-            if not frozen and feed is not None:
-                feed.read_new(live=True)
-            if screen == "main":
-                rows = render(st, w, h)
-                if frozen:
-                    rows[-1] = (rows[-1][0] + "   ** FROZEN (f) **", "warn")
-            elif screen == "artifacts":
-                rows = build_artifacts(artifacts, w, h, scroll["artifacts"])
-            elif screen == "graphs":
-                rows = build_graphs(st, w, h)
-            else:
-                rows = HELP_TEXT + [("", "")] * max(0, h - len(HELP_TEXT) - 1)
-            draw(rows, w, h)
-            st.flash.clear()
-
-            ch = scr.getch()
-            if ch == -1:
-                continue
-            if ch == 27 or ch == ord("q"):
-                if screen != "main":
-                    screen = "main"
-                    continue
-                if ch == ord("q"):
-                    break
-                continue
-            if screen == "main":
-                if ch == ord("a"):
-                    scroll["artifacts"] = 0
-                    screen = "artifacts"
-                elif ch == ord("g"):
-                    screen = "graphs"
-                elif ch == ord("h"):
-                    screen = "help"
-                elif ch == ord("f"):
-                    frozen = not frozen
-                elif ch == ord("r") and feed is not None:
-                    feed.read_new(live=True)
-            elif screen == "artifacts":
-                if ch in (ord("j"), curses.KEY_DOWN):
-                    scroll["artifacts"] += 1
-                elif ch in (ord("k"), curses.KEY_UP):
-                    scroll["artifacts"] = max(0, scroll["artifacts"] - 1)
-
-    curses.wrapper(on_term)
+    try:
+        curses.wrapper(on_term)
+    except KeyboardInterrupt:
+        pass
 
 
 # ---- ADAPT ME: parse your own fuzzer's text log instead of JSON ----------------
@@ -678,26 +561,8 @@ def parse_text_line(st, line):
 class TextFeed(JsonFeed):
     """Same file-follower, but parses each line as text via parse_text_line."""
 
-    def read_new(self, live=False):
-        if self.fh is None:
-            try:
-                self.fh = open(self.path, "rb", buffering=0)
-            except OSError:
-                return 0
-        try:
-            self.fh.seek(self.off)
-            data = self.fh.read(1 << 20)
-        except OSError:
-            return 0
-        if not data:
-            return 0
-        self.off += len(data)
-        blob = self.buf + data
-        parts = blob.split(b"\n")
-        self.buf = parts.pop()
-        for ln in parts:
-            parse_text_line(self.st, ln.decode("utf-8", "replace"))
-        return len(data)
+    def handle_line(self, ln):
+        parse_text_line(self.st, ln.decode("utf-8", "replace"))
 
 
 # ---- demo + selftest -----------------------------------------------------------
@@ -710,16 +575,20 @@ def make_demo_status():
         edges = int(700 + 760 * (1 - 0.5 ** (i / 10.0)))
         st.apply({"t": t, "execs": i * 6800, "execs_per_sec": 79.5,
                   "corpus": 180 + i, "edges": edges, "map_size": 131072,
-                  "sites": 3097, "new_edges": edges, "crashes": i * 4,
+                  "sites": 3097, "new_edges": edges - 700, "crashes": i * 4,
                   "crashes_unique": min(i, 3), "stage": "havoc + splice",
-                  "config": {"workers": 8, "demalloc": "1/8",
-                             "max_size": 8192, "resumed": 228}})
+                  "config": {"arch": "x86_64", "scheme": "n=3 model=site rotate=1",
+                             "proto": 1, "ring": 8, "relay": "127.0.0.1:41234",
+                             "listen": "0.0.0.0:7000", "out": "./out",
+                             "seeds": 1, "resumed": 228, "max_size": 65536,
+                             "minimize": "True"}})
         if i == 6:
             st.add_event("find", "reached parse_header", edges=180)
         if i == 20:
-            st.add_event("crash", "SIGSEGV in parse_record")
+            st.add_event("crash", "r2/s11 crash_r2_s11_3f9a01c2b7d4")
         if i == 40:
             st.add_event("find", "new state in handle_request()", edges=25)
+    st.last_update_wall = time.time()
     return st
 
 
@@ -728,20 +597,47 @@ def selftest():
     assert st.uniq_crashes() >= 1
     assert st.cycles_done() > 0
     titles = ["process timing", "overall results", "map coverage",
-              "stage progress", "findings in depth", "run config"]
+              "stage progress", "findings in depth", "latest findings",
+              "run config", "last events"]
+
+    def text(rows):
+        return "\n".join(t for t, _ in rows)
+
     for w in (60, 80, 100, 132):
-        rows = render(st, w, 40)
-        blob = "\n".join(t for t, _ in rows)
+        rows = render(st, w, 60, source="demo", stall_after=10)
+        blob = text(rows)
         for title in titles:
             assert title in blob, f"missing panel {title!r} at w={w}"
         for t, _ in rows:
             assert len(t) <= w, f"row wider than {w}: {t!r}"
-    # feed/apply round-trip
+        assert "running" in blob, f"run state missing at w={w}"
+        assert "[q]uit" not in blob and not any(c in blob for c in "▁▂▃▄▅▆▇█"), \
+            f"hotkey footer or chart glyphs at w={w}"
+    blob = text(render(st, 132, 60))
+    for k, v in st.config.items():
+        assert f"{k} : {v}" in blob, f"config entry {k!r} not shown"
+    assert "80.0/sec" in blob, "current exec speed not derived from snapshots"
+    # current rate from two snapshots
     s2 = Status()
-    s2.apply({"execs": 10, "edges": 5, "map_size": 100,
+    s2.apply({"t": 10, "execs": 100})
+    s2.apply({"t": 20, "execs": 600})
+    assert abs(s2.current_rate() - 50.0) < 1e-9
+    # stalled / finished run state
+    s3 = Status()
+    s3.apply({"t": 1, "execs": 1})
+    s3.last_update_wall = time.time() - 3600
+    assert "STALLED" in text(render(s3, 100, 40, stall_after=10))
+    assert "STALLED" not in text(render(s3, 100, 40, stall_after=None))
+    s3.apply({"finished": True})
+    blob = text(render(s3, 100, 40, stall_after=10))
+    assert "RUN FINISHED" in blob and "STALLED" not in blob
+    # feed/apply round-trip
+    s4 = Status()
+    s4.apply({"execs": 10, "edges": 5, "map_size": 100,
               "event": {"kind": "find", "edges": 5}})
-    assert s2.execs == 10 and s2.finds == 1 and s2.last_find_t is not None
-    print("[selftest] ok: panels render at 60/80/100/132 cols, apply() works")
+    assert s4.execs == 10 and s4.finds == 1 and s4.last_find_t is not None
+    print("[selftest] ok: static board renders at 60/80/100/132 cols, "
+          "full config, run state, apply() works")
     return 0
 
 
@@ -749,48 +645,57 @@ def selftest():
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Generic afl-style fuzzer status board (suzzer).")
+        description="Generic afl-style static fuzzer status board (suzzer).")
     ap.add_argument("--input", "-i", default=None,
                     help="JSON-lines feed file to follow, or '-' for stdin")
     ap.add_argument("--format", choices=("json", "text"), default="json",
                     help="feed format: json (default) or text (ADAPT ME parser)")
+    ap.add_argument("--refresh", type=float, default=1.0,
+                    help="seconds between redraws (default 1.0)")
     ap.add_argument("--dump", action="store_true",
                     help="print one text frame and exit (no curses; CI/tty-less)")
     ap.add_argument("--demo", action="store_true",
                     help="render synthetic data (no feed needed)")
     ap.add_argument("--selftest", action="store_true",
                     help="render checks on synthetic data; exit 0 on success")
-    ap.add_argument("--artifacts", default=None,
-                    help="directory to browse in the 'a' screen (e.g. crashes/)")
     ap.add_argument("--title", default="fuzzer status :: afl-style")
     args = ap.parse_args()
 
     if args.selftest:
         return selftest()
+    if args.refresh <= 0:
+        ap.error("--refresh must be > 0")
 
     st = Status()
     feed = None
+    stall_after = None                 # only a followed file can stall
     if args.demo:
         st = make_demo_status()
+        source = "demo"
     elif args.input == "-":
         feed_from_stdin(st)            # drain stdin (one-shot; implies --dump)
+        st.last_update_wall = time.time()
+        source = "stdin"
         args.dump = True
     elif args.input:
         feed = (TextFeed if args.format == "text" else JsonFeed)(args.input, st)
         feed.initial_scan()
+        source = args.input
+        stall_after = max(10.0, 5 * args.refresh)
     else:
         ap.error("need --input FILE, --input -, or --demo")
 
     if args.dump or not sys.stdout.isatty():
         import shutil
         w, h = shutil.get_terminal_size((100, 44))
-        for txt, attr in render(st, w, max(24, h), title=args.title):
-            tag = {"err": "!!", "warn": "**", "flash": "**", "head": ">>",
+        for txt, attr in render(st, w, max(24, h), title=args.title,
+                                source=source, stall_after=stall_after):
+            tag = {"err": "!!", "warn": "**", "head": ">>",
                    "ok": "++", "dim": "  "}.get(attr, "  ")
             print(f"{tag} {txt}")
         return 0
 
-    run_curses(feed, st, args.artifacts)
+    run_curses(feed, st, args.refresh, args.title, source, stall_after)
     return 0
 
 
