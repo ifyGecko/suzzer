@@ -29,7 +29,7 @@ All structs are packed, with no implicit padding. Offsets are in bytes from the 
 
 ## 1. LCV3 patch list
 
-The list of coverage sites, produced by `tools/gen_patchlist.py` and loaded by libcov (`LIBCOV_PATCHLIST`). Every multi-byte field is **little-endian**, whatever the target's byte order.
+The list of coverage sites, produced by `tools/gen_patchlist.py` (or the Ghidra Jython port `tools/ghidra/gen_patchlist_ghidra.py`, which emits the same format) and loaded by libcov (`LIBCOV_PATCHLIST`). Every multi-byte field is **little-endian**, whatever the target's byte order.
 
 ### 1.1 Layout
 
@@ -101,7 +101,7 @@ Reject the file if:
 
 ## 2. LCVB1 boundary file
 
-Marks where one iteration (one input) begins and ends, produced by `tools/gen_boundary.py` and loaded by libcov (`LIBCOV_BOUNDARY_LIST`). It is **little-endian**.
+Marks where one iteration (one input) begins and ends, produced by `tools/gen_boundary.py` (or the Ghidra Jython port `tools/ghidra/gen_boundary_ghidra.py`, which emits the same format) and loaded by libcov (`LIBCOV_BOUNDARY_LIST`). It is **little-endian**.
 
 ```
 offset 0     header       16 bytes

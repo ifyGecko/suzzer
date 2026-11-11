@@ -609,8 +609,9 @@ order; the reader's seqlock check handles a slot that isn't stamped yet.
 
 ## Patch list format (LCV3)
 
-The library accepts only LCV3. The generator (`tools/gen_patchlist.py`)
-emits LCV3 and the library mmaps it at init.
+The library accepts only LCV3. The generator (`tools/gen_patchlist.py`,
+or its Ghidra Jython port `tools/ghidra/gen_patchlist_ghidra.py`) emits
+LCV3 and the library mmaps it at init.
 
 LCV3 header (24 bytes):
 
@@ -699,7 +700,8 @@ uint8_t  depth_filter;  // 0=any depth, 1=depth-zero only (paired mode)
 uint8_t  reserved[6];
 ```
 
-All little-endian. `tools/gen_boundary.py` emits this. The generator
+All little-endian. `tools/gen_boundary.py` (or its Ghidra Jython port
+`tools/ghidra/gen_boundary_ghidra.py`) emits this. The generator
 resolves a function name to the site `gen_patchlist.py` would pick for its
 FIRST basic block under the same `--strategy` (default: the arch's): the
 last >= 2-byte instruction under `terminator`, the first instruction

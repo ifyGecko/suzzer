@@ -99,6 +99,18 @@ importable, both generators fail. Verify:
 rizin -v && python3 -c "import rzpipe; print('rzpipe ok')"
 ```
 
+> **Ghidra instead of rizin.** If you analyse targets in Ghidra, the same
+> LCV3 / LCVB sidecars can be generated from the open program with the
+> Jython 2.7 ports in [`tools/ghidra/`](tools/ghidra/) — no rizin or rzpipe
+> needed. See [`tools/ghidra/README.md`](tools/ghidra/README.md) for the
+> headless `analyzeHeadless -postScript` invocation and the small interface
+> differences (module 0 is the open program, so there is no positional
+> `<binary>`). On Ghidra 11.4+/12.x, Jython is no longer built in — install
+> the bundled **Jython extension** first (the README explains how). The
+> rizin generators below remain the reference; the ports' output matches
+> theirs modulo documented analysis differences (Ghidra ends basic blocks
+> at calls; the two tools exclude slightly different CRT stubs).
+
 ### Cross-compile + emulation (only for non-host architectures)
 
 To build for a foreign arch you need its cross-gcc; to *run* it on your host
