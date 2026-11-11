@@ -1,5 +1,6 @@
 ## -*- coding: utf-8 -*-
 ## Ghidra Jython 2.7 port of tools/gen_boundary.py
+#@runtime Jython
 ##@category suzzer
 ##@keybinding
 ##@menupath

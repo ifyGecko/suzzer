@@ -24,18 +24,13 @@ The rizin versions are kept and remain the reference implementation.
 ## Installing Jython (Ghidra 11.4+ / 12.x)
 
 These are **Jython 2.7** scripts. Older Ghidra (≤ 11.3) bundled Jython, so
-`.py` scripts ran under it with no setup. Ghidra **11.4+ / 12.x dropped
-Jython as the default** — `.py` now runs under **PyGhidra (CPython 3)** —
-so you must add Jython back as an extension:
+they ran with no setup. Ghidra **11.4+ / 12.x no longer bundles Jython**, so
+add it back as an extension:
 
-1. In the GUI: *File → Install Extensions → +*, pick the bundled
-   `Extensions/Ghidra/ghidra_<ver>_PUBLIC_<date>_Jython.zip`, and restart.
-   Or headless: unzip that file into `<ghidra>/Ghidra/Extensions/` so a
-   `Jython/` module (with `lib/jython-standalone-2.7.x.jar`) appears there.
-2. Because PyGhidra also claims `.py`, the Jython script provider must be
-   the one that handles `.py`. In the GUI the Jython interpreter runs them;
-   for headless on a build where PyGhidra is active and wins `.py`, run on a
-   Ghidra configuration where PyGhidra is not the active `.py` provider.
+- In the GUI: *File → Install Extensions → +*, pick the bundled
+  `Extensions/Ghidra/ghidra_<ver>_PUBLIC_<date>_Jython.zip`, and restart.
+- Or headless: unzip that file into `<ghidra>/Ghidra/Extensions/` so a
+  `Jython/` module (with `lib/jython-standalone-2.7.x.jar`) appears there.
 
 If you would rather not manage the Jython extension, the project can instead
 provide PyGhidra-compatible (Python 3) copies — ask; these files are kept

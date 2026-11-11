@@ -1,4 +1,5 @@
 ## -*- coding: utf-8 -*-
+#@runtime Jython
 """
 ghidra_resolve.py -- shared symbol/address resolution for the Ghidra Jython
 ports of the suzzer tools.  Jython 2.7 (Ghidra's bundled interpreter).
