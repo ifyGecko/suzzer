@@ -32,10 +32,6 @@ add it back as an extension:
 - Or headless: unzip that file into `<ghidra>/Ghidra/Extensions/` so a
   `Jython/` module (with `lib/jython-standalone-2.7.x.jar`) appears there.
 
-If you would rather not manage the Jython extension, the project can instead
-provide PyGhidra-compatible (Python 3) copies — ask; these files are kept
-Jython-2.7 on purpose.
-
 ## How the rizin commands map to Ghidra
 
 | rizin                              | Ghidra Program API |
